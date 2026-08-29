@@ -38,7 +38,7 @@ BALISE_ALLOWED_ORIGINS = "https://balise.neorgon.com,http://localhost:8876,http:
 [[d1_databases]]
 binding = "DB"
 database_name = "balise"
-database_id = "00000000-0000-0000-0000-000000000000"
+database_id = "bd9caf38-a680-4e8d-97a5-5518e8e94391"
 
 # ── Ingest rate limiting ──────────────────────────────────────────────────────
 # period must be exactly 10 or 60 seconds
