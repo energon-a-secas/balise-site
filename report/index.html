@@ -1,0 +1,149 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Report an Error | Balise</title>
+  <meta name="description" content="Tell the Neorgon fleet what a page got wrong, in a sentence, without opening a pull request">
+  <meta name="robots" content="noindex, follow">
+  <link rel="canonical" href="https://balise.neorgon.com/report/">
+  <meta name="theme-color" content="#040714">
+  <link rel="icon" type="image/x-icon" href="https://cdn.neorgon.org/v1.0.0/favicon.ico" />
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/styles/base.css">
+  <link rel="stylesheet" href="../css/style.css">
+  <script>(function(){var m=location.search.match(/[?&]theme=([\w-]+)/)||document.cookie.match(/(?:^|;\s*)neo_theme=([\w-]+)/);if(m&&m[1]!=='default')document.documentElement.dataset.theme=decodeURIComponent(m[1]);})();</script>
+  <link rel="stylesheet" href="../css/neorgon-header.css">
+  <link rel="stylesheet" href="../css/neorgon-themes.css">
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/header/season.css">
+  <script defer src="../js/neorgon-header.js"></script>
+  <link rel="stylesheet" href="../css/neorgon-footer.css">
+  <script defer src="../js/neorgon-footer.js"></script>
+  <meta name="neo-repo" content="https://github.com/energon-a-secas/balise-site">
+</head>
+<body>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="header-bar" data-header-mode="content">
+    <div class="header-logo">
+      <a href="../" class="header-title-link">
+        <img src="https://cdn.neorgon.org/v1.0.0/energon-classic-logo.png" class="header-logo-img" alt="">
+        <div class="header-title-wrap">
+          <h1>Balise</h1>
+          <div class="header-subtitle">Report what a page got wrong</div>
+        </div>
+      </a>
+    </div>
+    <div class="header-right">
+      <a class="header-home" href="https://neorgon.com/" title="neorgon.com" aria-label="Neorgon home">
+        <svg class="nh-hub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.4"/>
+          <ellipse cx="12" cy="12" rx="8.4" ry="3" transform="rotate(-18 12 12)"/>
+          <g class="nh-orbit">
+            <path d="M17.5 4.2 14.2 2.7l.9 1.4-.6 1.1z" fill="currentColor" stroke="none"/>
+            <circle cx="12.6" cy="3" r=".7" fill="currentColor" stroke="none" opacity=".55"/>
+          </g>
+        </svg>
+      </a>
+    </div>
+  </header>
+
+  <main id="main" class="page page--narrow">
+
+    <!-- What you are reporting. Every value here came from a URL fragment and is
+         rendered with textContent by js/report.js (CONTRACTS.md C5). -->
+    <section class="report-context" id="context" hidden>
+      <h2 class="report-context__head">You are reporting</h2>
+      <dl class="report-context__list">
+        <div class="report-context__row" id="targetRow" hidden>
+          <dt>Item</dt>
+          <dd><span class="report-target" id="targetLabel"></span></dd>
+        </div>
+        <div class="report-context__row">
+          <dt>Site</dt>
+          <dd><code id="siteName"></code></dd>
+        </div>
+        <div class="report-context__row">
+          <dt>Page</dt>
+          <dd><a id="pageLink" rel="noopener noreferrer nofollow" target="_blank"><span id="pageUrl"></span></a></dd>
+        </div>
+      </dl>
+    </section>
+
+    <section class="report-context report-context--empty" id="noContext" hidden>
+      <h2 class="report-context__head">Reporting a page</h2>
+      <p class="muted">
+        This page opened without knowing which item you meant, so tell us where
+        you saw the problem in your own words below.
+      </p>
+    </section>
+
+    <form class="report-form" id="form">
+      <div class="field">
+        <label for="kind">What kind of problem is it?</label>
+        <select id="kind" name="kind">
+          <option value="wrong">Something is wrong or inaccurate</option>
+          <option value="missing">Something is missing</option>
+          <option value="broken">Something is broken</option>
+          <option value="other">Something else</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label for="body">What should it say instead?</label>
+        <textarea id="body" name="body" rows="6" maxlength="2400"
+                  placeholder="Say what is wrong and what it should say instead. A sentence is plenty."
+                  required></textarea>
+        <div class="field__foot">
+          <span class="hint">No account needed. Nothing you type is published as written.</span>
+          <span class="counter" id="count" aria-live="off">0 / 2000</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label for="contact">Contact, if you want a reply <span class="muted">(optional)</span></label>
+        <input type="text" id="contact" name="contact" maxlength="120" autocomplete="off"
+               placeholder="Email, handle, anything. Left blank is fine.">
+      </div>
+
+      <!-- Turnstile mounts here. It lives on this page rather than in the widget
+           because this page's CSP is ours to write; 18 fleet sites would block it
+           (DESIGN.md section 3). With no site key configured the div stays empty
+           and the Worker answers NOT_CONFIGURED, which says so plainly.
+
+           data-sitekey is EMPTY on purpose. Put the real key here at deploy time,
+           paired with BALISE_TURNSTILE_SECRET on the Worker. Do not commit
+           Cloudflare's 1x0000... test key: it always passes, so shipping it turns
+           the bot check into decoration while still looking configured. -->
+      <div id="turnstile" class="cf-turnstile" data-sitekey="" data-theme="auto"></div>
+
+      <div class="report-error" id="error" role="alert" hidden>
+        <p class="report-error__message" id="errorMessage"></p>
+        <p class="report-error__hint" id="errorHint"></p>
+      </div>
+
+      <button type="submit" class="btn btn--primary btn--lg" id="submit">Send report</button>
+    </form>
+
+    <section class="report-done" id="done" role="status" hidden>
+      <h2>Sent. Thank you.</h2>
+      <p>
+        A person reads every report. If it turns out to be a real problem you
+        will see it on the <a href="../">fixed log</a> once the change ships.
+      </p>
+      <p class="muted">
+        Reports are not published as written, so nothing you typed appears on
+        the site.
+      </p>
+    </section>
+
+  </main>
+
+  <footer class="neo-footer" data-footer-mode="minimal">
+    Reports are reviewed by a person before anything is published.
+  </footer>
+
+  <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
+  <script type="module" src="../js/report-page.js"></script>
+</body>
+</html>

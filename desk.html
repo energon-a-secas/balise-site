@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Desk | Balise</title>
+  <meta name="description" content="Operator review desk for reports raised across the Neorgon fleet">
+  <!-- The desk is not for visitors and must never be indexed. The queue itself
+       is protected by the Worker (C3); this only keeps the page out of search. -->
+  <meta name="robots" content="noindex, nofollow">
+  <meta name="theme-color" content="#040714">
+  <link rel="icon" type="image/x-icon" href="https://cdn.neorgon.org/v1.0.0/favicon.ico" />
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/styles/base.css">
+  <link rel="stylesheet" href="css/style.css">
+  <script>(function(){var m=location.search.match(/[?&]theme=([\w-]+)/)||document.cookie.match(/(?:^|;\s*)neo_theme=([\w-]+)/);if(m&&m[1]!=='default')document.documentElement.dataset.theme=decodeURIComponent(m[1]);})();</script>
+  <link rel="stylesheet" href="css/neorgon-header.css">
+  <link rel="stylesheet" href="css/neorgon-themes.css">
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/header/season.css">
+  <script defer src="js/neorgon-header.js"></script>
+  <link rel="stylesheet" href="css/neorgon-footer.css">
+  <script defer src="js/neorgon-footer.js"></script>
+</head>
+<body>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="header-bar" data-header-mode="app">
+    <div class="header-logo">
+      <a href="./" class="header-title-link">
+        <img src="https://cdn.neorgon.org/v1.0.0/energon-classic-logo.png" class="header-logo-img" alt="">
+        <div class="header-title-wrap">
+          <h1>Balise Desk</h1>
+          <div class="header-subtitle">Operator review</div>
+        </div>
+      </a>
+    </div>
+    <div class="header-right">
+      <div class="header-actions">
+        <button type="button" class="btn btn--ghost btn--sm" id="signOut" data-keep-mobile>Sign out</button>
+      </div>
+      <a class="header-home" href="https://neorgon.com/" title="neorgon.com" aria-label="Neorgon home">
+        <svg class="nh-hub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.4"/>
+          <ellipse cx="12" cy="12" rx="8.4" ry="3" transform="rotate(-18 12 12)"/>
+        </svg>
+      </a>
+    </div>
+  </header>
+
+  <main id="main" class="page">
+
+    <!-- The gate. The token is typed here, held in memory for this tab, and
+         never written to storage of any kind (CONTRACTS.md C3, amendment A1). -->
+    <section class="desk-gate" id="gate">
+      <h2>Operator token</h2>
+      <p class="muted">
+        Held in memory for this tab only. Closing the tab ends the session, and
+        nothing is written to storage.
+      </p>
+      <form id="tokenForm" class="desk-gate__form">
+        <label class="sr-only" for="tokenInput">Operator token</label>
+        <input type="password" id="tokenInput" autocomplete="off" spellcheck="false"
+               placeholder="Paste the operator token" required>
+        <button type="submit" class="btn btn--primary">Open the queue</button>
+      </form>
+      <p class="muted desk-gate__note">
+        Five wrong attempts lock this address out for fifteen minutes.
+      </p>
+    </section>
+
+    <section class="desk-queue" id="queue" hidden>
+      <div class="desk-toolbar">
+        <div class="desk-filters" id="filters" role="group" aria-label="Filter by status">
+          <button type="button" class="btn btn--ghost btn--sm is-active" data-filter="new">New</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="triaged">Triaged</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="accepted">Accepted</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="fixed">Fixed</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="spam">Spam</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="all">All</button>
+        </div>
+        <span class="desk-count muted" id="count"></span>
+      </div>
+
+      <p class="log__state" id="loading" hidden>Loading…</p>
+
+      <div class="report-error" id="error" role="alert" hidden>
+        <p class="report-error__message" id="errorMessage"></p>
+        <p class="report-error__hint" id="errorHint"></p>
+      </div>
+
+      <p class="log__state" id="empty" hidden>Nothing in this queue.</p>
+
+      <ul class="desk-list" id="list"></ul>
+
+      <button type="button" class="btn btn--ghost" id="more" hidden>Show older</button>
+    </section>
+
+  </main>
+
+  <footer class="neo-footer" data-footer-mode="app" data-footer-top="off">
+    Operator surface. Reports shown here are unpublished.
+  </footer>
+
+  <script type="module" src="js/desk-page.js"></script>
+</body>
+</html>

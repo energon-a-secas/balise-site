@@ -1,0 +1,60 @@
+name = "balise-api"
+main = "src/index.js"
+compatibility_date = "2026-08-01"
+
+# Balise: the fleet's correction-reporting service. Ingest, review desk, public log.
+#
+# NOTHING HERE IS A SECRET AND NOTHING HERE MAY BECOME ONE. Three secrets are set out
+# of band, never written into this file, never into .dev.vars in a tracked directory,
+# never into a doc:
+#
+#   wrangler secret put BALISE_OPERATOR_TOKEN     32 bytes of CSPRNG, base64url (C3)
+#   wrangler secret put BALISE_TURNSTILE_SECRET   Turnstile widget secret key
+#   wrangler secret put BALISE_IP_SALT            random, salts every stored ip_hash
+#
+# /health reports which of the three are bound and never their values, so an operator
+# can tell a missing secret from an outage without reading anything privileged.
+#
+# For local work the three arrive as `wrangler dev --var NAME:value`, which keeps them
+# out of the tree entirely. See the Makefile targets in ../Makefile.
+
+[vars]
+# Comma separated. An empty Origin header (curl, a crawler, the AI job) is not checked
+# against this list at all: CORS restricts a browser from reading a response, it does
+# not stop curl, so treating it as the defence would be a mistake. The real controls
+# are Turnstile on ingest and the bearer token on the desk.
+BALISE_ALLOWED_ORIGINS = "https://balise.neorgon.com,http://localhost:8876,http://127.0.0.1:8876"
+
+# ── D1 ────────────────────────────────────────────────────────────────────────
+# database_id is a placeholder on purpose. This campaign is local only: no database has
+# been created on the account and `wrangler d1 create` has not been run. The release
+# runbook fills the real id in at deploy time.
+#
+# A bare `wrangler d1 ...` command is one keystroke from writing to production, because
+# the command reference documents --local and --remote and marks NEITHER as the default
+# (https://developers.cloudflare.com/d1/wrangler-commands/). Every D1 invocation in this
+# project goes through a Makefile target that writes --local explicitly. Do not type a
+# bare one and do not put one in a doc.
+[[d1_databases]]
+binding = "DB"
+database_name = "balise"
+database_id = "00000000-0000-0000-0000-000000000000"
+
+# ── Ingest rate limiting ──────────────────────────────────────────────────────
+# period must be exactly 10 or 60 seconds
+# (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/), which is
+# why C3's fifteen minute operator lockout CANNOT live here and stays in the D1
+# auth_attempts table. Do not "simplify" the lockout onto this binding: it would silently
+# shorten fifteen minutes to sixty seconds.
+#
+# The binding's counters are per Cloudflare location and Cloudflare describes them as
+# "permissive, eventually consistent, and intentionally designed to not be used as an
+# accurate accounting system". It is a blunt instrument in front of ingest, which is the
+# right job for it, and nothing may depend on its precision.
+[[ratelimits]]
+name = "INGEST_LIMITER"
+namespace_id = "2001"
+
+  [ratelimits.simple]
+  limit = 20
+  period = 60

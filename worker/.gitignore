@@ -1,0 +1,11 @@
+node_modules/
+
+# Miniflare's local state. Holds the local D1 SQLite file, which after any local
+# exercise contains real report bodies typed by whoever ran it. Never tracked.
+.wrangler/
+
+# Local secrets for `wrangler dev`. The three Balise secrets are passed as --var by the
+# Makefile targets instead, so this file should not exist at all; the rule is here so a
+# moment of convenience cannot become a committed secret.
+.dev.vars
+.dev.vars.*

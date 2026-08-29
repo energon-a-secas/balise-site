@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Balise | Fleet Correction Log</title>
+  <meta name="description" content="See what readers reported across the Neorgon fleet and what got fixed, with every entry written by the person who shipped the change">
+  <meta property="og:title" content="Balise: Fleet Correction Log">
+  <meta property="og:description" content="What readers reported across the fleet, and what got fixed">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://balise.neorgon.com/">
+  <meta property="og:site_name" content="Neorgon">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Balise: Fleet Correction Log">
+  <meta name="twitter:description" content="What readers reported across the fleet, and what got fixed">
+  <meta name="robots" content="index, follow">
+  <link rel="canonical" href="https://balise.neorgon.com/">
+  <meta property="og:locale" content="en_US">
+  <meta name="theme-color" content="#040714">
+  <meta property="og:image" content="https://balise.neorgon.com/og-preview.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="Balise">
+  <meta name="twitter:image" content="https://balise.neorgon.com/og-preview.jpg">
+  <link rel="icon" type="image/x-icon" href="https://cdn.neorgon.org/v1.0.0/favicon.ico" />
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/styles/base.css">
+  <link rel="stylesheet" href="css/style.css">
+  <script>(function(){var m=location.search.match(/[?&]theme=([\w-]+)/)||document.cookie.match(/(?:^|;\s*)neo_theme=([\w-]+)/);if(m&&m[1]!=='default')document.documentElement.dataset.theme=decodeURIComponent(m[1]);})();</script>
+  <link rel="stylesheet" href="css/neorgon-header.css">
+  <link rel="stylesheet" href="css/neorgon-themes.css">
+  <link rel="stylesheet" href="https://cdn.neorgon.org/v1.0.0/header/season.css">
+  <script defer src="js/neorgon-header.js"></script>
+  <link rel="stylesheet" href="css/neorgon-footer.css">
+  <script defer src="js/neorgon-footer.js"></script>
+  <meta name="neo-repo" content="https://github.com/energon-a-secas/balise-site">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "WebApplication",
+    "name": "Balise",
+    "description": "Collect and triage correction reports raised from any Neorgon site, with a private review desk and a public record of what got fixed",
+    "url": "https://balise.neorgon.com/",
+    "applicationCategory": "DeveloperApplication",
+    "operatingSystem": "Any",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "author": { "@type": "Organization", "name": "Neorgon", "url": "https://neorgon.com/" }
+  }
+  </script>
+</head>
+<body>
+
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="header-bar" data-header-mode="content">
+    <div class="header-logo">
+      <a href="./" class="header-title-link">
+        <img src="https://cdn.neorgon.org/v1.0.0/energon-classic-logo.png" class="header-logo-img" alt="">
+        <div class="header-title-wrap">
+          <h1>Balise</h1>
+          <div class="header-subtitle">What got reported, and what got fixed</div>
+        </div>
+      </a>
+    </div>
+    <div class="header-right">
+      <a class="header-home" href="https://neorgon.com/" title="neorgon.com" aria-label="Neorgon home">
+        <svg class="nh-hub-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+          <circle cx="12" cy="12" r="4.4"/>
+          <ellipse cx="12" cy="12" rx="8.4" ry="3" transform="rotate(-18 12 12)"/>
+          <g class="nh-orbit">
+            <path d="M17.5 4.2 14.2 2.7l.9 1.4-.6 1.1z" fill="currentColor" stroke="none"/>
+            <circle cx="12.6" cy="3" r=".7" fill="currentColor" stroke="none" opacity=".55"/>
+          </g>
+        </svg>
+      </a>
+    </div>
+  </header>
+
+  <main id="main" class="page">
+
+    <section class="intro">
+      <h2 class="intro__head">Every Neorgon page carries a beacon</h2>
+      <p class="intro__lede">
+        Spot something wrong on any tool in the fleet and the beacon in the
+        corner takes one sentence about it. No account, no pull request. A
+        person reads every report, and the ones that turn out to be real land
+        here once the fix ships.
+      </p>
+      <p class="intro__note muted">
+        Reports themselves stay private, because they arrive as raw text from
+        strangers. What you see below is written by whoever made the change.
+      </p>
+    </section>
+
+    <section class="log" aria-labelledby="logHead">
+      <h2 id="logHead" class="log__head">Fixed</h2>
+
+      <p class="log__state" id="loading" hidden>Loading the log…</p>
+
+      <div class="report-error" id="error" role="alert" hidden>
+        <p class="report-error__message" id="errorMessage"></p>
+        <p class="report-error__hint" id="errorHint"></p>
+      </div>
+
+      <p class="log__state" id="empty" hidden>
+        Nothing has been fixed through Balise yet. When the first report lands
+        and the change ships, it shows up here.
+      </p>
+
+      <ul class="log__list" id="list" hidden></ul>
+
+      <button type="button" class="btn btn--ghost" id="more" hidden>Show older</button>
+    </section>
+
+  </main>
+
+  <footer class="neo-footer" data-footer-mode="minimal">
+    Reports are reviewed by a person, and nothing arrives here as it was typed.
+  </footer>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
