@@ -48,7 +48,31 @@ export const TRANSITIONS = {
  * check as the reason the AI "cannot" change a report's status. If it ever needs to be a
  * boundary, the AI needs its own credential.
  */
-export const AI_TRANSITIONS = { new: ['triaged'] };
+/**
+ * What the AUTOMATION credential may do. Enforced against the token that
+ * authenticated, never against a header the caller sets, so this is a real
+ * boundary rather than the honesty mechanism it used to be.
+ *
+ * The rule behind the list: automation may write a verdict and it may CLOSE
+ * junk, but it may never move a report toward anything a reader will see.
+ *
+ *   - `triaged` records an opinion and its evidence. Publishes nothing.
+ *   - `spam` and `duplicate` are closing moves. They publish nothing either,
+ *     they are the bulk of the volume, and they are the judgement an AI is
+ *     actually good at. Both are cheap to get wrong: a human reopen
+ *     (spam -> accepted) is already legal and is deliberately NOT granted here,
+ *     so automation can close junk but only a person can bring one back.
+ *
+ * `accepted` and `fixed` stay human. `fixed` in particular requires a
+ * public_note, and C4 says an operator writes that note and never derives it
+ * from the reporter's text, because it lands on a public page. An AI writing it
+ * would route stranger-influenced text onto neorgon.com through a paraphrase,
+ * which is the exact thing settled decision 3 exists to prevent.
+ */
+export const AI_TRANSITIONS = {
+  new: ['triaged', 'spam', 'duplicate'],
+  triaged: ['spam', 'duplicate'],
+};
 
 /** Pure, and exported so a test can assert the whole table without a database. */
 export function canTransition(from, to, actor) {

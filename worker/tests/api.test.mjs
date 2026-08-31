@@ -191,25 +191,42 @@ test('C4: fixed is terminal', () => {
   for (const to of STATUSES) assert.equal(canTransition('fixed', to, 'human'), false, `fixed -> ${to}`);
 });
 
-test('C4: the AI is authorised for exactly one edge, new to triaged', () => {
-  assert.deepEqual(AI_TRANSITIONS, { new: ['triaged'] });
-  let allowed = 0;
+test('C4: automation may record a verdict and close junk, and nothing else', () => {
+  assert.deepEqual(AI_TRANSITIONS, {
+    new: ['triaged', 'spam', 'duplicate'],
+    triaged: ['spam', 'duplicate'],
+  });
+  // Spelled out as a set rather than a count, so widening the table by accident
+  // fails here with the offending edge named instead of an off-by-one.
+  const PERMITTED = new Set([
+    'new->triaged', 'new->spam', 'new->duplicate',
+    'triaged->spam', 'triaged->duplicate',
+  ]);
+  const seen = new Set();
   for (const from of STATUSES) {
     for (const to of STATUSES) {
-      if (canTransition(from, to, 'ai')) {
-        allowed += 1;
-        assert.equal(from, 'new');
-        assert.equal(to, 'triaged');
-      }
+      if (canTransition(from, to, 'ai')) seen.add(`${from}->${to}`);
     }
   }
-  assert.equal(allowed, 1);
+  assert.deepEqual(seen, PERMITTED);
 });
 
-test('C4: the AI cannot accept, fix, reject or mark spam', () => {
-  for (const to of ['accepted', 'fixed', 'rejected', 'spam', 'duplicate']) {
-    assert.equal(canTransition('new', to, 'ai'), false, `ai new -> ${to}`);
+test('C4: automation can never reach a reader, and can never reopen', () => {
+  // The whole point of the scope: nothing automation does may publish, and a
+  // close it got wrong must need a person to undo.
+  for (const from of STATUSES) {
+    assert.equal(canTransition(from, 'fixed', 'ai'), false, `ai ${from} -> fixed`);
+    assert.equal(canTransition(from, 'accepted', 'ai'), false, `ai ${from} -> accepted`);
+    assert.equal(canTransition(from, 'rejected', 'ai'), false, `ai ${from} -> rejected`);
   }
+  // Reopening is the human's, so automation cannot walk a report back out of a
+  // state it put it in.
+  for (const from of ['spam', 'duplicate', 'rejected']) {
+    assert.equal(canTransition(from, 'accepted', 'ai'), false, `ai reopen from ${from}`);
+  }
+  // A human still has the full table, including the reopen.
+  assert.equal(canTransition('spam', 'accepted', 'human'), true);
+  assert.equal(canTransition('accepted', 'fixed', 'human'), true);
 });
 
 // ── The desk's patch body ─────────────────────────────────────────────────────

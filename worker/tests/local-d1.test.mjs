@@ -38,6 +38,10 @@ const STATE = join(WORKER_DIR, '.wrangler/test-state');
 const PORT = 8878;
 const BASE = `http://127.0.0.1:${PORT}`;
 const TOKEN = 'test-operator-token-local-only-not-a-secret';
+// The automation role is now a SEPARATE credential, not a header. These tests
+// prove the boundary by presenting a different token, which is the only way it
+// can be reached.
+const AI_TOKEN = 'test-automation-token-local-only-not-a-secret';
 const SALT = 'test-ip-salt-local-only';
 
 // Cloudflare's published test secret keys. Both are documented public values, not
@@ -100,11 +104,10 @@ async function stopWorker(child) {
 
 // ── Request helpers ───────────────────────────────────────────────────────────
 
-async function call(path, { method = 'GET', body, token, actor, ip, origin, base = BASE } = {}) {
+async function call(path, { method = 'GET', body, token, ip, origin, base = BASE } = {}) {
   const headers = {};
   if (body !== undefined) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = `Bearer ${token}`;
-  if (actor) headers['X-Balise-Actor'] = actor;
   if (ip) headers['CF-Connecting-IP'] = ip;
   if (origin) headers.Origin = origin;
   const res = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
@@ -134,6 +137,7 @@ before(async () => {
   await run(['d1', 'execute', 'balise', '--local', '--persist-to', STATE, '--file=schema.sql', '-y']);
   worker = await startWorker(PORT, {
     BALISE_OPERATOR_TOKEN: TOKEN,
+    BALISE_AUTOMATION_TOKEN: AI_TOKEN,
     BALISE_IP_SALT: SALT,
     BALISE_TURNSTILE_SECRET: TURNSTILE_PASS,
   });
@@ -289,13 +293,48 @@ async function firstNew() {
   return body.reports[0];
 }
 
-test('C4: the AI is refused every edge except new to triaged', async () => {
+test('C4: automation is refused every edge that reaches a reader', async () => {
   const r = await firstNew();
-  for (const to of ['accepted', 'rejected', 'spam', 'fixed']) {
-    const { res, body } = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: to }, token: TOKEN, actor: 'ai', ip: '192.0.2.12' });
+  for (const to of ['accepted', 'rejected', 'fixed']) {
+    const { res, body } = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: to }, token: AI_TOKEN, ip: '192.0.2.12' });
     assert.equal(res.status, 409, `ai new -> ${to} was allowed`);
     assert.equal(body.code, 'BAD_TRANSITION');
   }
+});
+
+test('C4: automation may close junk, and only a human may reopen it', async () => {
+  const r = await firstNew();
+  const spam = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: 'spam' }, token: AI_TOKEN, ip: '192.0.2.13' });
+  assert.equal(spam.res.status, 200, JSON.stringify(spam.body));
+  assert.equal(spam.body.report.status, 'spam');
+
+  // The automation credential cannot walk it back out.
+  const reopenByAi = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: 'accepted' }, token: AI_TOKEN, ip: '192.0.2.13' });
+  assert.equal(reopenByAi.res.status, 409);
+  assert.equal(reopenByAi.body.code, 'BAD_TRANSITION');
+
+  // The operator can.
+  const reopen = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: 'accepted' }, token: TOKEN, ip: '192.0.2.13' });
+  assert.equal(reopen.body.report.status, 'accepted');
+});
+
+test('C3: the role follows the credential, so the old header cannot grant it', async () => {
+  const r = await firstNew();
+  // The operator token with the retired header set still gets the HUMAN table:
+  // the header is inert, which is the whole point of moving the role onto the token.
+  const res = await fetch(`${BASE}/reports/${r.id}`, {
+    method: 'PATCH',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${TOKEN}`,
+      'X-Balise-Actor': 'ai',
+      'CF-Connecting-IP': '192.0.2.14',
+    },
+    body: JSON.stringify({ status: 'accepted' }),
+  });
+  const body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(body.report.status, 'accepted', 'the header must not downgrade a human');
 });
 
 test('C4: the AI takes its one edge, and a human carries it the rest of the way', async () => {
@@ -303,8 +342,7 @@ test('C4: the AI takes its one edge, and a human carries it the rest of the way'
   const triaged = await call(`/reports/${r.id}`, {
     method: 'PATCH',
     body: { status: 'triaged', ai_verdict: 'plausible', ai_confidence: 0.7, ai_notes: 'Consistent with the page.' },
-    token: TOKEN,
-    actor: 'ai',
+    token: AI_TOKEN,
     ip: '192.0.2.12',
   });
   assert.equal(triaged.res.status, 200, JSON.stringify(triaged.body));

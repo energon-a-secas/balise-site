@@ -124,6 +124,27 @@ const ROUTES_HINT = 'The routes are POST /report, GET /reports, PATCH /reports/:
  * unreachable; it is written out anyway so that a later change of digest cannot
  * reintroduce the leak silently.
  */
+/**
+ * Constant-time compare of an already hashed presentation against a candidate secret.
+ * Returns false for an unset secret, which is how a deployment with no automation token
+ * simply has no automation role rather than an error.
+ *
+ * timingSafeEqual throws on unequal length buffers, so both sides are SHA-256 first.
+ * The length branch is unreachable at a fixed 32 bytes and is written out anyway, so a
+ * later change of digest cannot silently reintroduce the leak. Comparing the input
+ * against itself and negating is the current documented form
+ * (https://developers.cloudflare.com/workers/examples/protect-against-timing-attacks/);
+ * the pre-2026 example returned early on a length mismatch, which is the leak it claimed
+ * to prevent.
+ */
+async function matches(presentedHash, candidate) {
+  if (!candidate) return false;
+  const secret = await sha256Bytes(candidate);
+  return presentedHash.byteLength === secret.byteLength
+    ? crypto.subtle.timingSafeEqual(presentedHash, secret)
+    : !crypto.subtle.timingSafeEqual(presentedHash, presentedHash);
+}
+
 async function authenticate(request, env, db, key, now) {
   if (!env || !env.BALISE_OPERATOR_TOKEN) {
     return {
@@ -146,19 +167,25 @@ async function authenticate(request, env, db, key, now) {
   if (lock.locked) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
 
   const presented = await sha256Bytes(match[1]);
-  const secret = await sha256Bytes(env.BALISE_OPERATOR_TOKEN);
-  const sameLength = presented.byteLength === secret.byteLength;
-  const equal = sameLength
-    ? crypto.subtle.timingSafeEqual(presented, secret)
-    : !crypto.subtle.timingSafeEqual(presented, presented);
 
+  /* The actor is decided by WHICH credential matched, never by a header. It used to
+     be `X-Balise-Actor: ai`, self declared, which meant anything holding the operator
+     token could simply omit the header and take the human transition table: C4's limit
+     on automation was unenforceable. That header is gone; do not reintroduce it.
+
+     Both candidates are compared every time, and the result is folded rather than
+     short circuited, so the work does not depend on which token was presented and a
+     wrong guess cannot be told from a right-token-wrong-role by timing. */
+  const operator = await matches(presented, env.BALISE_OPERATOR_TOKEN);
+  const automation = await matches(presented, env.BALISE_AUTOMATION_TOKEN);
+
+  const equal = operator || automation;
   await recordAuthResult(db, key, equal, now);
   if (!equal) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
 
-  // Self declared by the caller. See AI_TRANSITIONS in store.js: an honesty mechanism,
-  // not a security boundary.
-  const actor = request.headers.get('X-Balise-Actor') === 'ai' ? 'ai' : 'human';
-  return { actor };
+  // The operator wins if both secrets are somehow the same value, so a misconfiguration
+  // degrades to the MORE restrictive outcome being unreachable rather than the reverse.
+  return { actor: operator ? 'human' : 'ai' };
 }
 
 // ── Turnstile ─────────────────────────────────────────────────────────────────
