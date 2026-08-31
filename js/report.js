@@ -180,9 +180,9 @@ async function submit(event) {
  */
 function challengeToken() {
   const api = typeof window !== 'undefined' ? window.turnstile : null;
-  if (!api || typeof api.getResponse !== 'function' || !el.turnstile) return '';
+  if (!api || typeof api.getResponse !== 'function' || !el.challenge) return '';
   try {
-    return api.getResponse(el.turnstile) || '';
+    return api.getResponse(el.challenge) || '';
   } catch {
     return '';
   }
@@ -190,9 +190,9 @@ function challengeToken() {
 
 function resetChallenge() {
   const api = typeof window !== 'undefined' ? window.turnstile : null;
-  if (!api || typeof api.reset !== 'function' || !el.turnstile) return;
+  if (!api || typeof api.reset !== 'function' || !el.challenge) return;
   try {
-    api.reset(el.turnstile);
+    api.reset(el.challenge);
   } catch { /* a widget that never rendered has nothing to reset */ }
 }
 
@@ -200,7 +200,7 @@ export function initReport() {
   [
     'context', 'noContext', 'targetRow', 'targetLabel', 'siteName', 'pageUrl',
     'pageLink', 'form', 'kind', 'body', 'contact', 'count', 'submit', 'error',
-    'errorMessage', 'errorHint', 'done', 'turnstile',
+    'errorMessage', 'errorHint', 'done', 'challenge',
   ].forEach((id) => { el[id] = document.getElementById(id); });
 
   context = parseContext(location.hash);

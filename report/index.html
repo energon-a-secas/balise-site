@@ -115,7 +115,15 @@
            paired with BALISE_TURNSTILE_SECRET on the Worker. Do not commit
            Cloudflare's 1x0000... test key: it always passes, so shipping it turns
            the bot check into decoration while still looking configured. -->
-      <div id="turnstile" class="cf-turnstile" data-sitekey="0x4AAAAAAEibdzXZ9E_4_65D" data-theme="auto"></div>
+      <!-- The id MUST NOT be "turnstile". An element id becomes a property of
+           window, and api.js guards its own setup with `"turnstile" in window`:
+           finding the div there, it decides it has already been imported, logs
+           "Turnstile already has been loaded", and skips assigning the real API.
+           The widget then never renders, getResponse never exists, an empty
+           token is sent, and the Worker answers CHALLENGE_FAILED. Cloudflare's
+           own demo works because its div carries the class and no id at all.
+           Rendering is by class, so nothing here needs the name. -->
+      <div id="challenge" class="cf-turnstile" data-sitekey="0x4AAAAAAEibdzXZ9E_4_65D" data-theme="auto"></div>
 
       <div class="report-error" id="error" role="alert" hidden>
         <p class="report-error__message" id="errorMessage"></p>
