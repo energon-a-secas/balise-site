@@ -128,7 +128,8 @@
            token is sent, and the Worker answers CHALLENGE_FAILED. Cloudflare's
            own demo works because its div carries the class and no id at all.
            Rendering is by class, so nothing here needs the name. -->
-      <div id="challenge" class="cf-turnstile" data-sitekey="0x4AAAAAAEibdzXZ9E_4_65D" data-theme="auto"></div>
+      <div id="challenge" class="cf-turnstile" data-sitekey="0x4AAAAAAEibdzXZ9E_4_65D" data-theme="auto"
+           data-error-callback="neoChallengeError"></div>
 
       <div class="report-error" id="error" role="alert" hidden>
         <p class="report-error__message" id="errorMessage"></p>
@@ -156,6 +157,18 @@
     Reports are reviewed by a person before anything is published.
   </footer>
 
+  <!-- Turnstile calls its error callback by NAME off window, and a module
+       cannot publish one, so the bridge is declared here and ahead of api.js.
+       It also records the last code, because the widget can fail before the
+       module has registered its listener and a missed error is what put us
+       back to a silent failure. -->
+  <script>
+    window.neoChallengeError = function (code) {
+      window.__neoChallengeError = code;
+      document.dispatchEvent(new CustomEvent('neo:challenge-error', { detail: code }));
+      return true;
+    };
+  </script>
   <script src="https://challenges.cloudflare.com/turnstile/v0/api.js" async defer></script>
   <script type="module" src="../js/report-page.js"></script>
 </body>

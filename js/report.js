@@ -110,6 +110,33 @@ function failWith(result) {
   setText(el.submit, 'Send report');
 }
 
+/**
+ * A challenge that cannot run used to be invisible. getResponse returns no
+ * token, challengeToken() correctly yields '', and the reader was handed the
+ * Worker's CHALLENGE_FAILED hint telling them to wait for a checkbox that is
+ * not on the page. Cloudflare reports the real reason to an error callback,
+ * so show that instead of guessing.
+ *
+ * Families, per Cloudflare's client-side error docs: 110 is configuration,
+ * which the reader cannot fix; 300 and 600 are the challenge failing to
+ * execute, which is nearly always the browsing context rather than this site.
+ */
+function challengeFailed(code) {
+  const family = String(code).slice(0, 3);
+  let hint;
+  if (family === '110') {
+    hint = 'The check is misconfigured for this domain, which is ours to fix and not yours. Nothing you type here can get past it today.';
+  } else if (family === '300' || family === '600') {
+    hint = 'This usually means third party cookies are blocked for challenges.cloudflare.com, or the page is open inside an embedded browser. Try a normal browser window.';
+  } else {
+    hint = 'Reload the page and try once more.';
+  }
+  failWith({ message: `The security check could not run (code ${code}).`, hint });
+  // failWith hands the button back, which is right for a failed send and wrong
+  // here: without a challenge there is nothing to send.
+  el.submit.disabled = true;
+}
+
 async function submit(event) {
   event.preventDefault();
   hide(el.error);
@@ -213,6 +240,10 @@ export function initReport() {
   }
 
   renderContext();
+  document.addEventListener('neo:challenge-error', (e) => challengeFailed(e.detail));
+  // The widget can fail before this module runs, so read what the bridge kept.
+  if (window.__neoChallengeError) challengeFailed(window.__neoChallengeError);
+
   el.body.addEventListener('input', updateCount);
   el.form.addEventListener('submit', submit);
   updateCount();
