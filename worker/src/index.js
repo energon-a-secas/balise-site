@@ -1,24 +1,32 @@
-// Balise: the fleet's correction-reporting Worker. Ingest, review desk, public log.
+// Balise: the fleet's correction-reporting Worker, and the fleet's open-items board.
 //
-// Five routes:
-//   POST   /report       public ingest, Turnstile gated, rate limited
-//   GET    /reports      the private queue          (Authorization: Bearer, C3)
-//   PATCH  /reports/:id  one status transition      (Authorization: Bearer, C3 + C4)
-//   GET    /log          the public resolved log    (no auth, cacheable)
-//   GET    /health       which secrets are bound, and the per-site read-back
+// Eight routes, two feeds:
+//   POST   /report          public ingest, Turnstile gated, rate limited
+//   GET    /reports         the private queue          (Authorization: Bearer, C3)
+//   PATCH  /reports/:id     one status transition      (Authorization: Bearer, C3 + C4)
+//   GET    /log             the public corrections log (no auth, cacheable)
+//   POST   /open-items      one import batch           (Authorization: Bearer, C3)
+//   POST   /open-items/sync what the importer saw      (Authorization: Bearer, C3)
+//   GET    /board           the public open-items board (no auth, cacheable)
+//   GET    /health          which secrets are bound, and the per-site read-back
+//
+// The two feeds share one table, one desk and one triage flow, because they share the
+// same rule: text arrives in PRIVATE, a person decides, and only a sentence that person
+// typed reaches a public page. Corrections arrive from strangers; open items arrive from
+// the fleet's own trackers. NOTHING ON EITHER FEED PUBLISHES ITSELF.
 //
 // Contracts this file enforces, all frozen in docs/delivery/CONTRACTS.md:
 //   C1  the report shape        -> src/validate.js
 //   C2  the error envelope      -> src/envelope.js
 //   C3  operator authentication -> below, plus auth_attempts in src/store.js
-//   C4  the status vocabulary   -> src/store.js, which owns the transition table
+//   C4  the status vocabulary   -> src/transitions.js, enforced in src/store.js
 //
 // No response from this Worker is ever HTTP 500. The router is wrapped in a try/catch in
 // the default export at the bottom, the same shape as
 // projects/resume-forge-site/worker/src/index.js:341-365.
 //
-// /report and /log NEVER read the Authorization header. A public route that also honours
-// an operator credential is one refactor away from leaking the queue.
+// /report, /log and /board NEVER read the Authorization header. A public route that also
+// honours an operator credential is one refactor away from leaking the queue.
 
 import { ERROR_CODES, fail, ok, corsHeaders, originVerdict } from './envelope.js';
 import { validateReport, validatePatch, validateListQuery, REQUEST_MAX_BYTES } from './validate.js';
@@ -36,11 +44,12 @@ import {
   recordAuthResult,
   rowsReadBudget,
 } from './store.js';
+import { verifyTurnstile } from './turnstile.js';
+import { openImport, openSync, openBoard } from './routes-open.js';
 
 export { ERROR_CODES };
 
 const VERSION = '1.0.0';
-const TURNSTILE_VERIFY = 'https://challenges.cloudflare.com/turnstile/v0/siteverify';
 const HEALTH_WINDOW_DAYS = 30;
 
 /** The one sentence a failed operator auth ever gets. It does not say which of the three
@@ -102,28 +111,11 @@ const tooLarge = (provider, origin, env) =>
 const notARoute = (origin, env, hint) =>
   fail('NOT_A_ROUTE', { provider: '', origin, env, message: 'That path and method are not a route on this worker.', hint });
 
-const ROUTES_HINT = 'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log and GET /health.';
+const ROUTES_HINT =
+  'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board and GET /health.';
 
 // ── C3: operator authentication ───────────────────────────────────────────────
 
-/**
- * Returns { actor } on success or a ready-made 401 envelope. Every failure returns the
- * same sentence.
- *
- * The comparison is constant time: SHA-256 both sides, then crypto.subtle.timingSafeEqual
- * on the two 32 byte digests. Hashing first is REQUIRED, not tidiness: timingSafeEqual
- * throws on unequal length buffers, so comparing raw tokens would both leak the secret's
- * length through timing and throw on most wrong guesses.
- *
- * Cloudflare's own timing-attack example page was WRONG until 2026 and was fixed only
- * after cloudflare-docs#23623. Any pre-2026 copy of it returns early on a length mismatch,
- * which is the leak it claims to prevent. The current documented form
- * (https://developers.cloudflare.com/workers/examples/protect-against-timing-attacks/,
- * updated 2026-04-23) compares the input against itself and negates instead of returning
- * early, and that is the branch below. Hashing to a fixed 32 bytes means it should be
- * unreachable; it is written out anyway so that a later change of digest cannot
- * reintroduce the leak silently.
- */
 /**
  * Constant-time compare of an already hashed presentation against a candidate secret.
  * Returns false for an unset secret, which is how a deployment with no automation token
@@ -145,6 +137,8 @@ async function matches(presentedHash, candidate) {
     : !crypto.subtle.timingSafeEqual(presentedHash, presentedHash);
 }
 
+/** Returns { actor } on success, or a ready-made 401 envelope. Every failure returns the
+ *  same sentence, whichever of the three things went wrong. */
 async function authenticate(request, env, db, key, now) {
   if (!env || !env.BALISE_OPERATOR_TOKEN) {
     return {
@@ -186,58 +180,6 @@ async function authenticate(request, env, db, key, now) {
   // The operator wins if both secrets are somehow the same value, so a misconfiguration
   // degrades to the MORE restrictive outcome being unreachable rather than the reverse.
   return { actor: operator ? 'human' : 'ai' };
-}
-
-// ── Turnstile ─────────────────────────────────────────────────────────────────
-
-/**
- * Server side validation is mandatory: the widget alone protects nothing, because anyone
- * can POST any string to this endpoint. Tokens are single use and expire after five
- * minutes (https://developers.cloudflare.com/turnstile/get-started/server-side-validation/).
- *
- * Gate on the secret before the fetch, the same rule as the fleet's reference worker: a
- * missing secret is a configuration fact and must not be reported as a challenge failure.
- */
-async function verifyTurnstile(env, token, ip) {
-  if (!env.BALISE_TURNSTILE_SECRET) {
-    return {
-      code: 'NOT_CONFIGURED',
-      message: 'This service has no Turnstile secret set, so it cannot check that you are a person.',
-      hint: 'The site owner needs to set BALISE_TURNSTILE_SECRET. Nothing you can type will get past this one, so tell them what you found instead.',
-    };
-  }
-  if (!token || typeof token !== 'string' || token.length > 2048) {
-    return {
-      code: 'CHALLENGE_FAILED',
-      message: 'The report arrived without a completed challenge.',
-      hint: 'Wait for the checkbox on the report page to finish, then send it again.',
-    };
-  }
-  const form = new URLSearchParams({ secret: env.BALISE_TURNSTILE_SECRET, response: token });
-  if (ip) form.set('remoteip', ip);
-  let body;
-  try {
-    const res = await fetch(TURNSTILE_VERIFY, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: form,
-    });
-    body = await res.json();
-  } catch (err) {
-    console.error('turnstile siteverify threw:', err);
-    return {
-      code: 'CHALLENGE_FAILED',
-      message: 'The challenge check could not be completed.',
-      hint: 'Try again in a minute. Your text is still in this page, so nothing is lost.',
-    };
-  }
-  if (body && body.success === true) return null;
-  console.warn('turnstile refused:', body && body['error-codes']);
-  return {
-    code: 'CHALLENGE_FAILED',
-    message: 'The challenge on the report page was not accepted.',
-    hint: 'Reload the report page to get a fresh challenge, then send it again.',
-  };
 }
 
 // ── The router ────────────────────────────────────────────────────────────────
@@ -293,6 +235,14 @@ const router = {
       if (method !== 'GET') return notARoute(origin, env, 'The public log is read with GET /log.');
       return await resolvedLog(request, env, origin);
     }
+    if (path === '/open-items' || path === '/open-items/sync') {
+      if (method !== 'POST') return notARoute(origin, env, 'An import is POST /open-items, and POST /open-items/sync closes what it did not see.');
+      return await importRoute(request, env, origin, ip, now, path === '/open-items/sync');
+    }
+    if (path === '/board') {
+      if (method !== 'GET') return notARoute(origin, env, 'The open-items board is read with GET /board.');
+      return await openBoard(request, env, { origin });
+    }
     if (path === '/health') {
       if (method !== 'GET') return notARoute(origin, env, 'Health is read with GET /health.');
       return await health(env, origin, now);
@@ -304,7 +254,8 @@ const router = {
 const surfaceFor = (path) => {
   if (path === '/report') return 'ingest';
   if (path === '/reports' || path.startsWith('/reports/')) return 'desk';
-  if (path === '/log') return 'log';
+  if (path.startsWith('/open-items')) return 'desk';
+  if (path === '/log' || path === '/board') return 'log';
   return '';
 };
 
@@ -411,6 +362,31 @@ async function deskPatch(request, env, origin, ip, now, id) {
   return ok(P, { report: result.report }, { origin, env });
 }
 
+// ── POST /open-items and /open-items/sync ─────────────────────────────────────
+
+/**
+ * C3 first, then the body, then src/routes-open.js. Both import routes take EITHER
+ * credential: the importer is a script the operator runs, and the automation token is the
+ * intended value for it, because neither route can move a report toward a reader. A
+ * leaked import token writes drafts into a private queue and nothing else.
+ *
+ * The lockout counts these the same way it counts the desk, so a script pointed at the
+ * wrong deployment with the wrong token does not get unlimited tries.
+ */
+async function importRoute(request, env, origin, ip, now, isSync) {
+  const P = 'desk';
+  const key = actorKey(await ipHash(env.BALISE_IP_SALT, ip), ip);
+  const auth = await authenticate(request, env, env.DB, key, now);
+  if (auth.error) return fail(auth.error.code, { provider: P, origin, env, message: auth.error.message, hint: auth.error.hint });
+
+  const parsed = await readJson(request, P, origin, env);
+  if (parsed.error) return parsed.error;
+
+  return isSync
+    ? await openSync(env, parsed.value, { origin, now })
+    : await openImport(env, parsed.value, { origin, now });
+}
+
 // ── GET /log ──────────────────────────────────────────────────────────────────
 
 async function resolvedLog(request, env, origin) {
@@ -468,6 +444,10 @@ async function health(env, origin, now) {
     config: {
       db: Boolean(env.DB),
       operator_token: Boolean(env.BALISE_OPERATOR_TOKEN),
+      // The second credential. With no automation token bound, this deployment simply
+      // has no automation role and the importer has to run as the operator, which is a
+      // configuration fact an operator can read here instead of guessing at a 401.
+      automation_token: Boolean(env.BALISE_AUTOMATION_TOKEN),
       turnstile: Boolean(env.BALISE_TURNSTILE_SECRET),
       ip_salt: Boolean(env.BALISE_IP_SALT),
       rate_limiter: Boolean(env.INGEST_LIMITER),

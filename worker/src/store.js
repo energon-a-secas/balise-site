@@ -1,6 +1,9 @@
-// The ONLY file in this Worker that contains SQL. If you are about to write a query
-// somewhere else, put it here instead: one file means one place to audit what touches
-// the store, and one place where CONTRACTS.md C4's transition table is enforced.
+// The corrections half of the store, and one of only TWO files in this Worker that
+// contain SQL. The other is src/store-open.js, which owns the open-items feed (queue
+// #58) and nothing else. If you are about to write a query somewhere else, put it in one
+// of these two instead: two files means two places to audit what touches the store. The
+// C4 tables themselves are pure and live in src/transitions.js; this file is where they
+// are enforced.
 //
 // Two D1 limits shape everything below, and they bite at our SHAPE, not our volume
 // (https://developers.cloudflare.com/d1/platform/limits/, CONTRACTS.md A4):
@@ -16,70 +19,16 @@
 // the budget below. Local D1 enforces no limit and no quota, so that number and the test
 // asserting it are the only things that would catch a scan before production.
 
-// ── C4: the status vocabulary and the transition table ────────────────────────
+import { redactionFindings } from './redact.js';
 
-/** The seven statuses. Reading is whitelisted against this list on both sides. */
-export const STATUSES = ['new', 'triaged', 'accepted', 'fixed', 'rejected', 'spam', 'duplicate'];
+// ── C4: the status vocabulary and the transition tables ───────────────────────
+//
+// Defined in src/transitions.js, which is pure. Re-exported here because this file is
+// where C4 is ENFORCED and because every caller already imports it from the store.
 
-/**
- * Legal transitions, enforced in code. Anything not listed here is 409 BAD_TRANSITION.
- * `fixed` is terminal and has no entry.
- */
-export const TRANSITIONS = {
-  new: ['triaged', 'accepted', 'rejected', 'spam', 'duplicate'],
-  triaged: ['accepted', 'rejected', 'spam', 'duplicate'],
-  accepted: ['fixed', 'rejected'],
-  fixed: [],
-  rejected: ['accepted'],
-  spam: ['accepted'],
-  duplicate: ['accepted'],
-};
+import { STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition } from './transitions.js';
 
-/**
- * The AI is authorised for exactly one edge: new -> triaged. Settled decision 4 of this
- * campaign ("triage and propose, never auto-apply") is enforced here rather than
- * described in a comment somewhere.
- *
- * READ THIS BEFORE TRUSTING IT. The AI job and the desk hold the SAME token today, so
- * the Worker tells them apart by the `X-Balise-Actor: ai` header, which the caller sets
- * about itself. That is an HONESTY MECHANISM, NOT A SECURITY BOUNDARY: it stops the job
- * from doing the wrong thing, and it does nothing at all against an attacker who already
- * holds the token, because that attacker simply omits the header. Do not later cite this
- * check as the reason the AI "cannot" change a report's status. If it ever needs to be a
- * boundary, the AI needs its own credential.
- */
-/**
- * What the AUTOMATION credential may do. Enforced against the token that
- * authenticated, never against a header the caller sets, so this is a real
- * boundary rather than the honesty mechanism it used to be.
- *
- * The rule behind the list: automation may write a verdict and it may CLOSE
- * junk, but it may never move a report toward anything a reader will see.
- *
- *   - `triaged` records an opinion and its evidence. Publishes nothing.
- *   - `spam` and `duplicate` are closing moves. They publish nothing either,
- *     they are the bulk of the volume, and they are the judgement an AI is
- *     actually good at. Both are cheap to get wrong: a human reopen
- *     (spam -> accepted) is already legal and is deliberately NOT granted here,
- *     so automation can close junk but only a person can bring one back.
- *
- * `accepted` and `fixed` stay human. `fixed` in particular requires a
- * public_note, and C4 says an operator writes that note and never derives it
- * from the reporter's text, because it lands on a public page. An AI writing it
- * would route stranger-influenced text onto neorgon.com through a paraphrase,
- * which is the exact thing settled decision 3 exists to prevent.
- */
-export const AI_TRANSITIONS = {
-  new: ['triaged', 'spam', 'duplicate'],
-  triaged: ['spam', 'duplicate'],
-};
-
-/** Pure, and exported so a test can assert the whole table without a database. */
-export function canTransition(from, to, actor) {
-  const table = actor === 'ai' ? AI_TRANSITIONS : TRANSITIONS;
-  const allowed = table[from];
-  return Array.isArray(allowed) && allowed.includes(to);
-}
+export { STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition };
 
 // ── Budgets ───────────────────────────────────────────────────────────────────
 
@@ -134,7 +83,7 @@ export async function ipHash(salt, address) {
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 
-const storeError = (where, err) => {
+export const storeError = (where, err) => {
   console.error(`d1 ${where} failed:`, err);
   return {
     code: 'STORE_ERROR',
@@ -187,26 +136,41 @@ export async function insertReport(db, row) {
 const DESK_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_label,
                       kind, body, contact, status, public, public_note, duplicate_of,
                       ai_verdict, ai_confidence, ai_notes, ai_at,
-                      decided_at, fixed_at, fixed_ref`;
+                      decided_at, fixed_at, fixed_ref,
+                      source, source_ref, suggested, opened_at, source_closed_at`;
 
 /**
  * The private queue. ONE query returning many rows, never a query per row.
  *
- * The two SQL strings are deliberately not one string with `(?1 IS NULL OR status = ?1)`.
- * That form is shorter and it defeats the index: SQLite cannot use
- * reports_status_created for a predicate whose column may not participate, so the filtered
- * list would silently become a full scan and only rows_read would show it.
+ * The SQL is built from a handful of CONSTANT fragments and is deliberately not one
+ * string with `(?1 IS NULL OR status = ?1)`. That form is shorter and it defeats the
+ * index: SQLite cannot use reports_status_created for a predicate whose column may not
+ * participate, so the filtered list would silently become a full scan and only rows_read
+ * would show it. Nothing below is ever interpolated from a request; the fragments are
+ * chosen, and every value is bound.
+ *
+ * THE DEFAULT LIST IS CORRECTIONS, not everything. Two feeds share this table now, and
+ * an operator who has never opened the Open items tab must not find sixty imported drafts
+ * sitting in the queue of stranger reports. `kind` selects the feed:
+ *
+ *   absent            -> kind <> 'open', the corrections queue this route has always been
+ *   'open'            -> the imported drafts
+ *   a correction kind -> that one kind
+ *
+ * Each of the four combinations lands on an index created for it. The two `kind <> 'open'`
+ * shapes need PARTIAL indexes, because an inequality cannot seek an index prefix: the
+ * term is written here exactly as it is written in migrations/0002_open_items.sql, since
+ * SQLite matches a partial index by implication and a reworded predicate silently loses
+ * the index while returning identical rows.
  */
-export async function listReports(db, { status, before, limit }) {
+export async function listReports(db, { status, kind, before, limit }) {
   const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;
-  const sql = status
-    ? `SELECT ${DESK_COLUMNS} FROM reports
-        WHERE status = ? AND created_at < ?
-        ORDER BY created_at DESC LIMIT ?`
-    : `SELECT ${DESK_COLUMNS} FROM reports
-        WHERE created_at < ?
+  const kindTerm = kind ? 'kind = ?' : "kind <> 'open'";
+  const statusTerm = status ? 'status = ? AND ' : '';
+  const sql = `SELECT ${DESK_COLUMNS} FROM reports
+        WHERE ${kindTerm} AND ${statusTerm}created_at < ?
         ORDER BY created_at DESC LIMIT ?`;
-  const args = status ? [status, cursor, limit] : [cursor, limit];
+  const args = [...(kind ? [kind] : []), ...(status ? [status] : []), cursor, limit];
   try {
     const res = await db.prepare(sql).bind(...args).run();
     const rows = res.results || [];
@@ -241,7 +205,7 @@ export async function getReport(db, id) {
 export async function applyTransition(db, { id, actor, patch, now }) {
   let current;
   try {
-    current = await db.prepare('SELECT id, status FROM reports WHERE id = ?').bind(id).first();
+    current = await db.prepare('SELECT id, status, kind FROM reports WHERE id = ?').bind(id).first();
   } catch (err) {
     return storeError('transition read', err);
   }
@@ -255,11 +219,15 @@ export async function applyTransition(db, { id, actor, patch, now }) {
 
   const from = STATUSES.includes(current.status) ? current.status : 'new';
   const to = patch.status;
-  if (!canTransition(from, to, actor)) {
+  const isOpenItem = current.kind === 'open';
+  if (!canTransition(from, to, actor, isOpenItem ? 'open' : null)) {
+    const table = actor === 'ai' ? AI_TRANSITIONS : isOpenItem ? OPEN_TRANSITIONS : TRANSITIONS;
     return {
       code: 'BAD_TRANSITION',
       message: `A report at "${from}" cannot move to "${to}"${actor === 'ai' ? ' for the triage job' : ''}.`,
-      hint: `From "${from}" the legal moves are ${(actor === 'ai' ? AI_TRANSITIONS[from] : TRANSITIONS[from])?.join(', ') || 'none, it is terminal'}.`,
+      hint: actor === 'ai' && isOpenItem
+        ? 'An open item is moved by a person, never by the triage job. Nothing on that feed is automatic.'
+        : `From "${from}" the legal moves are ${table[from]?.join(', ') || 'none, it is terminal'}.`,
     };
   }
 
@@ -270,6 +238,33 @@ export async function applyTransition(db, { id, actor, patch, now }) {
       message: 'A report cannot be marked fixed without a public note.',
       hint: 'Write one sentence for the public log, in your own words, then mark it fixed.',
     };
+  }
+
+  // An open item published as OPEN carries the same requirement, for the same reason:
+  // `accepted` is what puts it on the board, and an entry with no sentence is a blank
+  // line telling a reader nothing.
+  if (isOpenItem && to === 'accepted' && !(patch.public_note || '').trim()) {
+    return {
+      code: 'BAD_FIELD',
+      message: 'An open item cannot be published without a sentence.',
+      hint: 'Say what is being worked on, in your own words. One line is the whole entry.',
+    };
+  }
+
+  // THE REDACTION FLOOR, server side. The desk runs the same rules live under the field,
+  // which is a courtesy to whoever is typing; this is the one that decides. A public_note
+  // on an open item is the only string this feed can ever put in front of a reader, and
+  // the trackers it is drafted from are full of paths, line numbers and ids.
+  if (isOpenItem && patch.public_note !== undefined) {
+    const findings = redactionFindings(patch.public_note);
+    if (findings.length) {
+      const { rule, match } = findings[0];
+      return {
+        code: 'BAD_FIELD',
+        message: `That sentence contains a ${rule} (${match}) and the board never shows one.`,
+        hint: 'Say what is being done, not where. Rewrite it and publish again.',
+      };
+    }
   }
   if (to === 'duplicate' && !(patch.duplicate_of || '').trim()) {
     return {
@@ -339,6 +334,11 @@ export async function applyTransition(db, { id, actor, patch, now }) {
  * `body` and `contact` are absent from this SELECT and that is the point: the stranger's
  * raw text is never served from a neorgon.com domain. Only the operator's `public_note`
  * is. Adding `body` here would break settled decision 3 in one line, so do not.
+ *
+ * `kind <> 'open'` is the one amendment this query has taken. A resolved open item is a
+ * board entry and not a correction: it names no site, no page and no reporter, so it
+ * would land in the corrections log as a line about nothing. The term is written the same
+ * way in migrations/0002_open_items.sql, which is what lets its partial index serve this.
  */
 export async function publicLog(db, { before, limit }) {
   const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;
@@ -347,7 +347,7 @@ export async function publicLog(db, { before, limit }) {
       .prepare(
         `SELECT site, url, target_label, public_note, fixed_ref, fixed_at
            FROM reports
-          WHERE status = 'fixed' AND public = 1 AND fixed_at < ?
+          WHERE kind <> 'open' AND status = 'fixed' AND public = 1 AND fixed_at < ?
           ORDER BY fixed_at DESC LIMIT ?`,
       )
       .bind(cursor, limit)
@@ -372,6 +372,12 @@ export async function publicLog(db, { before, limit }) {
  *
  * A site absent from this list either has no visitors or has a broken widget, and the
  * operator can tell which in one click by opening the site.
+ *
+ * IMPORTED OPEN ITEMS ARE EXCLUDED, and that exclusion is the whole reason this signal
+ * still means anything. They carry their source name in `site` because the column is NOT
+ * NULL, they arrive in the hundreds from one command, and counting them here would put
+ * four invented sites at the top of the list and drown the one number that says a real
+ * Beacon is alive.
  */
 export async function healthSites(db, since) {
   try {
@@ -379,7 +385,7 @@ export async function healthSites(db, since) {
       .prepare(
         `SELECT site, COUNT(*) AS reports, MAX(created_at) AS last_at
            FROM reports
-          WHERE created_at >= ?
+          WHERE kind <> 'open' AND created_at >= ?
           GROUP BY site
           ORDER BY reports DESC`,
       )
@@ -464,5 +470,14 @@ function toReport(row) {
     decided_at: row.decided_at || null,
     fixed_at: row.fixed_at || null,
     fixed_ref: row.fixed_ref || '',
+    // The open-item half. All five are null or empty on a correction, which is what makes
+    // this one queue with two feeds rather than two queues. `source_ref` and `body` are
+    // the private halves: the desk shows them to the operator and no public query selects
+    // either one.
+    source: row.source || null,
+    source_ref: row.source_ref || null,
+    suggested: row.suggested || '',
+    opened_at: row.opened_at || null,
+    source_closed_at: row.source_closed_at || null,
   };
 }

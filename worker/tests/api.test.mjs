@@ -14,8 +14,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 
 import { ERROR_CODES, HTTP_FOR, SURFACES, originVerdict, allowedOrigins } from '../src/envelope.js';
-import { validateReport, validatePatch, validateListQuery, BODY_MIN, BODY_MAX, URL_MAX } from '../src/validate.js';
-import { STATUSES, TRANSITIONS, AI_TRANSITIONS, canTransition, rowsReadBudget, normaliseForFingerprint } from '../src/store.js';
+import {
+  validateReport, validatePatch, validateListQuery, validateOpenBatch, validateOpenSync,
+  BODY_MIN, BODY_MAX, URL_MAX, KINDS, LIST_KINDS,
+} from '../src/validate.js';
+import {
+  STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition, rowsReadBudget,
+  normaliseForFingerprint,
+} from '../src/store.js';
+import { OPEN_SOURCES, IMPORT_BATCH_MAX, SYNC_REFS_MAX, openFingerprintInput, dayStamp } from '../src/store-open.js';
 
 // ── C2.1: the drift test ──────────────────────────────────────────────────────
 
@@ -273,4 +280,122 @@ test('A4: the rows_read budget grows with the page and stays a small multiple of
 test('the fingerprint ignores case and whitespace, and nothing else', () => {
   assert.equal(normaliseForFingerprint('  The  Same\nthing '), normaliseForFingerprint('the same thing'));
   assert.notEqual(normaliseForFingerprint('the same thing'), normaliseForFingerprint('the same things'));
+});
+
+/* ── The open-items board (queue #58) ──────────────────────────────────────────
+ *
+ * The kind-scoped transition table and the shape of an import batch. The redaction rules
+ * are in tests/redact.test.mjs, which is a file of its own because that check is the one
+ * piece of this feed that also ships to the site. The flows are in
+ * tests/open-items.test.mjs.
+ */
+
+// ── C4, kind-scoped ───────────────────────────────────────────────────────────
+
+test('C4: an open item takes the human table plus one edge, new -> fixed', () => {
+  assert.deepEqual(OPEN_TRANSITIONS, {
+    new: ['triaged', 'accepted', 'fixed', 'rejected', 'spam', 'duplicate'],
+    triaged: ['accepted', 'rejected', 'spam', 'duplicate'],
+    accepted: ['fixed', 'rejected'],
+    fixed: [],
+    rejected: ['accepted'],
+    spam: ['accepted'],
+    duplicate: ['accepted'],
+  });
+  // The one edge, and the reason for it: an item whose source closed before anyone
+  // published it is a resolution, not an open item that resolved a second later.
+  assert.equal(canTransition('new', 'fixed', 'human', 'open'), true);
+  assert.equal(canTransition('new', 'fixed', 'human'), false);
+  assert.equal(canTransition('new', 'fixed', 'human', null), false);
+});
+
+test('C4: the corrections table is untouched by the open feed existing', () => {
+  for (const from of STATUSES) {
+    for (const to of STATUSES) {
+      assert.equal(canTransition(from, to, 'human'), TRANSITIONS[from].includes(to), `${from} -> ${to}`);
+    }
+  }
+});
+
+test('C4: automation has NO edge on an open item, not one', () => {
+  for (const from of STATUSES) {
+    for (const to of STATUSES) {
+      assert.equal(canTransition(from, to, 'ai', 'open'), false, `ai open ${from} -> ${to}`);
+    }
+  }
+  // And it keeps the corrections edges it already had, so this narrowed nothing else.
+  assert.equal(canTransition('new', 'triaged', 'ai'), true);
+  assert.equal(canTransition('new', 'spam', 'ai'), true);
+});
+
+// ── The list filter ───────────────────────────────────────────────────────────
+
+test('the desk may ask for a kind, and only for a kind this service knows', () => {
+  const p = (s) => validateListQuery(new URLSearchParams(s), STATUSES);
+  assert.equal(p('kind=open').value.kind, 'open');
+  assert.equal(p('kind=wrong').value.kind, 'wrong');
+  assert.equal(p('').value.kind, null, 'no kind means the corrections queue, not everything');
+  assert.equal(p('kind=secret').code, 'BAD_FIELD');
+  assert.deepEqual(LIST_KINDS, [...KINDS, 'open']);
+});
+
+// ── The import batch ──────────────────────────────────────────────────────────
+
+const batch = (over = {}) => ({
+  v: 1,
+  source: 'queue',
+  items: [{ ref: '#58', text: 'Balise as the fleet open-items board', opened_at: 1757289600000 }],
+  ...over,
+});
+
+test('an import batch names one of the four trackers and format 1', () => {
+  assert.equal(validateOpenBatch(batch(), OPEN_SOURCES, IMPORT_BATCH_MAX).code, undefined);
+  assert.equal(validateOpenBatch(batch({ source: 'inbox' }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'BAD_FIELD');
+  assert.equal(validateOpenBatch(batch({ source: '' }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'MISSING_PARAM');
+  assert.equal(validateOpenBatch(batch({ v: 2 }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'BAD_VERSION');
+  assert.deepEqual(OPEN_SOURCES, ['queue', 'brief', 'harness', 'registry']);
+});
+
+test('an import batch is capped at the query budget, not at a size', () => {
+  const many = (n) => Array.from({ length: n }, (_, i) => ({ ref: `#${i}`, text: 'x' }));
+  assert.equal(validateOpenBatch(batch({ items: many(IMPORT_BATCH_MAX) }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, undefined);
+  assert.equal(validateOpenBatch(batch({ items: many(IMPORT_BATCH_MAX + 1) }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'BAD_FIELD');
+  assert.equal(validateOpenBatch(batch({ items: [] }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'MISSING_PARAM');
+});
+
+test('an item needs a ref and text, and a ref may not repeat inside one batch', () => {
+  assert.equal(validateOpenBatch(batch({ items: [{ text: 'x' }] }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'MISSING_PARAM');
+  assert.equal(validateOpenBatch(batch({ items: [{ ref: '#1' }] }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, 'MISSING_PARAM');
+  // A repeat would insert once and report the second as unchanged, which reads as
+  // "already imported" when it means "sent twice".
+  const twice = validateOpenBatch(batch({ items: [{ ref: '#1', text: 'a' }, { ref: '#1', text: 'b' }] }), OPEN_SOURCES, IMPORT_BATCH_MAX);
+  assert.equal(twice.code, 'BAD_FIELD');
+  assert.match(twice.message, /twice/);
+});
+
+test('a timestamp is milliseconds, so a seconds value is caught rather than stored', () => {
+  const secs = validateOpenBatch(batch({ items: [{ ref: '#1', text: 'a', opened_at: 1757289600 }] }), OPEN_SOURCES, IMPORT_BATCH_MAX);
+  assert.equal(secs.code, 'BAD_FIELD');
+  assert.match(secs.message, /millisecond/);
+  assert.equal(validateOpenBatch(batch({ items: [{ ref: '#1', text: 'a', opened_at: null }] }), OPEN_SOURCES, IMPORT_BATCH_MAX).code, undefined);
+});
+
+test('a sync call carries the complete ref set for one tracker', () => {
+  assert.equal(validateOpenSync({ source: 'queue', refs: ['#1', '#2'] }, OPEN_SOURCES, SYNC_REFS_MAX).code, undefined);
+  // An empty list is legal and means "this tracker has nothing open", which closes the
+  // lot. It is the harness's normal state.
+  assert.deepEqual(validateOpenSync({ source: 'harness', refs: [] }, OPEN_SOURCES, SYNC_REFS_MAX).value.refs, []);
+  assert.equal(validateOpenSync({ source: 'queue' }, OPEN_SOURCES, SYNC_REFS_MAX).code, 'MISSING_PARAM');
+  assert.equal(validateOpenSync({ source: 'queue', refs: [1, 2] }, OPEN_SOURCES, SYNC_REFS_MAX).code, 'BAD_FIELD');
+});
+
+test('the open-item fingerprint separates its three parts', () => {
+  // No pair of (source, ref) values may collide by concatenation.
+  assert.notEqual(openFingerprintInput('queue', 'x#1'), openFingerprintInput('queuex', '#1'));
+  assert.equal(openFingerprintInput('queue', '#58'), openFingerprintInput('queue', '#58'));
+});
+
+test('the board shows a day and never a time', () => {
+  assert.equal(dayStamp(Date.UTC(2026, 8, 9, 23, 59)), '2026-09-09');
+  for (const bad of [null, undefined, 0, -1, NaN, 'yesterday']) assert.equal(dayStamp(bad), null);
 });

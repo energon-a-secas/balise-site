@@ -9,7 +9,15 @@
 // router turns into a C2 envelope. No function here throws and none of them touches the
 // network or the database.
 
-const KINDS = ['wrong', 'missing', 'broken', 'other'];
+/**
+ * The four kinds a REPORT can be. This list is what a stranger may send, and the import
+ * route's `open` is deliberately not in it: `kind = 'open'` is written by one route, from
+ * an authenticated importer, and can never arrive through POST /report.
+ */
+export const KINDS = ['wrong', 'missing', 'broken', 'other'];
+
+/** What the desk may ASK for. Reading the open feed is allowed; writing it is not. */
+export const LIST_KINDS = [...KINDS, 'open'];
 
 const SITE_RE = /^[a-z0-9-]{1,40}$/;
 const TARGET_KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
@@ -163,6 +171,14 @@ export function validateListQuery(params, statuses) {
     return bad(`"${status}" is not a report status.`, `The statuses are ${statuses.join(', ')}. Drop the filter to see everything.`);
   }
 
+  // Which FEED the desk is asking for. Absent means the corrections queue, which is what
+  // this route has always returned; `open` is the imported items. The whitelist is here
+  // rather than in the store because the value reaches a SQL predicate.
+  const kind = (params.get('kind') || '').trim();
+  if (kind && !LIST_KINDS.includes(kind)) {
+    return bad(`"${kind}" is not a kind of report.`, `The kinds are ${LIST_KINDS.join(', ')}. Drop the filter for the correction queue.`);
+  }
+
   const rawLimit = (params.get('limit') || '').trim();
   let limit = 25;
   if (rawLimit) {
@@ -181,7 +197,7 @@ export function validateListQuery(params, statuses) {
     }
   }
 
-  return { value: { status: status || null, limit, before } };
+  return { value: { status: status || null, kind: kind || null, limit, before } };
 }
 
 /** The PATCH body. The transition itself is checked in store.js, which owns C4. */
@@ -232,4 +248,133 @@ export function validatePatch(body, statuses) {
   }
 
   return { value: out };
+}
+
+/* ── The open-items import (queue #58) ─────────────────────────────────────────
+ *
+ * The importer is authenticated and runs on the operator's own machine, so this is not
+ * hostile input in the way a report is. It is checked to the same standard anyway: the
+ * caps below are what stops a runaway parse of a tracker file from writing a megabyte
+ * into the queue, and one shape check here is cheaper than a store error at 3am.
+ */
+
+export const OPEN_REF_MAX = 128;
+export const OPEN_TEXT_MAX = 4000;
+export const OPEN_SUGGESTED_MAX = 500;
+
+/** The largest sensible millisecond timestamp, so a seconds-based value is caught. */
+const TIME_MIN = 946684800000; // 2000-01-01
+const TIME_MAX = 4102444800000; // 2100-01-01
+
+function timestamp(value, field) {
+  if (value === undefined || value === null || value === '') return { value: null };
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < TIME_MIN || n > TIME_MAX) {
+    return bad(
+      `${field} has to be a millisecond timestamp.`,
+      'Send Date.now() style milliseconds, not seconds and not a date string.',
+    );
+  }
+  return { value: n };
+}
+
+/**
+ * One import batch: { v: 1, source, items: [{ ref, text, suggested?, opened_at?, closed_at? }] }.
+ *
+ * `max` is the batch cap, which exists because of D1's 50 queries per invocation and not
+ * because of the body size: see the note at the top of src/store-open.js.
+ */
+export function validateOpenBatch(body, sources, max) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return bad('The import batch was not a JSON object.', 'Send { "v": 1, "source": "queue", "items": [...] }.');
+  }
+  if (body.v !== 1) {
+    return {
+      code: 'BAD_VERSION',
+      message: `This service reads import format 1 and that batch says ${JSON.stringify(body.v)}.`,
+      hint: 'Update tools/import-open-items.mjs to the format this worker reads.',
+    };
+  }
+
+  const source = isStr(body.source) ? body.source.trim() : '';
+  if (!source) return missing('The batch did not say which tracker it came from.', `Send a source: one of ${sources.join(', ')}.`);
+  if (!sources.includes(source)) {
+    return bad(`"${source}" is not a tracker this service reads.`, `The sources are ${sources.join(', ')}.`);
+  }
+
+  if (!Array.isArray(body.items)) return missing('The batch had no items array.', 'Send items as an array, even for one item.');
+  if (!body.items.length) return missing('The batch had no items in it.', 'Send at least one item, or send nothing at all.');
+  if (body.items.length > max) {
+    return bad(
+      `The batch has ${body.items.length} items and the limit is ${max}.`,
+      `Split it into batches of ${max}. The limit is a query budget, not a size one.`,
+    );
+  }
+
+  const items = [];
+  const refs = new Set();
+  for (const raw of body.items) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      return bad('An item in the batch was not an object.', 'Each item is { ref, text, opened_at }.');
+    }
+    const ref = isStr(raw.ref) ? raw.ref.trim() : '';
+    if (!ref) return missing('An item in the batch had no ref.', 'The ref is the private key inside the tracker, and it is what makes a re-run idempotent.');
+    if (ref.length > OPEN_REF_MAX) return bad(`An item ref is longer than ${OPEN_REF_MAX} characters.`, 'Hash the long part of the ref instead of sending it whole.');
+    // A repeat inside ONE batch would insert once and then report the second as
+    // unchanged, which reads as "already imported" when it is really "sent twice".
+    if (refs.has(ref)) return bad(`The ref ${ref} is in this batch twice.`, 'Deduplicate the batch before sending it.');
+    refs.add(ref);
+
+    const text = isStr(raw.text) ? raw.text.trim() : '';
+    if (!text) return missing(`The item ${ref} had no text.`, 'Send the tracker line itself. It stays private; only the operator sentence is published.');
+
+    const opened = timestamp(raw.opened_at, 'opened_at');
+    if (opened.code) return opened;
+    const closed = timestamp(raw.closed_at, 'closed_at');
+    if (closed.code) return closed;
+
+    items.push({
+      ref,
+      text: text.slice(0, OPEN_TEXT_MAX),
+      // The suggestion is a DRAFT the desk prefills, never a published string. It is
+      // capped and stored as it arrives; the redaction floor decides whether it is kept,
+      // and the operator rewrites it either way.
+      suggested: (isStr(raw.suggested) ? raw.suggested.trim() : '').slice(0, OPEN_SUGGESTED_MAX),
+      opened_at: opened.value,
+      closed_at: closed.value,
+    });
+  }
+
+  return { value: { source, items } };
+}
+
+/**
+ * One sync call: { source, refs: [...] }.
+ *
+ * The ref list is the COMPLETE set the importer saw this run, because anything missing
+ * from it is about to be marked closed. A partial list therefore says "everything else is
+ * finished", which is why the importer refuses to send one and why this cap is generous
+ * enough that the 8 KB body limit is what actually bites.
+ */
+export function validateOpenSync(body, sources, max) {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) {
+    return bad('The sync call was not a JSON object.', 'Send { "source": "queue", "refs": [...] }.');
+  }
+  const source = isStr(body.source) ? body.source.trim() : '';
+  if (!source) return missing('The sync call did not say which tracker it came from.', `Send a source: one of ${sources.join(', ')}.`);
+  if (!sources.includes(source)) {
+    return bad(`"${source}" is not a tracker this service reads.`, `The sources are ${sources.join(', ')}.`);
+  }
+  if (!Array.isArray(body.refs)) {
+    return missing('The sync call had no refs array.', 'Send every ref the importer saw this run, even if the list is empty.');
+  }
+  if (body.refs.length > max) {
+    return bad(`The sync call carries ${body.refs.length} refs and the limit is ${max}.`, 'Import that source in fewer, longer-lived refs.');
+  }
+  const refs = [];
+  for (const raw of body.refs) {
+    if (!isStr(raw) || !raw.trim()) return bad('A ref in the sync call was not text.', 'Every ref is the same string the import batch sent.');
+    refs.push(raw.trim().slice(0, OPEN_REF_MAX));
+  }
+  return { value: { source, refs } };
 }

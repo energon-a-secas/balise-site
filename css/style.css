@@ -795,3 +795,162 @@ button:active,
 .desk-badge--rejected  { color: #94a3b8; }
 .desk-badge--spam      { color: var(--danger); }
 .desk-badge--duplicate { color: #94a3b8; }
+
+/* ── The open-items board (public) and its half of the desk ─────
+ *
+ * Same vocabulary as the log above, one addition: the board ranks. A board
+ * that only grows is a graveyard, so resolutions come first, sit on a filled
+ * surface, and the newest one takes the accent and the size. Open items are
+ * deliberately the quiet half. The hierarchy is built from base.css surfaces
+ * and one accent, not from a second palette.
+ */
+
+.board-tabs {
+  display: flex;
+  gap: var(--space-2);
+  margin-bottom: var(--space-6);
+  border-bottom: 1px solid var(--border, #24304a);
+}
+.board-tab {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  padding: 0 var(--space-2);
+  min-height: var(--control-height);
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-muted, #94a3b8);
+  cursor: pointer;
+  transition: color var(--dur, 200ms) var(--ease-out),
+              border-color var(--dur, 200ms) var(--ease-out);
+}
+.board-tab:hover { color: var(--text-primary); }
+.board-tab.is-active { color: var(--text-primary); border-bottom-color: var(--accent); }
+
+.board__lede {
+  line-height: 1.65;
+  color: var(--text-secondary);
+  max-width: 62ch;
+  margin-bottom: var(--space-8);
+}
+.board__group + .board__group { margin-top: var(--space-8); }
+/* Both halves are headed, one of them louder. Resolved keeps the accent; open is
+   the standing state and does not need announcing twice. */
+.log__head--quiet { color: var(--text-muted, #94a3b8); }
+.board__list { list-style: none; display: grid; gap: var(--space-2); }
+
+/* One line: state, sentence, date. It wraps on a phone and never scrolls. */
+.board-entry {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-subtle, rgba(255,255,255,.07));
+  border-left: 3px solid var(--border, #24304a);
+  border-radius: var(--radius-sm);
+}
+.board-entry__state {
+  flex: none;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.07em;
+  font-weight: 700;
+  color: var(--text-muted, #94a3b8);
+}
+.board-entry__text { flex: 1 1 240px; min-width: 0; line-height: 1.55; }
+.board-entry__date {
+  flex: none;
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-muted, #94a3b8);
+}
+
+.board-entry--resolved {
+  background: var(--surface-2);
+  border-color: var(--border, #24304a);
+  border-left-color: var(--border-strong, rgba(255,255,255,.22));
+}
+.board-entry--resolved .board-entry__state { color: var(--text-secondary); }
+
+/* The newest resolution. The one entry on this page that is allowed to shout. */
+.board-entry--latest {
+  border-left-color: var(--accent);
+  padding: var(--space-4);
+}
+.board-entry--latest .board-entry__text { font-size: var(--text-lg); }
+.board-entry--latest .board-entry__state { color: var(--accent); }
+.board-entry__latest {
+  flex-basis: 100%;
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-weight: 700;
+  color: var(--accent);
+}
+
+.board-entry--open { border-left-color: var(--border-subtle, rgba(255,255,255,.07)); }
+
+/* ── Desk: the feed toggle and the open-item card ─────────────── */
+
+.desk-kinds {
+  display: flex;
+  gap: 6px;
+  padding-right: var(--space-3);
+  border-right: 1px solid var(--border, #24304a);
+}
+.desk-kinds .is-active { border-color: var(--accent); color: var(--accent); }
+.desk-hint { font-size: 0.88rem; line-height: 1.55; max-width: 62ch; margin-bottom: 14px; }
+
+.desk-card--open { border-left: 3px solid var(--border-strong, rgba(255,255,255,.22)); }
+.desk-card__source {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-muted, #94a3b8);
+}
+.desk-card__ref {
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+}
+.desk-open__closed { font-size: 0.88rem; margin-top: var(--space-2); }
+.desk-open__source { margin-top: var(--space-3); }
+.desk-open__summary {
+  cursor: pointer;
+  font-size: 0.85rem;
+  color: var(--text-muted, #94a3b8);
+  padding: var(--space-1) 0;
+}
+.desk-open__summary:hover { color: var(--text-primary); }
+.desk-open__source[open] .desk-open__summary { margin-bottom: 6px; }
+
+.desk-open__field { display: grid; gap: 7px; margin-top: var(--space-4); }
+.desk-open__label { font-size: 0.94rem; font-weight: 600; }
+.desk-open__note {
+  width: 100%;
+  min-height: 76px;
+  resize: vertical;
+  padding: 10px 12px;
+  font: inherit;
+  line-height: 1.55;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  border: 1px solid var(--border, #24304a);
+  border-radius: 8px;
+}
+.desk-open__note:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+.desk-open__verdict { margin-top: var(--space-2); font-size: 0.85rem; line-height: 1.5; }
+.desk-open__verdict.is-clear { color: var(--text-muted, #94a3b8); }
+/* Nothing typed yet is not a refusal. Only a match is drawn in the danger colour,
+   so the colour still means something the hundredth time it appears. */
+.desk-open__verdict.is-empty { color: var(--text-muted, #94a3b8); }
+.desk-open__verdict.is-blocked { color: var(--danger); }
+
+@media (max-width: 600px) {
+  .desk-kinds { padding-right: 0; border-right: 0; }
+  .board-entry__date { margin-left: 0; }
+}

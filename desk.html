@@ -81,6 +81,13 @@
 
     <section class="desk-queue" id="queue" hidden>
       <div class="desk-toolbar">
+        <!-- Which feed. Corrections are strangers' reports; open items are drafts
+             the importer wrote from the fleet's own trackers, and neither the
+             draft nor its source text is ever published as it stands. -->
+        <div class="desk-kinds" id="kinds" role="group" aria-label="Feed">
+          <button type="button" class="btn btn--ghost btn--sm is-active" data-kind="" aria-pressed="true">Corrections</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-kind="open" aria-pressed="false">Open items</button>
+        </div>
         <div class="desk-filters" id="filters" role="group" aria-label="Filter by status">
           <button type="button" class="btn btn--ghost btn--sm is-active" data-filter="new">New</button>
           <button type="button" class="btn btn--ghost btn--sm" data-filter="triaged">Triaged</button>
@@ -91,6 +98,12 @@
         </div>
         <span class="desk-count muted" id="count"></span>
       </div>
+
+      <p class="desk-hint muted" id="kindHint" hidden>
+        Drafts imported from the fleet's own trackers. They stay private until you
+        write the sentence and publish it, either as open or as resolved, which is
+        the entry the board leads with.
+      </p>
 
       <p class="log__state" id="loading" hidden>Loading…</p>
 

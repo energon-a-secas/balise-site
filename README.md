@@ -41,6 +41,11 @@ Reports land in a private queue, because they arrive as raw text from strangers.
 An operator triages them. Only what the operator decides to publish reaches the
 public log, written in the operator's own words.
 
+The same desk carries a second feed. An importer reads the fleet's own internal
+trackers and files a PRIVATE draft per open item; the operator writes the public
+sentence. The board that comes out of it is one line each: a direction, a state,
+a date. No paths, no line numbers, no ids.
+
 **Live:** [balise.neorgon.com](https://balise.neorgon.com/)
 
 ---
@@ -53,6 +58,11 @@ public log, written in the operator's own words.
   in, so nobody retypes what they were looking at
 - **Operator desk** -- the private queue, filtered by status, with only the
   status changes that are legal from where a report currently sits
+- **Open-items board** -- what the fleet is working on and what it has closed,
+  imported as drafts from the trackers and published one sentence at a time
+- **Redaction floor** -- the same rules in the desk and the Worker, refusing a
+  path, a line number, a tracker id or a credential-shaped string before it can
+  reach a public page
 - **Hardened ingest** -- Turnstile, per-address rate limiting, an origin
   allowlist, and an error envelope written to be read by a person
 - **Never HTTP 500** -- every failure is JSON with the same five keys
@@ -72,15 +82,26 @@ projects/balise-site/
 ├── js/
 │   ├── api.js          the only file that talks to the Worker; exports HANDLED_CODES
 │   ├── log.js          public log rendering
+│   ├── board.js        open-items board rendering
 │   ├── report.js       fragment parsing, C1 validation, payload assembly
 │   ├── desk.js         queue, transitions, in-memory token
+│   ├── desk-open.js    the open-item card and its publish moves
+│   ├── redact.js       a byte-identical copy of worker/src/redact.js
 │   └── utils.js        setText/elem: the only ways text reaches the DOM
+├── tools/
+│   └── import-open-items.mjs   reads the trackers, writes PRIVATE drafts
 └── worker/
-    ├── src/index.js    the router
-    ├── src/store.js    the only file containing SQL
-    ├── src/validate.js C1 validation
-    ├── src/envelope.js ERROR_CODES and the five-key envelope
-    └── schema.sql
+    ├── src/index.js       the router
+    ├── src/store.js       SQL, the corrections feed
+    ├── src/store-open.js  SQL, the open-items feed
+    ├── src/routes-open.js the import routes and the board
+    ├── src/redact.js      the redaction floor, shared with the site verbatim
+    ├── src/transitions.js C4's tables, pure
+    ├── src/turnstile.js   server-side challenge verification
+    ├── src/validate.js    C1 validation
+    ├── src/envelope.js    ERROR_CODES and the five-key envelope
+    ├── migrations/        what is actually applied; 0001 IS schema.sql
+    └── schema.sql         the readable shape of the store
 ```
 
 **The widget is not in this repo.** It is a shared kit at
@@ -99,6 +120,12 @@ visitor can actually see.
 visitor types `kind`, `body` and `contact` on this site, same origin, so their
 words and their contact address never enter a URL or a browser history.
 
+**Nothing on either feed publishes itself.** The importer writes rows at status
+`new`, which is private, and the automation credential is refused every
+transition on an open item. A leaked import token can put text in a queue only
+the operator reads. The board's own query selects five columns and returns three
+fields, so it cannot serve a source, a ref or a tracker's own words.
+
 ---
 
 ## Development
@@ -106,9 +133,23 @@ words and their contact address never enter a URL or a browser history.
 ```bash
 make serve         # the site        -> http://localhost:8876
 make worker-dev    # wrangler dev    -> http://127.0.0.1:8877
-make d1-schema     # apply worker/schema.sql to the LOCAL D1
+make d1-migrate    # apply worker/migrations/*.sql to the LOCAL D1
+make d1-schema     # the same thing, under the name the runbook uses
 make worker-test   # node --test
 ```
+
+Import the trackers into a local desk, from the monorepo root:
+
+```bash
+export BALISE_IMPORT_TOKEN=...        # the automation token make worker-dev prints
+node projects/balise-site/tools/import-open-items.mjs --dry-run
+node projects/balise-site/tools/import-open-items.mjs
+```
+
+The token is read from the environment and never from an argument, because argv
+is visible to `ps`. `--dry-run` prints every batch and sends nothing. A source
+that fails to parse is never synced, because sync closes whatever it does not
+see and a half-read tracker would read as "everything else is finished".
 
 `make worker-dev` mints a random operator token per run and prints it. Export
 `BALISE_OPERATOR_TOKEN` to pin one across restarts; that `--var` overrides
@@ -122,8 +163,8 @@ because Wrangler marks neither `--local` nor `--remote` as the default.
 ## Deploying
 
 Not deployed yet. The Worker needs `BALISE_OPERATOR_TOKEN`,
-`BALISE_TURNSTILE_SECRET` and `BALISE_IP_SALT` set with `wrangler secret put`,
-and a real D1 `database_id` in `wrangler.toml`. See
+`BALISE_AUTOMATION_TOKEN`, `BALISE_TURNSTILE_SECRET` and `BALISE_IP_SALT` set
+with `wrangler secret put`, and a real D1 `database_id` in `wrangler.toml`. See
 [`docs/operations/publishing.md`](../../docs/operations/publishing.md).
 
 Note that WAF is **not** available: it is zone-level and `neorgon.com` is on

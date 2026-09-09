@@ -40,6 +40,12 @@ binding = "DB"
 database_name = "balise"
 database_id = "bd9caf38-a680-4e8d-97a5-5518e8e94391"
 
+# Spelled out rather than left to the default. `wrangler d1 migrations apply` is the only
+# thing that builds this database now: schema.sql is migrations/0001_baseline.sql byte for
+# byte and stays as the readable shape, and tests/local-d1.test.mjs asserts the two are
+# equal so they cannot drift.
+migrations_dir = "migrations"
+
 # ── Ingest rate limiting ──────────────────────────────────────────────────────
 # period must be exactly 10 or 60 seconds
 # (https://developers.cloudflare.com/workers/runtime-apis/bindings/rate-limit/), which is

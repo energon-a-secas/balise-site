@@ -15,6 +15,7 @@
 //      brief and was right: it removes a moving part rather than adding one.
 
 import { fetchQueue, patchReport } from './api.js';
+import { openReportNode } from './desk-open.js';
 import { setText, show, hide, elem, formatDate } from './utils.js';
 
 /** C4's vocabulary. A status off this list is rendered as `new`, never raw. */
@@ -36,6 +37,9 @@ const NEXT = {
 // C3/A1: in memory, for this tab, and that is the entire lifetime.
 let token = '';
 let filter = 'new';
+// Which feed the desk is showing: '' is the corrections queue as it has always
+// been, 'open' is the imported open items. It rides as `?kind=` on the list call.
+let kind = '';
 let cursor = null;
 
 const el = {};
@@ -60,17 +64,28 @@ function promptForFix() {
   return { public_note: trimmed, fixed_ref: ref.trim() };
 }
 
-async function move(report, status) {
-  let extra = {};
-  if (status === 'fixed') {
-    const answers = promptForFix();
-    if (!answers) return;
-    extra = answers;
-  }
-  if (status === 'duplicate') {
-    const of = window.prompt('Duplicate of which report id?');
-    if (of === null) return;
-    extra = { duplicate_of: of.trim() };
+/**
+ * One status change, for either feed.
+ *
+ * `patch` is how an open item differs: its public sentence is typed into the
+ * card rather than asked for after the fact, so desk-open.js hands the sentence
+ * in and the prompts below are skipped. Pass nothing and this is the corrections
+ * flow, unchanged.
+ */
+async function move(report, status, patch = null) {
+  let extra = patch;
+  if (extra === null) {
+    extra = {};
+    if (status === 'fixed') {
+      const answers = promptForFix();
+      if (!answers) return;
+      extra = answers;
+    }
+    if (status === 'duplicate') {
+      const of = window.prompt('Duplicate of which report id?');
+      if (of === null) return;
+      extra = { duplicate_of: of.trim() };
+    }
   }
 
   const result = await patchReport(report.id, { status, ...extra }, token);
@@ -98,10 +113,14 @@ function reportNode(report) {
   if (when) head.append(elem('time', 'desk-card__date', when));
   item.append(head);
 
-  if (report.target_label) {
+  // The Worker nests the target (worker/src/store.js toReport), so the label is
+  // report.target.label. Reading report.target_label here meant this row never
+  // rendered, and the one thing a report points AT was missing from the card.
+  const targetLabel = report.target && report.target.label;
+  if (targetLabel) {
     const t = elem('p', 'desk-card__target');
     t.append(elem('span', 'desk-card__key', 'Item: '));
-    t.append(elem('span', 'desk-card__value', report.target_label));
+    t.append(elem('span', 'desk-card__value', targetLabel));
     item.append(t);
   }
 
@@ -168,7 +187,11 @@ async function load({ append = false } = {}) {
   hide(el.error);
   show(el.loading);
   const result = await fetchQueue(
-    { status: filter === 'all' ? null : filter, ...(append && cursor ? { before: cursor } : {}) },
+    {
+      status: filter === 'all' ? null : filter,
+      kind: kind || null,
+      ...(append && cursor ? { before: cursor } : {}),
+    },
     token
   );
   hide(el.loading);
@@ -189,7 +212,21 @@ async function load({ append = false } = {}) {
 
   const reports = Array.isArray(result.reports) ? result.reports : [];
   if (!append) el.list.replaceChildren();
-  reports.forEach((r) => el.list.append(reportNode(r)));
+
+  // Two guards, and the second is the one that matters. The tab decides which
+  // feed this is, so a row of the other kind is dropped rather than shown under
+  // a heading that misdescribes it: an unfiltered list route still answers with
+  // both, and a private import draft must not turn up in a list labelled
+  // Corrections. If the Worker later excludes them, this becomes a no-op.
+  // Then each row is drawn by ITS OWN kind, so a stray open item could never be
+  // rendered by the corrections card and read as a stranger's report.
+  reports
+    .filter((r) => (kind === 'open' ? r.kind === 'open' : r.kind !== 'open'))
+    .forEach((r) => {
+      el.list.append(
+        r.kind === 'open' ? openReportNode(r, safeStatus(r.status), move) : reportNode(r)
+      );
+    });
 
   cursor = result.next || null;
   if (cursor) show(el.more); else hide(el.more);
@@ -215,10 +252,28 @@ export function initDesk() {
   [
     'gate', 'tokenForm', 'tokenInput', 'queue', 'list', 'empty', 'loading',
     'error', 'errorMessage', 'errorHint', 'more', 'count', 'filters', 'signOut',
+    'kinds', 'kindHint',
   ].forEach((id) => { el[id] = document.getElementById(id); });
 
   el.tokenForm.addEventListener('submit', signIn);
   el.more.addEventListener('click', () => load({ append: true }));
+
+  // The feed toggle. The status filters below keep their vocabulary across both
+  // feeds, since it is one column in one table; what changes is what the words
+  // mean, which is why the hint appears with the open feed and not before it.
+  el.kinds.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-kind]');
+    if (!button) return;
+    kind = button.dataset.kind || '';
+    cursor = null;
+    [...el.kinds.querySelectorAll('[data-kind]')].forEach((b) => {
+      const chosen = b === button;
+      b.classList.toggle('is-active', chosen);
+      b.setAttribute('aria-pressed', String(chosen));
+    });
+    if (kind === 'open') show(el.kindHint); else hide(el.kindHint);
+    load();
+  });
 
   el.filters.addEventListener('click', (event) => {
     const button = event.target.closest('[data-filter]');

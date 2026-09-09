@@ -128,19 +128,47 @@ export function postReport(payload, turnstileToken) {
   });
 }
 
-/** GET /log. Public. Only reports a human marked fixed and left public. */
+/**
+ * GET /log. Public. Only reports a human marked fixed and left public.
+ *
+ * Corrections only. DESIGN-OPEN-ITEMS.md amends C4's frozen query with
+ * `AND kind <> 'open'`, so a resolved open item shows on the board and never in
+ * this log: the two lists answer different questions and mixing them would put
+ * a fleet decision under a heading that says a reader reported it.
+ */
 export function fetchLog({ limit = 50, before = null } = {}) {
   const q = new URLSearchParams({ limit: String(limit) });
   if (before) q.set('before', String(before));
   return request(`/log?${q}`);
 }
 
-/** GET /reports. Operator only. C3: the token never leaves memory. */
-export function fetchQueue({ status = null, limit = 50, before = null }, token) {
+/**
+ * GET /reports. Operator only. C3: the token never leaves memory.
+ *
+ * `kind` is the second feed's switch: 'open' asks for the imported drafts,
+ * omitted asks for the queue as it has always been. The Worker validates it
+ * against the four report kinds plus 'open' and answers BAD_FIELD otherwise, so
+ * nothing here needs to guess what is legal.
+ */
+export function fetchQueue({ status = null, kind = null, limit = 50, before = null }, token) {
   const q = new URLSearchParams({ limit: String(limit) });
   if (status) q.set('status', status);
+  if (kind) q.set('kind', kind);
   if (before) q.set('before', String(before));
   return request(`/reports?${q}`, { token });
+}
+
+/**
+ * GET /board. Public, and the only public read of the open-items feed.
+ *
+ * Answers `{ resolved: [...], open: [...] }` with each entry carrying three
+ * fields and no fourth: text, state, date. No site, no source, no private ref,
+ * because the Worker's SELECT does not name those columns. There is no paging:
+ * a board a person can scan is short by definition, and an endpoint that cannot
+ * return a cursor cannot be walked backwards into the private history.
+ */
+export function fetchBoard() {
+  return request('/board');
 }
 
 /** PATCH /reports/:id. Operator only. The Worker enforces C4's transitions. */

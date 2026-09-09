@@ -26,107 +26,27 @@
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
 import { rmSync } from 'node:fs';
-import { dirname, join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { join } from 'node:path';
 
-const WORKER_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
-const WRANGLER = join(WORKER_DIR, 'node_modules/.bin/wrangler');
+import {
+  WORKER_DIR, TOKEN, AI_TOKEN, SALT, TURNSTILE_PASS, ORIGIN,
+  migrate, startWorker, stopWorker, requester, report, seedReports, seedOpenItems,
+} from './harness.mjs';
+
+// Process control and the request helper live in ./harness.mjs, which tests/open-items.test.mjs
+// imports too. Two copies of "spawn wrangler dev and wait for /health" would drift.
 const STATE = join(WORKER_DIR, '.wrangler/test-state');
-
 const PORT = 8878;
 const BASE = `http://127.0.0.1:${PORT}`;
-const TOKEN = 'test-operator-token-local-only-not-a-secret';
-// The automation role is now a SEPARATE credential, not a header. These tests
-// prove the boundary by presenting a different token, which is the only way it
-// can be reached.
-const AI_TOKEN = 'test-automation-token-local-only-not-a-secret';
-const SALT = 'test-ip-salt-local-only';
-
-// Cloudflare's published test secret keys. Both are documented public values, not
-// secrets: "1x..." always passes siteverify and "2x..." always fails.
-const TURNSTILE_PASS = '1x0000000000000000000000000000000AA';
-const DUMMY_TOKEN = 'XXXX.DUMMY.TOKEN.XXXX';
+const call = requester(BASE);
 
 const SEEDED = 40;
-const ORIGIN = 'https://balise.neorgon.com';
+/** Imported open items, seeded in `before` so that every corrections assertion in this
+ *  file also states that the two feeds do not see each other. */
+const OPEN_SEEDED = 30;
 
 let worker = null;
-
-// ── Process control ───────────────────────────────────────────────────────────
-
-function run(args) {
-  return new Promise((resolve, reject) => {
-    const p = spawn(WRANGLER, args, {
-      cwd: WORKER_DIR,
-      env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    let out = '';
-    p.stdout.on('data', (d) => { out += d; });
-    p.stderr.on('data', (d) => { out += d; });
-    p.on('exit', (code) => (code === 0 ? resolve(out) : reject(new Error(`${args.join(' ')} exited ${code}\n${out}`))));
-  });
-}
-
-async function startWorker(port, vars) {
-  const args = ['dev', '--port', String(port), '--inspector-port', String(port + 1000)];
-  for (const [k, v] of Object.entries(vars)) args.push('--var', `${k}:${v}`);
-  args.push('--persist-to', STATE);
-  const child = spawn(WRANGLER, args, {
-    cwd: WORKER_DIR,
-    env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  let log = '';
-  child.stdout.on('data', (d) => { log += d; });
-  child.stderr.on('data', (d) => { log += d; });
-
-  const deadline = Date.now() + 90_000;
-  while (Date.now() < deadline) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/health`);
-      if (res.ok) return child;
-    } catch { /* not listening yet */ }
-    await new Promise((r) => setTimeout(r, 500));
-  }
-  child.kill('SIGKILL');
-  throw new Error(`wrangler dev did not come up on ${port} in 90s:\n${log}`);
-}
-
-async function stopWorker(child) {
-  if (!child) return;
-  child.kill('SIGTERM');
-  await new Promise((r) => setTimeout(r, 1500));
-  if (!child.killed) child.kill('SIGKILL');
-}
-
-// ── Request helpers ───────────────────────────────────────────────────────────
-
-async function call(path, { method = 'GET', body, token, ip, origin, base = BASE } = {}) {
-  const headers = {};
-  if (body !== undefined) headers['Content-Type'] = 'application/json';
-  if (token) headers.Authorization = `Bearer ${token}`;
-  if (ip) headers['CF-Connecting-IP'] = ip;
-  if (origin) headers.Origin = origin;
-  const res = await fetch(base + path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
-  let json = null;
-  try { json = await res.json(); } catch { json = null; }
-  return { res, body: json };
-}
-
-const report = (n, over = {}) => ({
-  v: 1,
-  site: 'parla-site',
-  url: `https://parla.neorgon.com/?q=seed${n}`,
-  target: { kind: 'concept', id: `seed${n}`, label: `seed ${n}` },
-  kind: 'wrong',
-  body: `Seeded report ${n}: the gloss here does not match what the page says.`,
-  contact: '',
-  turnstile: DUMMY_TOKEN,
-  ...over,
-});
 
 // ── Setup ─────────────────────────────────────────────────────────────────────
 
@@ -134,23 +54,22 @@ before(async () => {
   // A fresh database every run. The rows_read budgets below only mean something against
   // a known number of rows.
   rmSync(STATE, { recursive: true, force: true });
-  await run(['d1', 'execute', 'balise', '--local', '--persist-to', STATE, '--file=schema.sql', '-y']);
+  await migrate(STATE);
   worker = await startWorker(PORT, {
     BALISE_OPERATOR_TOKEN: TOKEN,
     BALISE_AUTOMATION_TOKEN: AI_TOKEN,
     BALISE_IP_SALT: SALT,
     BALISE_TURNSTILE_SECRET: TURNSTILE_PASS,
-  });
+  }, STATE);
 
-  // Seed through the real ingest path rather than by inserting rows, so the fixtures are
-  // produced by the code under test. The address changes every eighth report because the
-  // ratelimit binding really does count in local mode (measured, see the A5 note at the
-  // bottom of this file) and the shipped config allows 20 per minute per key.
-  for (let i = 0; i < SEEDED; i += 1) {
-    const { res } = await call('/report', { method: 'POST', body: report(i), ip: `198.51.100.${10 + Math.floor(i / 8)}` });
-    assert.equal(res.status, 200, `seeding report ${i} failed with ${res.status}`);
-  }
+  // Both feeds, through the real routes rather than by inserting rows, so the fixtures
+  // are produced by the code under test. The open items are seeded HERE, before every
+  // assertion below, so each of those is also a statement that a second feed in the same
+  // table changes nothing about the first.
+  await seedReports(call, SEEDED, assert);
+  await seedOpenItems(call, OPEN_SEEDED, assert);
 }, { timeout: 300_000 });
+
 
 after(async () => {
   await stopWorker(worker);
@@ -162,7 +81,9 @@ test('/health names which secrets are bound and never their values', async () =>
   const { res, body } = await call('/health');
   assert.equal(res.status, 200);
   assert.equal(body.ok, true);
-  assert.deepEqual(body.config, { db: true, operator_token: true, turnstile: true, ip_salt: true, rate_limiter: true });
+  assert.deepEqual(body.config, {
+    db: true, operator_token: true, automation_token: true, turnstile: true, ip_salt: true, rate_limiter: true,
+  });
   assert.equal(body.store_ok, true);
   const text = JSON.stringify(body);
   assert.ok(!text.includes(TOKEN), '/health leaked the operator token');
@@ -495,7 +416,7 @@ test('with no secrets bound, ingest and the desk say so instead of failing vague
   const bare = await startWorker(port, {
     BALISE_TURNSTILE_SECRET: '',
     BALISE_OPERATOR_TOKEN: '',
-  });
+  }, STATE);
   t.after(() => stopWorker(bare));
   const base = `http://127.0.0.1:${port}`;
 

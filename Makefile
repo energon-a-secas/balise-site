@@ -20,7 +20,8 @@ help:
 	@echo "  make worker-test      node --test worker/tests/*.test.mjs"
 	@echo "  make worker-kill      Kill the worker dev server"
 	@echo ""
-	@echo "  make d1-schema    Apply worker/schema.sql to the LOCAL D1 database"
+	@echo "  make d1-migrate   Apply worker/migrations/*.sql to the LOCAL D1 database"
+	@echo "  make d1-schema    Same thing: 0001 IS schema.sql, byte for byte"
 	@echo "  make d1-query Q=  Run one read-only query against the LOCAL D1 database"
 	@echo "  make d1-reset     Drop the local D1 tables and re-apply the schema"
 	@echo ""
@@ -39,9 +40,18 @@ help:
 # Local state lands in worker/.wrangler/state/v3/d1/, which is gitignored: after any
 # exercise it holds real report text.
 
+# migrations/0001_baseline.sql IS schema.sql, byte for byte, and the local D1 test asserts
+# it. schema.sql stays as the readable shape of the store; the migrations directory is what
+# is actually applied, because ALTER TABLE cannot be expressed as a CREATE TABLE IF NOT
+# EXISTS and a second run of the schema file would silently skip every later change.
+.PHONY: d1-migrate
+d1-migrate:
+	@$(WRANGLER) d1 migrations apply balise --local
+
+# The name the README and the runbook already use. It runs the migrations, so an operator
+# who types the command they know does not end up with a database missing half its columns.
 .PHONY: d1-schema
-d1-schema:
-	@$(WRANGLER) d1 execute balise --local --file=schema.sql
+d1-schema: d1-migrate
 
 .PHONY: d1-query
 d1-query:
@@ -50,13 +60,15 @@ d1-query:
 
 .PHONY: d1-reset
 d1-reset:
-	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters;"
-	@$(MAKE) d1-schema
+	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters; DROP TABLE IF EXISTS d1_migrations;"
+	@$(MAKE) d1-migrate
 
 # ── Worker ────────────────────────────────────────────────────────────────────
-# The three secrets are passed as --var and never written to a file. With no
+# The secrets are passed as --var and never written to a file. With no
 # BALISE_OPERATOR_TOKEN in the environment one is generated for this run and printed,
-# so a local desk session needs no file and leaves nothing behind.
+# so a local desk session needs no file and leaves nothing behind. The AUTOMATION token
+# is minted the same way: it is the credential the open-items importer is meant to hold,
+# and it cannot publish anything, so printing it here costs nothing.
 #
 # BALISE_TURNSTILE_SECRET is deliberately left unset by default: with no secret, /report
 # answers 501 NOT_CONFIGURED before it fetches anything, which is the path local work can
@@ -69,10 +81,12 @@ worker-install:
 .PHONY: worker-dev
 worker-dev:
 	@TOKEN=$${BALISE_OPERATOR_TOKEN:-$$(openssl rand -base64 24 | tr '+/' '-_' | tr -d '=')}; \
+	 AUTO=$${BALISE_AUTOMATION_TOKEN:-$$(openssl rand -base64 24 | tr '+/' '-_' | tr -d '=')}; \
 	 SALT=$${BALISE_IP_SALT:-$$(openssl rand -hex 16)}; \
 	 echo "Worker  → http://127.0.0.1:$(WORKER_PORT)"; \
-	 echo "Operator token for this run: $$TOKEN"; \
-	 $(WRANGLER) dev --port $(WORKER_PORT) --var BALISE_OPERATOR_TOKEN:$$TOKEN --var BALISE_IP_SALT:$$SALT
+	 echo "Operator token for this run:   $$TOKEN"; \
+	 echo "Automation token for this run: $$AUTO  (export BALISE_IMPORT_TOKEN to import)"; \
+	 $(WRANGLER) dev --port $(WORKER_PORT) --var BALISE_OPERATOR_TOKEN:$$TOKEN --var BALISE_AUTOMATION_TOKEN:$$AUTO --var BALISE_IP_SALT:$$SALT
 
 .PHONY: worker-test
 worker-test:
