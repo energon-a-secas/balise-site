@@ -158,11 +158,14 @@ so a wrong value fails closed.
    `ip_hash` or `fingerprint`. That is a property of these routes and not of the credential:
    `GET /reports` answers either token, and its correction rows do carry `contact`.
 5. **A drafted sentence is still only a draft.** A runner may send `suggested_note`, the
-   resolution sentence it would write. It is kept only for `kind = 'open'`, stripped by
-   `src/redact.js`, stored empty if anything survives the strip, and it only ever prefills
-   the desk field. A correction's `suggested_note` is dropped: an AI paraphrase of a
-   stranger's report never prefills a public note (A6's reasoning, unchanged). The
-   `suggested` sentence of `POST /work/items` goes through the same strip.
+   resolution sentence it would write. It is kept only for `kind = 'open'`, held to the
+   clauses that clear the redaction floor by `src/suggestion.js`, stored empty when that
+   leaves less than a direction, and it only ever prefills the desk field. A correction's
+   `suggested_note` is dropped: an AI paraphrase of a stranger's report never prefills a
+   public note (A6's reasoning, unchanged). The `suggested` sentence of `POST /work/items`
+   goes through the same rule, and so does the import route's, so a draft cannot depend on
+   which of the four wrote it (queue `#81`; `docs/DESIGN-OPEN-ITEMS.md` section 4 states the
+   rule and what it replaced).
 6. **Nothing here publishes.** No work action writes `status`, `public_note` or `public`.
    Publishing stays `PATCH /reports/:id`, a person, and the redaction floor. On that route, a
    patch from the automation token that carries `public`, `public_note` or `fixed_ref` is

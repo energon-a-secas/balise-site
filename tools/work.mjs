@@ -17,7 +17,7 @@
 // release script puts it so an unattended run keeps no token in a file or a shell profile.
 //
 // backlog IS THE SANITIZED VIEW. From each row it prints the published sentence or the
-// importer's stripped suggestion, and nothing else: never the body, the private ref, the
+// importer's suggestion, and nothing else: never the body, the private ref, the
 // instruction, the page address or the contact. Every line also goes back through the
 // redaction floor on the way out, because a suggestion is a machine's draft and was never a
 // person's decision.
@@ -31,7 +31,8 @@
 import { readFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 
-import { redactionFindings, stripRedactions } from '../worker/src/redact.js';
+import { redactionFindings } from '../worker/src/redact.js';
+import { cleanSuggestion } from '../worker/src/suggestion.js';
 
 const DEFAULT_API = 'http://127.0.0.1:8877';
 const KEYCHAIN_SERVICE = 'balise-automation';
@@ -356,12 +357,21 @@ async function list(api, token, opts) {
   return 0;
 }
 
-/** The one line the sanitized backlog may show for a row. */
+/**
+ * The one line the sanitized backlog may show for a row, and the two sources are not
+ * treated alike.
+ *
+ * A published note is a PERSON'S decision that already cleared the floor at publish time,
+ * so it prints whole; if it trips the floor here, that is worth saying rather than papering
+ * over, because the floor's rules have grown since some notes were written. A suggestion is
+ * a MACHINE'S draft, so it goes through the same rule as everywhere else (#81): as much of
+ * its opening as needs no cut, and otherwise nothing. This used to strip both, which is how
+ * a whole board of backlog lines came to read like "(closeMenu in)".
+ */
 function sentence(row) {
-  const raw = (row.public_note || '').trim() || (row.suggested || '').trim();
-  if (!raw) return '(no sentence yet)';
-  const stripped = stripRedactions(raw).replace(/\s+/g, ' ').trim();
-  return stripped && !redactionFindings(stripped).length ? stripped : '(no clean sentence yet)';
+  const published = (row.public_note || '').replace(/\s+/g, ' ').trim();
+  if (published) return redactionFindings(published).length ? '(published sentence trips the floor)' : published;
+  return cleanSuggestion(row.suggested) || '(no sentence yet)';
 }
 
 /** In the order a person catching up wants them: what needs them, what is moving, what is

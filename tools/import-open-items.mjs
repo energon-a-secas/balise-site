@@ -35,7 +35,7 @@ import { execFileSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { redactionFindings, stripRedactions } from '../worker/src/redact.js';
+import { cleanSuggestion } from '../worker/src/suggestion.js';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DEFAULT_ROOT = join(HERE, '..', '..', '..');
@@ -105,32 +105,22 @@ function dayMs(date) {
 }
 
 /**
- * The draft direction the desk will prefill: the first sentence of the tracker text with
- * every redaction match cut out.
+ * The draft direction the desk will prefill: as much of the tracker line's FIRST SENTENCE
+ * as carries no redaction finding, and nothing at all when that is less than a direction.
  *
- * It is a STARTING POINT and nothing more. A stripped sentence can still be a map (drop
- * the path from "the auth guard at x.js:12 never fires" and it still says which guard is
- * inert), so the operator rewrites it and the worker checks whatever they type. A
- * suggestion that still trips the check after stripping is returned EMPTY rather than
- * prefilled: half a redacted sentence in the box is worse than an empty box, because it
- * invites an edit instead of a rewrite.
+ * The rule itself is worker/src/suggestion.js, shared with the import route, direct filing
+ * and the runner, so a draft cannot depend on which of the four wrote it. This function is
+ * only the importer's two local decisions: one sentence rather than the whole line (the
+ * rest of a tracker entry is detail, not a direction), and a tighter budget than the column
+ * accepts.
+ *
+ * It is a STARTING POINT and nothing more. A clean opening can still be a map ("the auth
+ * guard never fires" says which guard is inert without naming a file), so the operator
+ * rewrites it and the worker checks whatever they type.
  */
 function suggest(text) {
   const firstSentence = text.split(/(?<=[.!?])\s+/)[0] || text;
-  const plain = firstSentence
-    // The trackers are Markdown and the board is not. Backticks and bold markers would
-    // arrive in the desk field as literal characters for the operator to delete by hand.
-    // The underscore is deliberately NOT in this class: stripping it would turn a secret's
-    // name into one unbroken word and walk it straight past the variable-name rule.
-    .replace(/[`*]{1,2}/g, '')
-    // An em or en dash, written as an escape so this file does not carry one. The fleet's
-    // writing rule applies to a sentence a machine drafted for a person as much as to one
-    // a person typed.
-    .replace(/\s*[\u2014\u2013]\s*/g, ', ')
-    .replace(/\s+/g, ' ');
-  const stripped = stripRedactions(plain).slice(0, SUGGESTION_MAX).trim();
-  if (!stripped) return '';
-  return redactionFindings(stripped).length ? '' : stripped;
+  return cleanSuggestion(firstSentence, SUGGESTION_MAX);
 }
 
 const item = (ref, text, { opened_at = null, closed_at = null, suggested } = {}) => ({
@@ -318,7 +308,9 @@ function readRegistry(root) {
       const name = s.display_name || s.id;
       const suggested = `${name} has an address and is not served there yet.`;
       return item(String(s.id), `${s.id} (${s.domain || 'no domain'}): ${s.description || ''}`.trim(), {
-        suggested: redactionFindings(suggested).length ? '' : suggested,
+        // The one rule again, not a check of its own: the name comes from the registry and
+        // this file has no more claim to hand-roll a sentence than the trackers do.
+        suggested: cleanSuggestion(suggested, SUGGESTION_MAX),
       });
     });
 }

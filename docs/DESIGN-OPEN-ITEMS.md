@@ -35,7 +35,7 @@ Columns added, all NULL for corrections:
 |---|---|
 | `source` | `queue`, `brief`, `harness`, `registry` |
 | `source_ref` | private key inside the source: `#58`, `bouquin-site:3f9a…`, a run id, a site id. Never selected by a public query |
-| `suggested` | the importer's draft direction, already stripped (section 4); prefills the desk field |
+| `suggested` | the draft direction, already held to the clauses that clear the floor (section 4); prefills the desk field |
 | `opened_at` | the date the board shows for an open entry: the queue date, a run's `started_at`, otherwise first import |
 | `source_closed_at` | set when the item left its source (a `closed_at` in an import, or a sync that no longer lists the ref); cleared by an import that sends the ref as open again (section 4) |
 
@@ -61,7 +61,10 @@ a harness run id (`YYYY-MM-DD-` followed by a slug), a `make` target, and a
 credential-shaped token (24+ base64url characters, 32+ hex, `ghp_`, `sk-`, `AKIA`,
 `Bearer `, `token=`). It is applied in three places and it is the same code each time:
 
-1. the import route, to `suggested` (a suggestion that still matches is stored empty);
+1. every drafted suggestion, through `worker/src/suggestion.js` (section 4): the import
+   route's `suggested`, a direct filing's, and a runner's drafted resolution. The route
+   checks it and not only the importer, because whoever holds the automation token does not
+   have to be the importer;
 2. `PATCH /reports/:id` when `public_note` is set on a `kind = 'open'` row: any finding is
    refused as `BAD_FIELD` naming the rule and the match, an existing code so the C2.1 drift
    test stays green;
@@ -99,9 +102,22 @@ Sources, and the private ref each produces:
   site id; the suggestion is the one template the importer can write well: "<display
   name> has an address and is not served there yet". Closes when the lifecycle changes.
 
-The suggested direction for free-text sources is the first sentence of the source text
-with every redaction match removed and whitespace collapsed. It is a starting point the
-operator overwrites, and the publish-time check treats it as untrusted anyway.
+**A suggestion is a span of its source, never a repair of one** (`worker/src/suggestion.js`,
+queue `#81`). For a free-text source it is the first sentence of the source text, kept clause
+by clause up to the first clause that carries a finding, and dropped entirely when what
+survives is under three words. Clause boundaries are `, ; : . ! ?` followed by whitespace or
+the end (`og:image` and `1,000` must not split) and never inside brackets, so no draft can end
+on an open bracket. It is a starting point the operator overwrites, and the publish-time check
+treats it as untrusted anyway.
+
+The rule used to CUT every finding out and keep the remains, which is what a redaction floor
+naturally suggests and what the 2026-09-15 import measured as unusable: 89 of 92 drafts read
+like `(closeMenu in)` or `uncommented ()`, and the work queue's sanitized backlog is built from
+the same field. A remnant is worse than an empty field, because the desk prefills this into
+the sentence the operator publishes, so a half-sentence invites an edit where the job is a
+rewrite: the grammar gets repaired and the machine's framing survives, assembled out of
+whichever parts of a defect report happened to be safe to show. Under the current rule the
+same corpus yields 64 readable drafts of 91 and 27 empty fields.
 
 Requests, batched at 25 items and 7 KB (the Worker's query budget and its 8 KB body cap):
 `POST /open-items` per batch, then one `POST /open-items/sync` per source with every ref

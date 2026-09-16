@@ -21,6 +21,7 @@
 // NOT IN list that would silently overflow once a source grows.
 
 import { sha256Hex, storeError } from './store.js';
+import { cleanSuggestion } from './suggestion.js';
 import { IN_PROGRESS_STATES } from './work.js';
 
 /** The kind that makes a row an open item. Written only by the import route. */
@@ -158,7 +159,10 @@ export async function upsertOpenItems(db, { source, items, now }) {
             fingerprint,
             source,
             item.ref,
-            item.suggested || '',
+            // Redacted HERE and not only in the importer, because whoever holds the
+            // automation token does not have to be the importer, and this is the field the
+            // desk prefills into the sentence box.
+            cleanSuggestion(item.suggested),
             item.opened_at || now,
             item.closed_at || null,
           )

@@ -73,7 +73,8 @@ anything.
   claim under a lease, heartbeat, submit with evidence, file what it found as a new
   private draft, and pass anything an item said only through a file
 - **Sanitized backlog** -- `node tools/work.mjs backlog` prints every open item as
-  one publishable line, never a body, a path, a ref or an instruction
+  one publishable line, never a body, a path, a ref or an instruction; a published
+  sentence prints whole, a machine's draft only as far as it clears the floor
 - **Board counts** -- `GET /board/summary`, published entries only, readable from
   any origin so other sections of the fleet can show the same line
 - **Redaction floor** -- the same rules in the desk and the Worker, refusing a
@@ -122,6 +123,7 @@ projects/balise-site/
     ├── src/routes-work.js      the work routes
     ├── src/work.js             the work queue's action table, pure
     ├── src/redact.js           the redaction floor, shared with the site verbatim
+    ├── src/suggestion.js       the one rule for a drafted sentence, pure
     ├── src/transitions.js      C4's tables, pure
     ├── src/turnstile.js        server-side challenge verification
     ├── src/validate.js         C1 validation
@@ -178,6 +180,17 @@ item automation filed, to an agent needs an instruction the operator wrote, and
 neither ever ships. That text reaches the runner as quoted data, because an agent
 with push rights reading a stranger's sentence is the prompt-injection case, and a
 runner that read a correction may have filed its follow-up in the reader's words.
+
+**A suggestion is a span of its source, never a repair of one.** Every sentence a machine
+drafts for the desk to prefill (the importer's, an import batch's, a direct filing's, a
+runner's) goes through one rule in `worker/src/suggestion.js`: keep the leading clauses that
+carry no redaction finding, stop at the first that does, and drop the result when it is
+shorter than a direction. It cuts nothing, so a draft is always a verbatim prefix of its
+source. The rule used to cut each finding out and keep the remains, and the 2026-09-15 import
+measured the result: 89 of 92 drafts read like `(closeMenu in)`. A remnant is worse than an
+empty field, because a half-sentence invites an edit where the job is a rewrite, and the
+framing that survives the edit was assembled from whichever parts of a defect report were safe
+to show. The same corpus now yields 64 readable drafts of 91.
 
 **The redaction floor has no lookbehind.** The desk imports `js/redact.js`
 statically and Safari before 16.4 cannot parse a lookbehind, so one would stop the

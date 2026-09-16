@@ -95,6 +95,36 @@ test('an import batch is one read and one write per item, and every row it write
   assert.ok(times.every((t) => t >= T), 'a row was stamped before its request');
 });
 
+// ── What the import route will store as a suggestion (#81) ────────────────────
+
+test('#81: the import route redacts the suggestion it is sent, whoever sent it', async () => {
+  // docs/DESIGN-OPEN-ITEMS.md section 3 has said since #58 that the redaction check is
+  // applied "to the import route, to suggested". It was not: the route stored the string
+  // exactly as sent, and only the importer's own suggest() checked anything. Whoever holds
+  // the automation token does not have to be the importer, and this field is what the desk
+  // prefills into the sentence box, so the one place it has to be checked is here.
+  const db = sqliteD1();
+  const env = { DB: db };
+  const suggestion = (ref) =>
+    db.sqlite.prepare("SELECT suggested FROM reports WHERE kind = 'open' AND source_ref = ?").get(ref).suggested;
+
+  await openImport(env, {
+    v: 1,
+    source: 'queue',
+    items: [
+      { ref: '#901', text: 'A planted draft.', suggested: 'See packages/neorgon-ui/beacon for the widget.' },
+      { ref: '#902', text: 'A planted draft.', suggested: 'The desk lockout is fifteen minutes: BALISE_IP_SALT keys it.' },
+      { ref: '#903', text: 'A planted draft.', suggested: 'The footer drops its attribution line on three sites.' },
+      { ref: '#904', text: 'A planted draft.', suggested: '' },
+    ],
+  }, { origin: null, now: T }).then(answer);
+
+  assert.equal(suggestion('#901'), '', 'a path reached the desk prefill through the import route');
+  assert.equal(suggestion('#902'), 'The desk lockout is fifteen minutes.', 'the clause naming a secret was kept');
+  assert.equal(suggestion('#903'), 'The footer drops its attribution line on three sites.');
+  assert.equal(suggestion('#904'), '');
+});
+
 test('REG 0: a filing that lands between two INSERTs of an import gets a created_at of its own, so paging reaches every row', async () => {
   const db = sqliteD1();
   // Two filings, run just before the import's second and fourth INSERTs: one whose request

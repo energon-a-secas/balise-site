@@ -189,13 +189,18 @@ test('an investigation cannot claim a fix or a landing, and a clean one reaches 
     outcome: 'investigated',
     summary: 'Still true: the checker still exits non-zero on drift.',
     evidence: 'ran the checker, exit 1',
-    suggested_note: 'The checker at enforce.py:612 is being reworked.',
+    suggested_note: 'The drift checker is being reworked, and the run at enforce.py:612 shows it.',
   });
   assert.equal(good.res.status, 200, JSON.stringify(good.body));
   assert.equal(good.body.item.work.state, 'review');
   // Equal, not merely free of the path: an assertion that a dropped sentence also passes
-  // cannot tell cutting from discarding.
-  assert.equal(good.body.item.work.run.suggested_note, 'The checker at is being reworked.', 'the drafted sentence was not cut to what clears the floor');
+  // cannot tell a kept opening from a discarded one. The clause naming the path goes and the
+  // clause before it stays whole, which is #81's rule reaching the desk through the runner.
+  assert.equal(
+    good.body.item.work.run.suggested_note,
+    'The drift checker is being reworked.',
+    'the drafted sentence was not held to the clauses that clear the floor',
+  );
 
   const again = await ai(path, { run: runId, outcome: 'investigated', summary: 'A second, different answer.' });
   assert.equal(again.res.status, 409, 'a result was submitted twice');
@@ -362,7 +367,10 @@ test('a follow-up filed by automation is a private draft, filed once, cannot app
   assert.equal(item.status, 'new');
   assert.equal(item.work, null);
   assert.match(item.source_ref, /^d-[0-9a-f]{8}$/);
-  assert.equal((await op(`/work/${item.id}`)).body.item.suggested, 'See for the widget.', 'a stored suggestion kept part of a path');
+  // The whole sentence is one clause and it names a path, so the field is stored empty
+  // rather than as "See for the widget." (#81): a hole in a sentence invites an edit where
+  // the operator needs to write the line themselves.
+  assert.equal((await op(`/work/${item.id}`)).body.item.suggested, '', 'a stored suggestion kept part of a path');
 
   const twice = await ai('/work/items', { text: `  ${text.toUpperCase()}  ` });
   assert.equal(twice.res.status, 409);

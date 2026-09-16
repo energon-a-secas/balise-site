@@ -11,8 +11,9 @@
 import { storeError } from './store.js';
 import { OPEN_KIND } from './store-open.js';
 import { MAX_ATTEMPTS, stateOf, refusal, submitRule } from './work.js';
+import { cleanSuggestion } from './suggestion.js';
 import {
-  notFound, changed, readRow, holderRefusal, explain, workItem, readDetail, cleanSuggestion,
+  notFound, changed, readRow, holderRefusal, explain, workItem, readDetail,
 } from './store-work.js';
 
 // A lapsed lease is claimable again, EXCEPT in ship mode. A ship run pushes before it

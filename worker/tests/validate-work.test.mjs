@@ -21,8 +21,8 @@ import {
   ACTIVE_STATES, WORK_OUTCOMES, LEASE_MIN_S, LEASE_MAX_S, LEASE_DEFAULT_S, INSTRUCTION_MIN,
   approvalRule, submitRule, trustOf,
 } from '../src/work.js';
-import { cleanSuggestion } from '../src/store-work.js';
-import { redactionFindings, stripRedactions } from '../src/redact.js';
+import { cleanSuggestion } from '../src/suggestion.js';
+import { redactionFindings } from '../src/redact.js';
 
 const RUN = '1a2b3c4d-0000-4000-8000-000000000000';
 const x = (n) => 'x'.repeat(n);
@@ -86,16 +86,23 @@ test('#59: an investigation may end investigated, blocked or failed, and nothing
   }
 });
 
-test('#59: a drafted sentence the strip cannot clear is dropped whole, never kept half clean', () => {
-  // Nested deeper than the strip's passes reach: the cut leaves "line 5", a line number.
+test('#59, #81: a drafted sentence is dropped whole rather than kept half clean, and never outgrows the column', () => {
+  // #59 asked that a sentence the floor still finds something in is dropped rather than
+  // prefilled half clean. #81 kept the guarantee and changed how it is reached: the rule cuts
+  // nothing now, it stops at the first clause that carries a finding (src/suggestion.js, and
+  // tests/suggestion.test.mjs is where the rule itself is tested). What this file owns is the
+  // tie to the validators above: a draft this function produces must be one the route accepts.
   const nested = 'line line line line line a/b 5 5 5 5 5';
-  assert.notDeepEqual(redactionFindings(stripRedactions(nested)), [], 'the fixture no longer outlasts the strip');
+  assert.notDeepEqual(redactionFindings(nested), [], 'the fixture carries no finding, so this proves nothing');
   assert.equal(cleanSuggestion(nested), '');
-  assert.equal(cleanSuggestion('The checker at enforce.py:612 is being reworked.'), 'The checker at is being reworked.');
-  assert.equal(cleanSuggestion('See packages/neorgon-ui/beacon for the widget.'), 'See for the widget.');
-  assert.equal(cleanSuggestion('  A clean\n\nsentence.  '), 'A clean sentence.');
+  assert.equal(cleanSuggestion('The checker at enforce.py:612 is being reworked.'), '');
   for (const empty of ['', null, undefined]) assert.equal(cleanSuggestion(empty), '');
-  assert.ok(cleanSuggestion('word '.repeat(300)).length <= SUGGESTION_MAX);
+  // The default budget is the column's own, so a caller that passes none stays inside what
+  // the routes above accept. One clause longer than the budget is dropped rather than sliced,
+  // and a run of short ones is kept up to it.
+  assert.equal(cleanSuggestion(`${'word '.repeat(300)}stop.`), '');
+  const kept = cleanSuggestion('A short clean sentence. '.repeat(40));
+  assert.ok(kept.length > 0 && kept.length <= SUGGESTION_MAX, `kept ${kept.length} characters`);
 });
 
 test('#51: a claim names its runner in the accepted form, and asks for a lease inside the bounds', () => {

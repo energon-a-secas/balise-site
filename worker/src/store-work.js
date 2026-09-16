@@ -31,7 +31,7 @@
 import { sha256Hex, storeError, normaliseForFingerprint } from './store.js';
 import { STATUSES } from './transitions.js';
 import { OPEN_KIND } from './store-open.js';
-import { redactionFindings, stripRedactions } from './redact.js';
+import { cleanSuggestion } from './suggestion.js';
 import {
   WORK_STATES, MAX_ATTEMPTS, NONE, stateOf, canAct, refusal, closedRule, approvalRule, acceptTarget, trustOf, titleFor,
 } from './work.js';
@@ -221,16 +221,6 @@ export async function workItem(db, id) {
   } catch (err) {
     return storeError('work item', err);
   }
-}
-
-/**
- * A drafted sentence, cut by the redaction floor and kept only if nothing survives the
- * cut. The same reasoning as the importer's suggestion: half a redacted sentence invites
- * an edit where a rewrite is needed, so an empty box is the better prefill.
- */
-export function cleanSuggestion(text) {
-  const stripped = stripRedactions((text || '').replace(/\s+/g, ' ')).trim().slice(0, 500);
-  return stripped && !redactionFindings(stripped).length ? stripped : '';
 }
 
 // ── Reads ─────────────────────────────────────────────────────────────────────

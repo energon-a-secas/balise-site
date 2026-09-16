@@ -23,8 +23,9 @@
 // and declares `group` instead.
 //
 // Applied in three places, and it is the same code each time:
-//   1. the importer, to the draft direction it suggests (a suggestion that still matches
-//      is stored empty, so a stripped-but-still-dirty sentence is never prefilled);
+//   1. every drafted suggestion, through src/suggestion.js, which asks this file which
+//      clauses of a machine's sentence carry a finding and keeps the ones before the first
+//      that does. It never CUTS: see stripRedactions below for why.
 //   2. PATCH /reports/:id, when public_note is set on a kind = 'open' row;
 //   3. the desk, live under the sentence field.
 
@@ -163,16 +164,22 @@ export function isRedactionClear(text) {
 const STRIP_PASSES = 5;
 
 /**
- * The text with every finding cut out and the whitespace closed up. Used ONLY to build
- * the importer's suggested direction, which is a starting point for the operator and is
- * checked again at publish time like any other typed sentence.
+ * The text with every finding cut out and the whitespace closed up.
  *
- * Repeated until nothing is found, because a cut can expose a shape that was not a finding
- * before it: cutting "packages/neorgon-ui" out of a longer path leaves "/auth/" or "/beacon"
- * standing.
+ * NEVER USE THIS TO BUILD A SENTENCE A PERSON WILL READ. It built the importer's suggested
+ * direction until #81, and the 2026-09-15 import measured what that produces: 89 of 92
+ * drafts read like "(closeMenu in)" or "uncommented ()". A sentence with a hole in it is
+ * worse than an empty field, because it invites an edit where a rewrite is needed.
+ * src/suggestion.js is the rule for a readable draft, and it cuts nothing.
  *
- * Stripping is not sanitising. A sentence can lose its path and still describe the defect
- * precisely enough to be a map, so nothing that comes out of here is trusted anywhere.
+ * What this is for is the ADVERSARY in tests/redact.test.mjs: cutting every finding out and
+ * asking whether anything above still fires is how the rules above are shown to leave no
+ * remnant behind, which is where two of them came from. Repeated until nothing is found,
+ * because a cut can expose a shape that was not a finding before it: cutting
+ * "packages/neorgon-ui" out of a longer path leaves "/auth/" or "/beacon" standing.
+ *
+ * Stripping is not sanitising either way. A sentence can lose its path and still describe
+ * the defect precisely enough to be a map, so nothing that comes out of here is trusted.
  */
 export function stripRedactions(text) {
   let out = typeof text === 'string' ? text : '';
