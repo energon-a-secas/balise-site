@@ -18,14 +18,16 @@ broken, other`, so `kind = 'open'` is only ever written by the import route (sec
 
 `worker/migrations/0001_baseline.sql` (today's `schema.sql`, verbatim) and
 `0002_open_items.sql`, applied by a new `make d1-migrate` target that spells out `--local`.
-`schema.sql` stays as the readable shape; `local-d1.test.mjs` asserts `PRAGMA table_info`
-matches after the migrations, so the two cannot drift.
+`schema.sql` is the baseline alone: `tests/open-items.test.mjs` asserts it is still `0001` byte
+for byte, and checks with `PRAGMA table_info` that the migrations build the columns below. The
+migrations are the store's shape.
 
 Columns reused: `kind` (`'open'`), `status` (C4 vocabulary), `body` (the source text,
 private, same protection as a stranger's text), `public_note` (the public direction),
 `fixed_at` (resolution time), `public`, `duplicate_of`, `fingerprint`
-(`sha256('open' || source || source_ref)`: the existing UNIQUE index is the idempotency
-guard, and a repeat run costs one no-op insert per item).
+(`sha256` of `open`, the source and the source ref, NUL separated: the existing UNIQUE index is
+the idempotency guard, and a batch reads which of its fingerprints exist before it writes, so a
+repeat run of a batch is one read and no write).
 
 Columns added, all NULL for corrections:
 
@@ -35,7 +37,7 @@ Columns added, all NULL for corrections:
 | `source_ref` | private key inside the source: `#58`, `bouquin-site:3f9a…`, a run id, a site id. Never selected by a public query |
 | `suggested` | the importer's draft direction, already stripped (section 4); prefills the desk field |
 | `opened_at` | the date the board shows for an open entry: the queue date, a run's `started_at`, otherwise first import |
-| `source_closed_at` | set by the importer when the item left its source; NULL while it is still there |
+| `source_closed_at` | set when the item left its source (a `closed_at` in an import, or a sync that no longer lists the ref); cleared by an import that sends the ref as open again (section 4) |
 
 Index: `reports_board ON (kind, public, status)`; the board's two queries stay inside the
 four-per-request budget.
@@ -74,10 +76,13 @@ quietly maps a soft spot, and that stays the operator's reading.
 
 `tools/import-open-items.mjs`, Node 18, no dependencies, run by the operator from the
 monorepo root. Token from `BALISE_IMPORT_TOKEN` only, never an argument (argv is visible to
-`ps`); the automation credential is the intended value because the route below cannot
-publish, so a leaked import token cannot either. Flags: `--api` (default
-`http://127.0.0.1:8877`; production is passed by hand), `--source` (one, or `all`),
-`--dry-run` (prints every batch and sends nothing), `--root` (default: three levels up).
+`ps`). It holds the automation credential, because no separate import credential exists: the
+routes below cannot publish, so a leaked import token cannot either, but the same token reads
+every report and can plant a draft the desk trusts like an import (`DESIGN-WORK-QUEUE.md`
+section 10). Flags: `--api` (default `http://127.0.0.1:8877`; production is passed by hand),
+`--source` (one, or `all`), `--dry-run` (prints every batch and sends nothing), `--root`
+(default: three levels up). A value flag given last, or followed by another flag or a blank
+value, is a usage error with exit 2, before anything is read.
 
 Sources, and the private ref each produces:
 
@@ -98,9 +103,27 @@ The suggested direction for free-text sources is the first sentence of the sourc
 with every redaction match removed and whitespace collapsed. It is a starting point the
 operator overwrites, and the publish-time check treats it as untrusted anyway.
 
-Requests, batched at 25 items to stay under the 8 KB cap: `POST /open-items` per batch,
-then one `POST /open-items/sync` per source with every ref seen. The script prints `created
-/ unchanged / closed` per source, exits non-zero on any envelope error, and never publishes.
+Requests, batched at 25 items and 7 KB (the Worker's query budget and its 8 KB body cap):
+`POST /open-items` per batch, then one `POST /open-items/sync` per source with every ref
+seen, `## Done` lines included. A source that failed to read, or whose batches did not all go
+through, is not synced. The script prints `created / unchanged / closed / reopened` per source
+and in total, exits non-zero on any envelope error, and never publishes.
+
+**Closed at source, and open again.** A row is marked closed at its source by an import that
+sends its ref with a `closed_at`, or by a sync that no longer lists the ref. Only an import
+clears the mark: an item it sends with no `closed_at` while its row is marked gets
+`source_closed_at` set back to NULL, and nothing else on the row, and counts as `reopened`. A
+sync never clears one, because its list is every ref the importer saw, `## Done` lines
+included, so being listed is no evidence of being open. So a wrong close, from a sync that left
+refs out or a `closed_at` sent by mistake, heals on the next import that lists the item as open,
+while a ref its tracker no longer lists stays closed. A `## Done` line always arrives closed:
+when its date does not parse, the import's own time stands in, because an item sent with no
+`closed_at` would read as open again. An import marks only a row that is not marked and never
+rewrites a mark, so a `## Done` line gives its row the date its tracker closed it on only when
+nothing marked the row first. After a sync or a mistaken `closed_at`, with no import listing
+the item as open in between, the row keeps that earlier date, and so does the desk. A sync
+with an empty `refs` list is refused with `MISSING_PARAM`, but one naming a single ref still
+closes every other row of its source until that next import.
 
 ## 5. The desk flow
 
@@ -131,11 +154,11 @@ what every page of this site does today.
 
 | Route | Auth | Notes |
 |---|---|---|
-| `POST /open-items` | Bearer, either credential | `{ v:1, source, items:[{ ref, text, opened_at, closed_at? }] }`, max 25; upsert by fingerprint; returns `{ created, unchanged, closed }` |
-| `POST /open-items/sync` | Bearer, either credential | `{ source, refs:[...] }`; sets `source_closed_at` on that source's rows whose ref is absent |
+| `POST /open-items` | Bearer, either credential | `{ v:1, source, items:[{ ref, text, opened_at, closed_at? }] }`, max 25; upsert by fingerprint; returns `{ source, created, unchanged, closed, reopened }`, each item counted once |
+| `POST /open-items/sync` | Bearer, either credential | `{ source, refs:[...] }`, at least one ref (`400 MISSING_PARAM` otherwise); sets `source_closed_at` on that source's rows whose ref is absent, clears none; returns `{ source, closed }` |
 | `GET /reports?kind=` | Bearer | existing list, `kind` validated against `KINDS` plus `open` |
 | `PATCH /reports/:id` | Bearer | existing; kind-scoped transitions and the redaction refusal |
-| `GET /board` | none, `max-age=300` | the two arrays above, `SELECT public_note, status, opened_at, fixed_at, source_closed_at` and no other column |
+| `GET /board` | none, `max-age=300`, any origin (A8) | the two arrays above, `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state` and no other column |
 
 `/health.config` gains `automation_token`. Files: `worker/src/store-open.js` (the second
 file with SQL; `store.js`'s header says so), `worker/src/routes-open.js`, and the Turnstile

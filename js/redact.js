@@ -17,6 +17,11 @@
 //
 //     cp worker/src/redact.js js/redact.js
 //
+// NO REGEX LOOKBEHIND, anywhere in this file. Safari before 16.4 cannot parse one, and the
+// desk imports this module statically, so a single lookbehind stops the whole desk from
+// loading with no message. A rule that needs to look behind matches the character in front
+// and declares `group` instead.
+//
 // Applied in three places, and it is the same code each time:
 //   1. the importer, to the draft direction it suggests (a suggestion that still matches
 //      is stored empty, so a stripped-but-still-dirty sentence is never prefilled);
@@ -37,6 +42,9 @@ const MAKE_STOPLIST = new Set([
  * `filter` narrows a deliberately loose pattern. Where one exists, the comment above it
  * says what it lets through: a rule that fires on good sentences teaches the operator to
  * stop reading it, which costs more than the case it was written for.
+ *
+ * `group` names the capture that is the finding, for a rule that has to match a character
+ * in front of it. The finding, and so the text a strip cuts, is that capture alone.
  */
 export const REDACTION_RULES = [
   // Two segments joined by a slash, or a word ending in a source extension. "and/or"
@@ -44,6 +52,18 @@ export const REDACTION_RULES = [
   // sees which two words did it and rewrites four characters.
   { rule: 'file path', re: /\b[\w.-]+\/[\w.-]+/g },
   { rule: 'file path', re: /\b[\w.-]+\.(?:js|mjs|py|md|html|css|toml|yaml|yml|sql|sh)\b/gi },
+  // A segment wrapped in slashes and standing on its own, "/auth/". It is what cutting a
+  // longer path leaves behind: the first rule takes "packages/neorgon-ui" and cannot start
+  // again on the slash it consumed, so "/auth/" survived the strip and read as clean.
+  // Measured 2026-09-15 in the work queue's sanitized backlog, on a real import. The
+  // character in front has to be one no path segment contains, which keeps this off the
+  // inside of a path the first rule already reports, so a path is still one finding.
+  { rule: 'file path', re: /(?:^|[^\w.-])(\/[\w.-]+\/)/g, group: 1 },
+  // The same remnant with no closing slash: cutting "packages/neorgon-ui" out of
+  // "packages/neorgon-ui/beacon" leaves "/beacon". The lookahead hands a segment that goes
+  // on into another slash to the rule above, and a colon or slash in front is a URL's
+  // scheme, which was never a finding without a path after its host.
+  { rule: 'file path', re: /(?:^|[^\w.:\/-])(\/[\w.-]+)(?![\w.\/-])/g, group: 1 },
 
   // A line number, in both of the shapes the trackers use. The first pattern deliberately
   // does NOT require a word before the colon. Measured while building the importer: cut
@@ -56,7 +76,10 @@ export const REDACTION_RULES = [
   // and a pattern that stopped at the first number cut the file name and left "-217"
   // sitting in the sentence.
   { rule: 'line number', re: /\S*:\d{1,6}(?:-\d{1,6})?\b/g },
-  { rule: 'line number', re: /\bline\s+\d+\b/gi },
+  // "lines 26-30" as well as "line 217". The trackers cite a block in the plural with a
+  // range, and the singular-only pattern let that through into a suggestion that then read
+  // as clean. Measured 2026-09-15 in the work queue's sanitized backlog, on a real import.
+  { rule: 'line number', re: /\blines?\s+\d+(?:-\d+)?\b/gi },
 
   // A tracker id. The board carries a date and a sentence; an id is a lookup into a
   // private file, and it is the single most common thing to paste by accident.
@@ -110,7 +133,7 @@ export function redactionFindings(text) {
   const subject = typeof text === 'string' ? text : '';
   const out = [];
   const seen = new Set();
-  for (const { rule, re, filter } of REDACTION_RULES) {
+  for (const { rule, re, filter, group } of REDACTION_RULES) {
     // A fresh RegExp per call. The module-level literals carry /g, and a shared /g regex
     // keeps lastIndex between calls, so reusing them would make the SECOND call on the
     // same string return different findings from the first.
@@ -118,11 +141,12 @@ export function redactionFindings(text) {
     let m;
     while ((m = scan.exec(subject)) !== null) {
       if (m[0] === '') { scan.lastIndex += 1; continue; }
-      if (filter && !filter(m[0])) continue;
-      const key = `${rule} ${m[0]}`;
+      const found = group ? m[group] : m[0];
+      if (!found || (filter && !filter(found))) continue;
+      const key = `${rule} ${found}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      out.push({ rule, match: m[0] });
+      out.push({ rule, match: found });
     }
   }
   return out;
@@ -133,20 +157,32 @@ export function isRedactionClear(text) {
   return redactionFindings(text).length === 0;
 }
 
+/** Cutting passes before stripping gives up. Every pass removes at least one match, and
+ *  a real tracker line clears in two; the bound is for a pathological string, which should
+ *  end with what it has rather than hold a Worker invocation open. */
+const STRIP_PASSES = 5;
+
 /**
  * The text with every finding cut out and the whitespace closed up. Used ONLY to build
  * the importer's suggested direction, which is a starting point for the operator and is
  * checked again at publish time like any other typed sentence.
+ *
+ * Repeated until nothing is found, because a cut can expose a shape that was not a finding
+ * before it: cutting "packages/neorgon-ui" out of a longer path leaves "/auth/" or "/beacon"
+ * standing.
  *
  * Stripping is not sanitising. A sentence can lose its path and still describe the defect
  * precisely enough to be a map, so nothing that comes out of here is trusted anywhere.
  */
 export function stripRedactions(text) {
   let out = typeof text === 'string' ? text : '';
-  // Longest match first, so cutting a short match cannot split a longer one and leave
-  // half of it behind.
-  const matches = redactionFindings(out).map((f) => f.match).sort((a, b) => b.length - a.length);
-  for (const match of matches) out = out.split(match).join(' ');
+  for (let pass = 0; pass < STRIP_PASSES; pass += 1) {
+    // Longest match first, so cutting a short match cannot split a longer one and leave
+    // half of it behind.
+    const matches = redactionFindings(out).map((f) => f.match).sort((a, b) => b.length - a.length);
+    if (!matches.length) break;
+    for (const match of matches) out = out.split(match).join(' ');
+  }
   return out
     .replace(/\s+/g, ' ')
     // Punctuation the cut left stranded between two spaces. A semicolon or a comma that

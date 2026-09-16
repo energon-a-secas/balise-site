@@ -17,6 +17,12 @@ import { fileURLToPath } from 'node:url';
 export const WORKER_DIR = dirname(dirname(fileURLToPath(import.meta.url)));
 export const WRANGLER = join(WORKER_DIR, 'node_modules/.bin/wrangler');
 
+// Every spawn below sets WRANGLER_HIDE_BANNER. Wrangler asks the npm registry for its
+// latest version on every command and does not exit until that request finishes; on
+// 2026-09-15 the registry stalled, finished migrations sat for eight minutes holding an open
+// socket to it, and every suite hung in `before`. The banner switch is the only thing that
+// skips the check (wrangler-banner.ts in workers-sdk), and nothing here needs the banner.
+
 export const TOKEN = 'test-operator-token-local-only-not-a-secret';
 // The automation role is a SEPARATE credential, not a header. The suites prove the
 // boundary by presenting a different token, which is the only way it can be reached.
@@ -33,7 +39,7 @@ export function run(args) {
   return new Promise((resolve, reject) => {
     const p = spawn(WRANGLER, args, {
       cwd: WORKER_DIR,
-      env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
+      env: { ...process.env, WRANGLER_SEND_METRICS: 'false', WRANGLER_HIDE_BANNER: 'true' },
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '';
@@ -55,7 +61,7 @@ export async function startWorker(port, vars, state) {
   args.push('--persist-to', state);
   const child = spawn(WRANGLER, args, {
     cwd: WORKER_DIR,
-    env: { ...process.env, WRANGLER_SEND_METRICS: 'false' },
+    env: { ...process.env, WRANGLER_SEND_METRICS: 'false', WRANGLER_HIDE_BANNER: 'true' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   let log = '';

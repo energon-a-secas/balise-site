@@ -179,3 +179,48 @@ export function patchReport(id, patch, token) {
     token,
   });
 }
+
+// ── The work queue (docs/DESIGN-WORK-QUEUE.md) ───────────────────────────────
+//
+// Only the operator's moves are here: approve, withdraw, review, and filing an item.
+// The runner's moves (claim, heartbeat, release, submit, land) are deliberately not in
+// the site at all. They live in tools/work.mjs, which runs where the code is.
+
+/** GET /work. `state` is one work state or 'active'; `next` comes back as `before`. */
+export function fetchWork({ state = 'active', limit = 25, before = null }, token) {
+  const q = new URLSearchParams({ state, limit: String(limit) });
+  if (before) q.set('before', String(before));
+  return request(`/work?${q}`, { token });
+}
+
+/** GET /work/:id. The item with its body and run history. */
+export function fetchWorkItem(id, token) {
+  return request(`/work/${encodeURIComponent(id)}`, { token });
+}
+
+/** POST /work/items. An `approve` block hands it over in the same call; the Worker takes
+ *  that from the operator token only, and refuses it before writing anything otherwise. */
+export function submitWorkItem(payload, token) {
+  return request('/work/items', { method: 'POST', body: payload, token });
+}
+
+export function approveWork(id, { mode, instruction }, token) {
+  return request(`/work/${encodeURIComponent(id)}/approve`, { method: 'POST', body: { mode, instruction }, token });
+}
+
+export function withdrawWork(id, token) {
+  return request(`/work/${encodeURIComponent(id)}/withdraw`, { method: 'POST', body: {}, token });
+}
+
+/** POST /work/:id/review with accept, return or dismiss. A return needs a note. */
+export function reviewWork(id, { decision, note = '' }, token) {
+  return request(`/work/${encodeURIComponent(id)}/review`, { method: 'POST', body: { decision, note }, token });
+}
+
+/**
+ * GET /board/summary. Public: counts of published entries and the newest resolution's
+ * sentence, readable from any origin so other sections of the fleet can show the same line.
+ */
+export function fetchBoardSummary() {
+  return request('/board/summary');
+}

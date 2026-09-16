@@ -1,32 +1,38 @@
-// Balise: the fleet's correction-reporting Worker, and the fleet's open-items board.
+// Balise: the fleet's correction-reporting Worker, the fleet's open-items board, and the
+// work queue that lets an agent pick those items up.
 //
-// Eight routes, two feeds:
-//   POST   /report          public ingest, Turnstile gated, rate limited
-//   GET    /reports         the private queue          (Authorization: Bearer, C3)
-//   PATCH  /reports/:id     one status transition      (Authorization: Bearer, C3 + C4)
-//   GET    /log             the public corrections log (no auth, cacheable)
-//   POST   /open-items      one import batch           (Authorization: Bearer, C3)
-//   POST   /open-items/sync what the importer saw      (Authorization: Bearer, C3)
-//   GET    /board           the public open-items board (no auth, cacheable)
-//   GET    /health          which secrets are bound, and the per-site read-back
+// The routes:
+//   POST   /report            public ingest, Turnstile gated, rate limited
+//   GET    /reports           the private queue            (Authorization: Bearer, C3)
+//   PATCH  /reports/:id       one status transition        (Authorization: Bearer, C3 + C4)
+//   GET    /log               the public corrections log   (no auth, cacheable)
+//   POST   /open-items        one import batch             (Authorization: Bearer, C3)
+//   POST   /open-items/sync   what the importer saw        (Authorization: Bearer, C3)
+//   GET    /board             the public open-items board  (no auth, cacheable, any origin)
+//   GET    /board/summary     the board as counts          (no auth, cacheable, any origin)
+//   GET    /work, /work/:id   the work queue               (Authorization: Bearer, C3)
+//   POST   /work/...          one work action              (Authorization: Bearer, C3 + src/work.js)
+//   GET    /health            which secrets are bound, and the per-site read-back
 //
-// The two feeds share one table, one desk and one triage flow, because they share the
-// same rule: text arrives in PRIVATE, a person decides, and only a sentence that person
-// typed reaches a public page. Corrections arrive from strangers; open items arrive from
-// the fleet's own trackers. NOTHING ON EITHER FEED PUBLISHES ITSELF.
+// The feeds share one table, one desk and one rule: text arrives in PRIVATE, a person
+// decides, and only a sentence that person typed reaches a public page. Corrections arrive
+// from strangers and open items from the fleet's own trackers; the work queue lets an agent
+// do the work behind either and hands the result back to a person. NOTHING ON ANY FEED
+// PUBLISHES ITSELF.
 //
 // Contracts this file enforces, all frozen in docs/delivery/CONTRACTS.md:
 //   C1  the report shape        -> src/validate.js
 //   C2  the error envelope      -> src/envelope.js
-//   C3  operator authentication -> below, plus auth_attempts in src/store.js
+//   C3  operator authentication -> src/auth.js, plus auth_attempts in src/store.js
 //   C4  the status vocabulary   -> src/transitions.js, enforced in src/store.js
+// and the work queue's action table (docs/DESIGN-WORK-QUEUE.md) -> src/work.js.
 //
 // No response from this Worker is ever HTTP 500. The router is wrapped in a try/catch in
 // the default export at the bottom, the same shape as
 // projects/resume-forge-site/worker/src/index.js:341-365.
 //
-// /report, /log and /board NEVER read the Authorization header. A public route that also
-// honours an operator credential is one refactor away from leaking the queue.
+// /report, /log, /board and /board/summary NEVER read the Authorization header. A public
+// route that also honours an operator credential is one refactor away from leaking the queue.
 
 import { ERROR_CODES, fail, ok, corsHeaders, originVerdict } from './envelope.js';
 import { validateReport, validatePatch, validateListQuery, REQUEST_MAX_BYTES } from './validate.js';
@@ -40,58 +46,44 @@ import {
   applyTransition,
   publicLog,
   healthSites,
-  checkLock,
-  recordAuthResult,
   rowsReadBudget,
 } from './store.js';
 import { verifyTurnstile } from './turnstile.js';
-import { openImport, openSync, openBoard } from './routes-open.js';
+import { authenticate, actorKey } from './auth.js';
+import { openImport, openSync, openBoard, openBoardSummary } from './routes-open.js';
+import { parseWorkPath, workRoute } from './routes-work.js';
+import { WORK_REQUEST_MAX_BYTES } from './validate-work.js';
 
 export { ERROR_CODES };
 
-const VERSION = '1.0.0';
+// 1.1.0 is the open-items board and the work queue together: 1.0.0 shipped the corrections
+// feed alone, and the board was built after it without a bump, so the release checks this
+// number to tell the two builds apart.
+const VERSION = '1.1.0';
 const HEALTH_WINDOW_DAYS = 30;
-
-/** The one sentence a failed operator auth ever gets. It does not say which of the three
- *  things went wrong, because telling a prober "wrong token" rather than "no token" or
- *  "locked out" hands them a free oracle. */
-const AUTH_GENERIC = {
-  message: 'That did not unlock the review desk.',
-  hint: 'Check the operator token and try once more. After five wrong tries the desk stops answering for fifteen minutes.',
-};
 
 // ── Small helpers ─────────────────────────────────────────────────────────────
 
-async function sha256Bytes(input) {
-  return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input)));
-}
-
 /**
- * The key both the rate limit binding and the C3 lockout count against. The salted hash
- * when a salt is bound, the raw address when it is not, and one shared bucket when there
- * is no address at all. That last case is local development and curl from the same box:
- * everyone shares a bucket, which is stricter than production rather than looser.
+ * Read a JSON body under a byte cap: 8 KB on every route but the work actions, which pass
+ * WORK_REQUEST_MAX_BYTES because a result's summary and evidence do not fit in 8 KB.
+ * Content-Length is checked first so an oversized request is refused before anything is
+ * read; a chunked request has no Content-Length, so the decoded length is checked as well.
+ *
+ * `allowEmpty` is for the work actions, where a body-less POST (withdraw) means "no
+ * fields" rather than a malformed request. Every other route keeps refusing an empty body.
  */
-function actorKey(hashed, ip) {
-  if (hashed) return hashed;
-  return ip ? `ip:${ip}` : 'anonymous';
-}
-
-/**
- * Read a JSON body under the 8 KB cap. Content-Length is checked first so an oversized
- * request is refused before anything is read; a chunked request has no Content-Length, so
- * the decoded length is checked as well.
- */
-async function readJson(request, provider, origin, env) {
+async function readJson(request, provider, origin, env, { allowEmpty = false, maxBytes = REQUEST_MAX_BYTES, tooLargeHint } = {}) {
   const declared = Number(request.headers.get('Content-Length') || '0');
-  if (declared > REQUEST_MAX_BYTES) return { error: tooLarge(provider, origin, env) };
+  if (declared > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
   let text;
   try {
     text = await request.text();
   } catch {
     return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body could not be read.', hint: 'Send it again from the beacon.' }) };
   }
-  if (new TextEncoder().encode(text).length > REQUEST_MAX_BYTES) return { error: tooLarge(provider, origin, env) };
+  if (new TextEncoder().encode(text).length > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
+  if (allowEmpty && !text.trim()) return { value: {} };
   try {
     return { value: JSON.parse(text) };
   } catch {
@@ -99,88 +91,20 @@ async function readJson(request, provider, origin, env) {
   }
 }
 
-const tooLarge = (provider, origin, env) =>
+const tooLarge = (provider, origin, env, maxBytes, hint) =>
   fail('TOO_LARGE', {
     provider,
     origin,
     env,
-    message: `The request is over ${REQUEST_MAX_BYTES / 1024} KB, which this service refuses before reading it.`,
-    hint: 'Shorten the report to a couple of paragraphs and send it again.',
+    message: `The request is over ${maxBytes / 1024} KB, which this service refuses before reading it.`,
+    hint: hint || 'Shorten the report to a couple of paragraphs and send it again.',
   });
 
 const notARoute = (origin, env, hint) =>
   fail('NOT_A_ROUTE', { provider: '', origin, env, message: 'That path and method are not a route on this worker.', hint });
 
 const ROUTES_HINT =
-  'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board and GET /health.';
-
-// ── C3: operator authentication ───────────────────────────────────────────────
-
-/**
- * Constant-time compare of an already hashed presentation against a candidate secret.
- * Returns false for an unset secret, which is how a deployment with no automation token
- * simply has no automation role rather than an error.
- *
- * timingSafeEqual throws on unequal length buffers, so both sides are SHA-256 first.
- * The length branch is unreachable at a fixed 32 bytes and is written out anyway, so a
- * later change of digest cannot silently reintroduce the leak. Comparing the input
- * against itself and negating is the current documented form
- * (https://developers.cloudflare.com/workers/examples/protect-against-timing-attacks/);
- * the pre-2026 example returned early on a length mismatch, which is the leak it claimed
- * to prevent.
- */
-async function matches(presentedHash, candidate) {
-  if (!candidate) return false;
-  const secret = await sha256Bytes(candidate);
-  return presentedHash.byteLength === secret.byteLength
-    ? crypto.subtle.timingSafeEqual(presentedHash, secret)
-    : !crypto.subtle.timingSafeEqual(presentedHash, presentedHash);
-}
-
-/** Returns { actor } on success, or a ready-made 401 envelope. Every failure returns the
- *  same sentence, whichever of the three things went wrong. */
-async function authenticate(request, env, db, key, now) {
-  if (!env || !env.BALISE_OPERATOR_TOKEN) {
-    return {
-      error: {
-        code: 'NOT_CONFIGURED',
-        message: 'This deployment has no operator token set, so the review desk cannot be unlocked.',
-        hint: 'Run wrangler secret put BALISE_OPERATOR_TOKEN. The public log at /log keeps working meanwhile.',
-      },
-    };
-  }
-
-  const header = request.headers.get('Authorization') || '';
-  const match = /^Bearer\s+(.+)$/.exec(header.trim());
-  // An absent or malformed header is not counted against the lockout. It costs no D1
-  // write, it tells a prober nothing the generic sentence does not, and counting it would
-  // let one bug in the desk lock the operator out of their own queue.
-  if (!match) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
-
-  const lock = await checkLock(db, key, now);
-  if (lock.locked) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
-
-  const presented = await sha256Bytes(match[1]);
-
-  /* The actor is decided by WHICH credential matched, never by a header. It used to
-     be `X-Balise-Actor: ai`, self declared, which meant anything holding the operator
-     token could simply omit the header and take the human transition table: C4's limit
-     on automation was unenforceable. That header is gone; do not reintroduce it.
-
-     Both candidates are compared every time, and the result is folded rather than
-     short circuited, so the work does not depend on which token was presented and a
-     wrong guess cannot be told from a right-token-wrong-role by timing. */
-  const operator = await matches(presented, env.BALISE_OPERATOR_TOKEN);
-  const automation = await matches(presented, env.BALISE_AUTOMATION_TOKEN);
-
-  const equal = operator || automation;
-  await recordAuthResult(db, key, equal, now);
-  if (!equal) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
-
-  // The operator wins if both secrets are somehow the same value, so a misconfiguration
-  // degrades to the MORE restrictive outcome being unreachable rather than the reverse.
-  return { actor: operator ? 'human' : 'ai' };
-}
+  'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board, GET /board/summary, the /work routes and GET /health.';
 
 // ── The router ────────────────────────────────────────────────────────────────
 
@@ -200,7 +124,13 @@ const router = {
     // A denied origin gets no CORS headers at all, so a browser sees a CORS failure and
     // never reads this body. It is here for curl and for the operator: do not build UI
     // against it (C2.2). A request with no Origin at all is allowed everywhere.
-    if (originVerdict(origin, env) === 'denied') {
+    //
+    // The two board reads are the exception, amendment A8 (docs/DESIGN-WORK-QUEUE.md
+    // section 6). They serve only sentences a person published and counts of them, they
+    // never read a credential, and they exist so other sections of the fleet can show
+    // them, which a three-origin allowlist would make impossible. Everything else keeps C2.2.
+    const publicRead = method === 'GET' && (path === '/board' || path === '/board/summary');
+    if (!publicRead && originVerdict(origin, env) === 'denied') {
       return fail('FORBIDDEN_ORIGIN', {
         provider: surfaceFor(path),
         message: 'This service does not answer requests from that origin.',
@@ -239,9 +169,18 @@ const router = {
       if (method !== 'POST') return notARoute(origin, env, 'An import is POST /open-items, and POST /open-items/sync closes what it did not see.');
       return await importRoute(request, env, origin, ip, now, path === '/open-items/sync');
     }
+    if (path === '/board/summary') {
+      if (method !== 'GET') return notARoute(origin, env, 'The board counts are read with GET /board/summary.');
+      return await openBoardSummary(env, { now });
+    }
     if (path === '/board') {
       if (method !== 'GET') return notARoute(origin, env, 'The open-items board is read with GET /board.');
-      return await openBoard(request, env, { origin });
+      return await openBoard(request, env);
+    }
+    if (path === '/work' || path.startsWith('/work/')) {
+      const target = parseWorkPath(path, method);
+      if (target.hint) return notARoute(origin, env, target.hint);
+      return await work(request, env, origin, ip, now, target);
     }
     if (path === '/health') {
       if (method !== 'GET') return notARoute(origin, env, 'Health is read with GET /health.');
@@ -254,8 +193,8 @@ const router = {
 const surfaceFor = (path) => {
   if (path === '/report') return 'ingest';
   if (path === '/reports' || path.startsWith('/reports/')) return 'desk';
-  if (path.startsWith('/open-items')) return 'desk';
-  if (path === '/log' || path === '/board') return 'log';
+  if (path.startsWith('/open-items') || path === '/work' || path.startsWith('/work/')) return 'desk';
+  if (path === '/log' || path === '/board' || path === '/board/summary') return 'log';
   return '';
 };
 
@@ -366,9 +305,13 @@ async function deskPatch(request, env, origin, ip, now, id) {
 
 /**
  * C3 first, then the body, then src/routes-open.js. Both import routes take EITHER
- * credential: the importer is a script the operator runs, and the automation token is the
- * intended value for it, because neither route can move a report toward a reader. A
- * leaked import token writes drafts into a private queue and nothing else.
+ * credential: the importer is a script the operator runs, and it holds the automation token
+ * because neither route can move a report toward a reader. That is not the same as
+ * harmless: the token also reads every report, contact included, and through these routes
+ * it can plant a draft trusted like the fleet's own, which the operator can hand to an agent
+ * in ship mode with no instruction, and mark items closed at their source or clear that mark.
+ * The separate import credential that would narrow this is not built. src/routes-open.js
+ * lists the reach, and docs/architecture/balise.md lists what the token cannot do.
  *
  * The lockout counts these the same way it counts the desk, so a script pointed at the
  * wrong deployment with the wrong token does not get unlimited tries.
@@ -385,6 +328,34 @@ async function importRoute(request, env, origin, ip, now, isSync) {
   return isSync
     ? await openSync(env, parsed.value, { origin, now })
     : await openImport(env, parsed.value, { origin, now });
+}
+
+// ── /work ─────────────────────────────────────────────────────────────────────
+
+/**
+ * C3 first, then the body, then src/routes-work.js, in the same order as the import routes
+ * and under the same lockout. Every work route takes either credential at this layer: WHICH
+ * actions a credential may take is decided against src/work.js inside src/store-work.js, so
+ * the role rule has exactly one home. The body is read under WORK_REQUEST_MAX_BYTES, and
+ * only after authentication, so nobody without a token gets 64 KB read on their behalf.
+ */
+async function work(request, env, origin, ip, now, target) {
+  const P = 'desk';
+  const key = actorKey(await ipHash(env.BALISE_IP_SALT, ip), ip);
+  const auth = await authenticate(request, env, env.DB, key, now);
+  if (auth.error) return fail(auth.error.code, { provider: P, origin, env, message: auth.error.message, hint: auth.error.hint });
+
+  let body = null;
+  if (request.method === 'POST') {
+    const parsed = await readJson(request, P, origin, env, {
+      allowEmpty: true,
+      maxBytes: WORK_REQUEST_MAX_BYTES,
+      tooLargeHint: 'Trim the evidence to the lines that matter, then the summary, and send it again on the same run.',
+    });
+    if (parsed.error) return parsed.error;
+    body = parsed.value;
+  }
+  return await workRoute(env, target, { url: new URL(request.url), actor: auth.actor, body, origin, now });
 }
 
 // ── GET /log ──────────────────────────────────────────────────────────────────

@@ -134,6 +134,10 @@
         Written by the person doing the work.
       </p>
 
+      <!-- Counts from GET /board/summary, the same line other sections of the fleet
+           can show. Published entries only; hidden when there is nothing to count. -->
+      <p class="board__summary muted" id="boardSummary" hidden></p>
+
       <p class="log__state" id="boardLoading" hidden>Loading the board…</p>
 
       <div class="report-error" id="boardError" role="alert" hidden>

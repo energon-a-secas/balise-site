@@ -355,6 +355,11 @@ export function validateOpenBatch(body, sources, max) {
  * from it is about to be marked closed. A partial list therefore says "everything else is
  * finished", which is why the importer refuses to send one and why this cap is generous
  * enough that the 8 KB body limit is what actually bites.
+ *
+ * An EMPTY list is refused. It would mark every item of the source closed at source in one
+ * call, and only a later import sending each item with no closed_at clears that mark. The
+ * importer never sends one (it skips a tracker with nothing in it), so the only caller it
+ * would serve is one that should not.
  */
 export function validateOpenSync(body, sources, max) {
   if (!body || typeof body !== 'object' || Array.isArray(body)) {
@@ -366,7 +371,13 @@ export function validateOpenSync(body, sources, max) {
     return bad(`"${source}" is not a tracker this service reads.`, `The sources are ${sources.join(', ')}.`);
   }
   if (!Array.isArray(body.refs)) {
-    return missing('The sync call had no refs array.', 'Send every ref the importer saw this run, even if the list is empty.');
+    return missing('The sync call had no refs array.', 'Send every ref the importer read from that tracker this run.');
+  }
+  if (!body.refs.length) {
+    return missing(
+      'The sync call had no refs in it, which would mark every item of that source closed.',
+      'Send every ref the importer read from that tracker. If the tracker really is empty, resolve what is left at the desk.',
+    );
   }
   if (body.refs.length > max) {
     return bad(`The sync call carries ${body.refs.length} refs and the limit is ${max}.`, 'Import that source in fewer, longer-lived refs.');

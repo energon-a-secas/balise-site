@@ -950,6 +950,96 @@ button:active,
 .desk-open__verdict.is-empty { color: var(--text-muted, #94a3b8); }
 .desk-open__verdict.is-blocked { color: var(--danger); }
 
+/* ── Desk: the work queue ─────────────────────────────────────
+ *
+ * The third view on the desk and the panel that feeds it. Same card, same badges,
+ * one new idea: a card here reports what an agent did, so the run gets its own quiet
+ * block and the moves a person has left sit under it. Badge hues reuse the status
+ * palette above rather than adding a second one.
+ */
+
+.desk-card--work { border-left: 3px solid var(--border-strong, rgba(255,255,255,.22)); }
+.desk-card--work[data-work="review"] { border-left-color: var(--accent); }
+
+.desk-badge--work-approved { color: #a78bfa; }
+.desk-badge--work-claimed  { color: #38bdf8; }
+.desk-badge--work-review   { color: var(--accent); }
+.desk-badge--work-accepted { color: #4ade80; }
+.desk-badge--work-done     { color: #94a3b8; }
+.desk-badge--outcome-fixed        { color: #4ade80; }
+.desk-badge--outcome-investigated { color: #38bdf8; }
+.desk-badge--outcome-partial      { color: #a78bfa; }
+.desk-badge--outcome-blocked      { color: var(--accent); }
+.desk-badge--outcome-failed       { color: var(--danger); }
+
+.desk-chip-count {
+  margin-left: 6px;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted, #94a3b8);
+}
+.desk-work__mode-chip { font-size: var(--text-xs); font-weight: 600; color: var(--text-secondary); }
+.desk-work__title { line-height: 1.55; font-weight: 600; overflow-wrap: anywhere; }
+.desk-work__warning { font-size: 0.85rem; line-height: 1.5; margin-top: var(--space-2); max-width: 62ch; }
+.desk-work__status { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: var(--space-3); }
+
+.desk-work { margin-top: var(--space-3); padding-top: var(--space-2); border-top: 1px solid var(--border, #24304a); }
+.desk-work__modes { border: 0; padding: 0; margin: var(--space-2) 0 0; display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; }
+.desk-work__legend { font-size: 0.94rem; font-weight: 600; margin-bottom: 6px; }
+.desk-work__mode { display: inline-flex; gap: 6px; align-items: center; min-height: var(--control-height-sm); font-size: 0.9rem; cursor: pointer; }
+.desk-work__mode input, .desk-work__toggle input { accent-color: var(--accent); }
+.desk-work__mode-hint { flex-basis: 100%; font-size: 0.85rem; line-height: 1.5; }
+
+.desk-work__run {
+  margin-top: var(--space-3);
+  padding: var(--space-3);
+  border: 1px solid var(--border-subtle, rgba(255,255,255,.07));
+  border-radius: var(--radius-sm);
+  background: var(--surface-1);
+}
+.desk-work__run-head { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; font-size: 0.88rem; }
+.desk-work__summary { margin-top: var(--space-2); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; }
+.desk-work__evidence {
+  max-height: 260px;
+  overflow: auto;
+  padding: var(--space-2);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  font-size: 0.8rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.desk-work__refs { list-style: none; display: grid; gap: 2px; margin-top: var(--space-2); font-size: 0.82rem; overflow-wrap: anywhere; }
+.desk-work__note { margin-top: var(--space-2); font-size: 0.86rem; line-height: 1.5; }
+.desk-work__lapsed { color: var(--accent); }
+.desk-work__return, .desk-work__publish { margin-top: var(--space-3); }
+.desk-work__return .btn, .desk-work__publish .btn { margin-top: var(--space-2); }
+
+.desk-work__new {
+  display: grid;
+  gap: var(--space-2);
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px dashed var(--border-strong, rgba(255,255,255,.22));
+  border-radius: 12px;
+}
+.desk-work__new-head { font-size: 1rem; }
+.desk-work__hint { font-size: 0.85rem; }
+.desk-work__toggle { display: inline-flex; gap: 8px; align-items: center; min-height: var(--control-height-sm); font-size: 0.9rem; cursor: pointer; }
+.desk-work__new .btn[type="submit"] { justify-self: start; }
+
+/* The line that says what the last move did. Empty, it takes no room. */
+.desk-status { font-size: 0.88rem; line-height: 1.5; margin-bottom: 12px; }
+.desk-status:empty { margin: 0; }
+/* A card waiting on its own request: its controls are disabled until the answer arrives. */
+.desk-card[aria-busy="true"] { cursor: progress; }
+/* Why a closing move is missing from a card an agent has, on its own line under the moves left. */
+.desk-card__held { flex-basis: 100%; font-size: 0.86rem; line-height: 1.5; }
+
+/* The board's count line tucks under the lede it belongs to, and an entry an agent is
+   working on borrows the accent at half strength: moving, but not yet the news. */
+.board__summary { margin: calc(-1 * var(--space-4)) 0 var(--space-6); font-size: 0.92rem; }
+.board-entry--in_progress { border-left-color: color-mix(in srgb, var(--accent) 55%, transparent); }
+.board-entry--in_progress .board-entry__state { color: var(--accent); }
+
 @media (max-width: 600px) {
   .desk-kinds { padding-right: 0; border-right: 0; }
   .board-entry__date { margin-left: 0; }

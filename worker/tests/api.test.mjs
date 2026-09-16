@@ -382,9 +382,11 @@ test('a timestamp is milliseconds, so a seconds value is caught rather than stor
 
 test('a sync call carries the complete ref set for one tracker', () => {
   assert.equal(validateOpenSync({ source: 'queue', refs: ['#1', '#2'] }, OPEN_SOURCES, SYNC_REFS_MAX).code, undefined);
-  // An empty list is legal and means "this tracker has nothing open", which closes the
-  // lot. It is the harness's normal state.
-  assert.deepEqual(validateOpenSync({ source: 'harness', refs: [] }, OPEN_SOURCES, SYNC_REFS_MAX).value.refs, []);
+  // An empty list is refused (C-j). It would mark every item of that tracker closed at its
+  // source in one call, and only a later import of each item clears that mark again.
+  const empty = validateOpenSync({ source: 'harness', refs: [] }, OPEN_SOURCES, SYNC_REFS_MAX);
+  assert.equal(empty.code, 'MISSING_PARAM');
+  assert.equal(empty.value, undefined);
   assert.equal(validateOpenSync({ source: 'queue' }, OPEN_SOURCES, SYNC_REFS_MAX).code, 'MISSING_PARAM');
   assert.equal(validateOpenSync({ source: 'queue', refs: [1, 2] }, OPEN_SOURCES, SYNC_REFS_MAX).code, 'BAD_FIELD');
 });

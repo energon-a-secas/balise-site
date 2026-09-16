@@ -15,7 +15,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { redactionFindings, stripRedactions, isRedactionClear } from '../src/redact.js';
+import { REDACTION_RULES, redactionFindings, stripRedactions, isRedactionClear } from '../src/redact.js';
 
 const SRC = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src');
 const SITE = join(dirname(dirname(dirname(fileURLToPath(import.meta.url)))), 'js');
@@ -43,6 +43,18 @@ test('redaction: a line number survives having its path cut off', () => {
   assert.ok(flags('the fix is at ::217 now').includes('line number'));
   assert.ok(flags('js/export.js:210-217 emits it').includes('line number'));
   assert.equal(stripRedactions('js/export.js:210-217 emits it'), 'emits it');
+});
+
+test('redaction: a plural line range and the segment a strip leaves behind are findings', () => {
+  // Both passed the floor until 2026-09-15, found by reading the sanitized backlog rather
+  // than by any test: a draft printed "(lines 26-30)", and another printed "/auth/" after
+  // its longer path had been cut out.
+  assert.ok(flags('the template ships it uncommented (lines 26-30)').includes('line number'));
+  assert.ok(flags('the kit hides it (/auth/) on the first step').includes('file path'));
+  assert.deepEqual(redactionFindings(stripRedactions('the kit at packages/neorgon-ui/auth/ hides it')), []);
+  assert.deepEqual(redactionFindings(stripRedactions('it ships uncommented (lines 26-30) today')), []);
+  // The range group is what takes the "-30": without it the strip left "( -30)", which reads clean.
+  assert.doesNotMatch(stripRedactions('it ships uncommented (lines 26-30) today'), /\d/);
 });
 
 test('redaction: a bare date is NOT a finding, and a run id is', () => {
@@ -103,9 +115,33 @@ test('redaction: stripping never leaves a finding behind', () => {
     'packages/neorgon-ui/footer/neorgon-footer.js:217 skips the hub link',
     'run 2026-09-05-feat-rush-q with BALISE_IP_SALT set and make d1-reset after',
     'see #58 and #59, both in docs/prompt-queue.md line 21',
+    'See packages/neorgon-ui/beacon for the widget.',
   ]) {
     assert.deepEqual(redactionFindings(stripRedactions(text)), [], text);
+    // A path's last segment is what a cut leaves behind, so no slash-led word may survive.
+    assert.doesNotMatch(stripRedactions(text), /\/[\w.-]/, text);
   }
+});
+
+test('C-m: no rule looks behind, so a desk on Safari before 16.4 can still load the module', () => {
+  assert.doesNotMatch(readFileSync(join(SRC, 'redact.js'), 'utf8'), /\(\?<[=!]/, 'worker/src/redact.js has a lookbehind');
+  for (const { re } of REDACTION_RULES) assert.doesNotMatch(re.source, /\(\?<[=!]/, re.source);
+});
+
+test('C-m: a capture rule reports its segment and a strip cuts only that, while a path is still one finding', () => {
+  const capturing = REDACTION_RULES.filter((r) => r.group !== undefined);
+  assert.ok(capturing.length >= 2, 'the slash-wrapped and slash-led rules no longer declare a capture');
+  for (const r of capturing) assert.equal(r.group, 1, r.re.source);
+  assert.deepEqual(redactionFindings('See /beacon for the widget.'), [{ rule: 'file path', match: '/beacon' }]);
+  assert.deepEqual(redactionFindings('the kit hides it (/auth/) on the first step'), [{ rule: 'file path', match: '/auth/' }]);
+  assert.equal(stripRedactions('a (/auth/) b'), 'a () b', 'the strip cut the character in front of the capture');
+  // The remnant a cut leaves is found and cut on the next pass...
+  assert.equal(stripRedactions('See packages/neorgon-ui/beacon for the widget.'), 'See for the widget.');
+  assert.equal(stripRedactions('the kit at packages/neorgon-ui/auth hides it'), 'the kit at hides it');
+  // ...without a second finding inside a path the first rule already reports.
+  assert.deepEqual(redactionFindings('The fix landed in packages/neorgon-ui/footer.'), [{ rule: 'file path', match: 'packages/neorgon-ui' }]);
+  // A scheme's slashes were never a path, and still are not.
+  assert.deepEqual(redactionFindings('Visit https://balise.neorgon.com for the board.'), []);
 });
 
 test('redaction: the check is total on non-strings rather than throwing', () => {

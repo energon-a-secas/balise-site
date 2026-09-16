@@ -12,11 +12,14 @@
 // textContent, through elem() and setText(), and there is no innerHTML here.
 // C3 says the token stays in desk.js's module scope; this file never sees it.
 
-import { redactionFindings } from './redact.js';
 import { setText, elem, formatDate } from './utils.js';
+import {
+  verdictFor, agentPanelNode, actionButton, movesWhileWorked, heldNode,
+} from './desk-work.js';
 
-/** DESIGN-OPEN-ITEMS.md section 4. Anything else is shown as "source". */
-const SOURCES = ['queue', 'brief', 'harness', 'registry'];
+/** DESIGN-OPEN-ITEMS.md section 4, plus `direct`: an item filed straight into the
+ *  work queue (DESIGN-WORK-QUEUE.md). Anything else is shown as "source". */
+const SOURCES = ['queue', 'brief', 'harness', 'registry', 'direct'];
 
 /**
  * What a C4 status MEANS on this kind. The vocabulary is shared with
@@ -75,29 +78,6 @@ const LABEL = {
 /** The two moves that put the sentence on the board, so the two the check gates. */
 const PUBLISHES = new Set(['accepted', 'fixed']);
 
-/**
- * The client half of the redaction check (section 3). It refuses nothing on its
- * own: the Worker refuses, every time, on a copy of these rules that this page
- * cannot reach. What this buys is that the operator sees WHY before they press
- * anything, instead of writing a sentence, publishing it, and reading a rejection.
- */
-function verdictFor(text) {
-  const trimmed = text.trim();
-  // Three states, not two. An empty field is not a breach, it is a sentence
-  // nobody has written yet, and colouring it like a refusal teaches the operator
-  // that the red line under the box means nothing.
-  if (!trimmed) {
-    return { clear: false, state: 'empty', text: 'Write one sentence for the board.' };
-  }
-  const findings = redactionFindings(trimmed);
-  if (!findings.length) {
-    return { clear: true, state: 'clear', text: 'Clear to publish' };
-  }
-  const first = findings[0];
-  const more = findings.length > 1 ? ` (and ${findings.length - 1} more)` : '';
-  return { clear: false, state: 'blocked', text: `Contains a ${first.rule}: ${first.match}${more}` };
-}
-
 /** The head row: what it is, where it came from, and when it opened. */
 function headNode(report, status) {
   const head = elem('div', 'desk-card__head');
@@ -120,10 +100,12 @@ function headNode(report, status) {
 }
 
 /**
- * One open item, as DOM. `move(report, status, extra)` is desk.js's, so the
- * token, the error box and the reload stay in one place.
+ * One open item, as DOM. `move(report, status, extra)` and `work` are desk.js's,
+ * so the token, the error box and the reload stay in one place. The redaction
+ * verdict is desk-work.js's `verdictFor`, shared with the work card's resolution
+ * sentence so the two boxes can never disagree about what is clear to publish.
  */
-export function openReportNode(report, status, move) {
+export function openReportNode(report, status, move, work) {
   const item = elem('li', 'desk-card desk-card--open');
   item.dataset.status = status;
   item.append(headNode(report, status));
@@ -167,27 +149,34 @@ export function openReportNode(report, status, move) {
 
   const actions = elem('div', 'desk-card__actions');
   const publishButtons = [];
+  // While an agent has the item, Publish as resolved and Keep private wait: the Worker
+  // refuses them (C-i), and a resolution published before its fix lands has nothing under it.
+  const offered = movesWhileWorked(report, NEXT[status] || []);
 
-  (NEXT[status] || []).forEach((next) => {
-    const button = elem('button', 'btn btn--ghost btn--sm', LABEL[next] || next);
-    button.type = 'button';
-    if (PUBLISHES.has(next)) {
-      publishButtons.push(button);
-      button.addEventListener('click', () => move(report, next, { public_note: note.value.trim() }));
-    } else {
-      // `duplicate` still asks for an id the way the corrections desk does.
-      // Section 5's "no window.prompt here" is about the SENTENCE, which is the
-      // whole entry and is edited in place above; an id is not the entry, and
-      // section 9 leaves the corrections prompt alone.
-      button.addEventListener('click', () => move(report, next));
-    }
+  offered.moves.forEach((next) => {
+    // `duplicate` still asks for an id the way the corrections desk does.
+    // Section 5's "no window.prompt here" is about the SENTENCE, which is the
+    // whole entry and is edited in place above; an id is not the entry, and
+    // section 9 leaves the corrections prompt alone.
+    const publishes = PUBLISHES.has(next);
+    const button = actionButton(LABEL[next] || next, 'btn btn--ghost btn--sm', () => (publishes
+      ? move(report, next, { public_note: note.value.trim() })
+      : move(report, next)));
+    if (publishes) publishButtons.push(button);
     actions.append(button);
   });
 
-  if (!actions.children.length) {
+  if (offered.held) {
+    actions.append(heldNode());
+  } else if (!actions.children.length) {
     actions.append(elem('span', 'muted', 'Terminal. Nothing further to do.'));
   }
   item.append(actions);
+
+  // Last on the card, below the publish moves, so handing an item to an agent is
+  // never mistaken for publishing it: the two are different axes (DESIGN-WORK-QUEUE.md
+  // section 1), and most work happens on drafts nobody has published.
+  item.append(agentPanelNode(report, work));
 
   const refresh = () => {
     const result = verdictFor(note.value);

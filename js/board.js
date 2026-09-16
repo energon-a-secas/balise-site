@@ -7,15 +7,15 @@
 // under the wrong heading claims a stranger asked for it.
 //
 // Everything rendered here was typed by an operator. The Worker's /board query
-// names four columns and none of them is the source text, the private ref or
-// the site, so there is nothing on this surface to redact at render time. C5
-// still holds anyway: elem() and setText() only, no innerHTML.
+// names no source text, no private ref and no site, so there is nothing on this
+// surface to redact at render time. C5 still holds anyway: elem() and setText()
+// only, no innerHTML.
 //
 // RESOLVED IS THE POINT. A board that only grows is a graveyard, so resolutions
 // come first, the newest one is labelled and given the accent, and the open
 // items sit under them. The ordering is the Worker's; this file does not sort.
 
-import { fetchBoard } from './api.js';
+import { fetchBoard, fetchBoardSummary } from './api.js';
 import { setText, show, hide, elem, formatDate } from './utils.js';
 
 const el = {};
@@ -24,8 +24,13 @@ const tabs = [];
 let loading = false;
 let loaded = false;
 
-/** The two states an entry can be in, and the only two words shown for them. */
-const STATE_LABEL = { resolved: 'Resolved', open: 'Open' };
+/**
+ * The states an entry can be in, and the only words shown for them. `in_progress`
+ * is an open entry an agent is working on (docs/DESIGN-WORK-QUEUE.md section 6),
+ * which says the fleet is moving and nothing about who, how or where. A state this
+ * file has never heard of falls back to its group's word, which is still true.
+ */
+const STATE_LABEL = { resolved: 'Resolved', in_progress: 'In progress', open: 'Open' };
 
 /**
  * A board date is a DAY, sent as `YYYY-MM-DD`, and it is a day on purpose: a
@@ -91,6 +96,24 @@ function render(result) {
 }
 
 /**
+ * The one line under the lede, from GET /board/summary. It is the same line other
+ * sections of the fleet can show, so this page is its first reader and the place
+ * a wrong count would be noticed. A failed summary hides the line and nothing else:
+ * the board does not depend on it.
+ */
+function renderSummary(summary) {
+  if (!summary || !summary.ok || (!summary.open && !summary.resolved)) {
+    hide(el.summary);
+    return;
+  }
+  const parts = [`${summary.open} open`];
+  if (summary.in_progress) parts.push(`${summary.in_progress} in progress`);
+  parts.push(`${summary.resolved} resolved in the last ${summary.window_days || 30} days`);
+  setText(el.summary, `${parts.join(', ')}.`);
+  show(el.summary);
+}
+
+/**
  * One fetch for the life of the page. The board is short by design and the
  * endpoint takes no cursor, so there is nothing to page and nothing to refresh
  * on a tab switch. A failed load leaves `loaded` false, so returning to the tab
@@ -100,8 +123,12 @@ async function load() {
   if (loading || loaded) return;
   loading = true;
   hide(el.error);
+  hide(el.summary);
   show(el.loading);
 
+  // Asked for together, drawn apart. A request has no timeout, so waiting on both would let
+  // a stalled count line hold back the board it only describes.
+  const summary = fetchBoardSummary();
   const result = await fetchBoard();
 
   loading = false;
@@ -116,6 +143,7 @@ async function load() {
 
   loaded = true;
   render(result);
+  summary.then(renderSummary);
 }
 
 /**
@@ -175,6 +203,7 @@ export function initBoard() {
     errorMessage: 'boardErrorMessage',
     errorHint: 'boardErrorHint',
     empty: 'boardEmpty',
+    summary: 'boardSummary',
     resolvedGroup: 'boardResolvedGroup',
     resolvedList: 'boardResolved',
     openGroup: 'boardOpenGroup',

@@ -87,14 +87,25 @@
         <div class="desk-kinds" id="kinds" role="group" aria-label="Feed">
           <button type="button" class="btn btn--ghost btn--sm is-active" data-kind="" aria-pressed="true">Corrections</button>
           <button type="button" class="btn btn--ghost btn--sm" data-kind="open" aria-pressed="false">Open items</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-kind="work" aria-pressed="false">Work</button>
         </div>
         <div class="desk-filters" id="filters" role="group" aria-label="Filter by status">
-          <button type="button" class="btn btn--ghost btn--sm is-active" data-filter="new">New</button>
-          <button type="button" class="btn btn--ghost btn--sm" data-filter="triaged">Triaged</button>
-          <button type="button" class="btn btn--ghost btn--sm" data-filter="accepted">Accepted</button>
-          <button type="button" class="btn btn--ghost btn--sm" data-filter="fixed">Fixed</button>
-          <button type="button" class="btn btn--ghost btn--sm" data-filter="spam">Spam</button>
-          <button type="button" class="btn btn--ghost btn--sm" data-filter="all">All</button>
+          <button type="button" class="btn btn--ghost btn--sm is-active" data-filter="new" aria-pressed="true">New</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="triaged" aria-pressed="false">Triaged</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="accepted" aria-pressed="false">Accepted</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="fixed" aria-pressed="false">Fixed</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="spam" aria-pressed="false">Spam</button>
+          <button type="button" class="btn btn--ghost btn--sm" data-filter="all" aria-pressed="false">All</button>
+        </div>
+        <!-- Work state is a second axis, not a status, so the work view has its own
+             filters. The counts come from the list call's one aggregate. -->
+        <div class="desk-filters" id="workFilters" role="group" aria-label="Filter by work state" hidden>
+          <button type="button" class="btn btn--ghost btn--sm is-active" data-work-filter="active" aria-pressed="true">All active<span class="desk-chip-count" data-count="active"></span></button>
+          <button type="button" class="btn btn--ghost btn--sm" data-work-filter="review" aria-pressed="false">Needs review<span class="desk-chip-count" data-count="review"></span></button>
+          <button type="button" class="btn btn--ghost btn--sm" data-work-filter="approved" aria-pressed="false">Waiting<span class="desk-chip-count" data-count="approved"></span></button>
+          <button type="button" class="btn btn--ghost btn--sm" data-work-filter="claimed" aria-pressed="false">Running<span class="desk-chip-count" data-count="claimed"></span></button>
+          <button type="button" class="btn btn--ghost btn--sm" data-work-filter="accepted" aria-pressed="false">To land<span class="desk-chip-count" data-count="accepted"></span></button>
+          <button type="button" class="btn btn--ghost btn--sm" data-work-filter="done" aria-pressed="false">Done<span class="desk-chip-count" data-count="done"></span></button>
         </div>
         <span class="desk-count muted" id="count"></span>
       </div>
@@ -105,12 +116,24 @@
         the entry the board leads with.
       </p>
 
+      <p class="desk-hint muted" id="workHint" hidden>
+        Items you handed to an agent. A runner on the Mac claims the oldest
+        approval, works it where the code is, and hands the result back here.
+        Nothing it does is public, and a fix lands only after you accept it.
+      </p>
+
+      <div id="workNew" hidden></div>
+
       <p class="log__state" id="loading" hidden>Loading…</p>
 
       <div class="report-error" id="error" role="alert" hidden>
         <p class="report-error__message" id="errorMessage"></p>
         <p class="report-error__hint" id="errorHint"></p>
       </div>
+
+      <!-- What the last move did. A move rebuilds the list, so without this line a card that
+           left the current filter would simply vanish, and a screen reader would hear nothing. -->
+      <p class="desk-status muted" id="status" role="status" aria-live="polite"></p>
 
       <p class="log__state" id="empty" hidden>Nothing in this queue.</p>
 

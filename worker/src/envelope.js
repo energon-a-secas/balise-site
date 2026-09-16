@@ -138,8 +138,11 @@ export function ok(provider, body, { origin = null, env = null, headers = {} } =
  *
  * `cors: false` is the FORBIDDEN_ORIGIN path and only that path. Everywhere else the
  * headers are computed from the origin, which for a denied origin is already {}.
+ *
+ * `headers` exists for the two public board reads (A8), whose errors must be as readable
+ * from another origin as their answers, or a failure there looks like a network fault.
  */
-export function fail(code, { provider = '', message, hint = '', origin = null, env = null, cors = true } = {}) {
-  const headers = { 'Cache-Control': 'no-store', ...(cors ? corsHeaders(origin, env) : {}) };
-  return json({ ok: false, code, provider, message, hint }, HTTP_FOR[code] || 502, headers);
+export function fail(code, { provider = '', message, hint = '', origin = null, env = null, cors = true, headers = {} } = {}) {
+  const merged = { 'Cache-Control': 'no-store', ...headers, ...(cors ? corsHeaders(origin, env) : {}) };
+  return json({ ok: false, code, provider, message, hint }, HTTP_FOR[code] || 502, merged);
 }

@@ -59,9 +59,9 @@ after(async () => {
 });
 
 test('the migration file IS the schema file, so the two cannot drift', () => {
-  // schema.sql stays as the readable shape of the store and migrations/0001 is what is
-  // applied. They are the same bytes, and this is the only thing that would notice one
-  // of them being edited alone.
+  // schema.sql is the baseline alone and the migrations are the store's shape: 0001 is
+  // schema.sql, and 0002 and 0003 add to it. The two files are the same bytes, and this is
+  // the only thing that would notice one of them being edited alone.
   const schema = readFileSync(join(WORKER_DIR, 'schema.sql'), 'utf8');
   const baseline = readFileSync(join(WORKER_DIR, 'migrations/0001_baseline.sql'), 'utf8');
   assert.equal(baseline, schema, 'migrations/0001_baseline.sql has drifted from schema.sql');
@@ -148,12 +148,17 @@ test('the import routes are behind the token, like the desk', async () => {
   const bare = await call('/open-items', { method: 'POST', body: { v: 1, source: 'queue', items: [{ ref: 'a', text: 'b' }] }, ip: '192.0.2.32' });
   assert.equal(bare.res.status, 401);
   assert.equal(bare.body.code, 'UNAUTHORIZED');
+  // No token, so the 401 comes before the body is read. With a token, an empty refs list is
+  // refused MISSING_PARAM (tests/api.test.mjs), because it would close the whole source.
   const sync = await call('/open-items/sync', { method: 'POST', body: { source: 'queue', refs: [] }, ip: '192.0.2.32' });
   assert.equal(sync.res.status, 401);
 });
 
 test('sync closes what the importer no longer sees, and only that', async () => {
   const before = await openList();
+  // The list names the seed's closed lines too, as the importer's does with its ## Done lines.
+  // A sync clears no mark, so #908 is still closed for the resolution test below; only an
+  // import that sends a ref with no closed_at clears one.
   const kept = before.reports.filter((r) => r.source_ref !== '#901').map((r) => r.source_ref);
   const { res, body } = await call('/open-items/sync', { method: 'POST', body: { source: 'queue', refs: kept }, token: AI_TOKEN });
   assert.equal(res.status, 200, JSON.stringify(body));
@@ -284,7 +289,9 @@ test('the board shows what a person published, resolved first, and nothing else'
   for (const entry of [...body.resolved, ...body.open]) {
     assert.deepEqual(Object.keys(entry).sort(), ['date', 'state', 'text']);
     assert.match(entry.date, /^\d{4}-\d{2}-\d{2}$/);
-    assert.ok(['open', 'resolved'].includes(entry.state));
+    // in_progress arrived with the work queue; nothing in this suite is being worked on,
+    // and tests/work.test.mjs is where an entry actually takes that state.
+    assert.ok(['open', 'in_progress', 'resolved'].includes(entry.state));
   }
 });
 

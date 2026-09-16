@@ -1,7 +1,8 @@
-// The corrections half of the store, and one of only TWO files in this Worker that
-// contain SQL. The other is src/store-open.js, which owns the open-items feed (queue
-// #58) and nothing else. If you are about to write a query somewhere else, put it in one
-// of these two instead: two files means two places to audit what touches the store. The
+// The corrections half of the store, and one of the four files in this Worker that
+// contain SQL. The others are src/store-open.js, which owns the open-items feed (queue
+// #58), and src/store-work.js with src/store-work-runner.js, which own the work queue. If
+// you are about to write a query somewhere else, put it in one of these instead: a short
+// list of files is a short list of places to audit what touches the store. The
 // C4 tables themselves are pure and live in src/transitions.js; this file is where they
 // are enforced.
 //
@@ -20,6 +21,7 @@
 // asserting it are the only things that would catch a scan before production.
 
 import { redactionFindings } from './redact.js';
+import { ACTIVE_STATES, CLOSED_STATUSES } from './work.js';
 
 // ── C4: the status vocabulary and the transition tables ───────────────────────
 //
@@ -92,6 +94,8 @@ export const storeError = (where, err) => {
   };
 };
 
+const refuse = (code, message, hint) => ({ code, message, hint });
+
 // ── Ingest ────────────────────────────────────────────────────────────────────
 
 /**
@@ -137,7 +141,8 @@ const DESK_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_
                       kind, body, contact, status, public, public_note, duplicate_of,
                       ai_verdict, ai_confidence, ai_notes, ai_at,
                       decided_at, fixed_at, fixed_ref,
-                      source, source_ref, suggested, opened_at, source_closed_at`;
+                      source, source_ref, suggested, opened_at, source_closed_at,
+                      work_state, work_mode, work_attempts, work_updated_at, filed_by`;
 
 /**
  * The private queue. ONE query returning many rows, never a query per row.
@@ -193,9 +198,13 @@ export async function getReport(db, id) {
   }
 }
 
+// The work queue check below, repeated in the write of a closing move: an approval landing
+// between the read and the UPDATE leaves the row queued, so the write matches nothing.
+const OUT_OF_QUEUE = "AND (work_state IS NULL OR work_state NOT IN ('approved', 'claimed', 'review', 'accepted'))";
+
 /**
- * One status change, C4 enforced. Two queries: read the current status, then a guarded
- * UPDATE.
+ * One status change, C4 enforced. Two queries: read the current status and work state,
+ * then a guarded UPDATE.
  *
  * The UPDATE carries `AND status = ?` on purpose. Between the read and the write another
  * operator could have moved the report, and without that guard the second writer would
@@ -205,16 +214,12 @@ export async function getReport(db, id) {
 export async function applyTransition(db, { id, actor, patch, now }) {
   let current;
   try {
-    current = await db.prepare('SELECT id, status, kind FROM reports WHERE id = ?').bind(id).first();
+    current = await db.prepare('SELECT id, status, kind, work_state FROM reports WHERE id = ?').bind(id).first();
   } catch (err) {
     return storeError('transition read', err);
   }
   if (!current) {
-    return {
-      code: 'NOT_FOUND',
-      message: 'There is no report with that id.',
-      hint: 'Reload the queue: it may have been merged into another report already.',
-    };
+    return refuse('NOT_FOUND', 'There is no report with that id.', 'Reload the queue: it may have been merged into another report already.');
   }
 
   const from = STATUSES.includes(current.status) ? current.status : 'new';
@@ -231,24 +236,34 @@ export async function applyTransition(db, { id, actor, patch, now }) {
     };
   }
 
+  // Closing an item an agent still holds would leave a runner working, shipping or landing
+  // something already closed. Publishing as open closes nothing, so it stays allowed.
+  const closing = CLOSED_STATUSES.includes(to);
+  if (closing && ACTIVE_STATES.includes(current.work_state)) {
+    return refuse('BAD_TRANSITION', `That item is in the work queue at "${current.work_state}", so it cannot move to "${to}" yet.`, 'Withdraw it from the work queue first, or let the result finish and close it then.');
+  }
+
+  // Automation writes a verdict and closes junk. What a reader sees, and whether a reader
+  // sees it at all, stays with a person on every edge, whatever is steering the token.
+  const reserved = actor === 'ai' ? ['public', 'public_note', 'fixed_ref'].filter((field) => patch[field] !== undefined) : [];
+  if (reserved.length) {
+    return refuse(
+      'BAD_FIELD',
+      `The automation token cannot set ${reserved.join(' or ')}.`,
+      'Send the status with the ai_ fields, and duplicate_of for a duplicate. What a reader sees is set at the desk.',
+    );
+  }
+
   // Two required fields, refused here rather than left to the reader of the public log.
   if (to === 'fixed' && !(patch.public_note || '').trim()) {
-    return {
-      code: 'BAD_FIELD',
-      message: 'A report cannot be marked fixed without a public note.',
-      hint: 'Write one sentence for the public log, in your own words, then mark it fixed.',
-    };
+    return refuse('BAD_FIELD', 'A report cannot be marked fixed without a public note.', 'Write one sentence for the public log, in your own words, then mark it fixed.');
   }
 
   // An open item published as OPEN carries the same requirement, for the same reason:
   // `accepted` is what puts it on the board, and an entry with no sentence is a blank
   // line telling a reader nothing.
   if (isOpenItem && to === 'accepted' && !(patch.public_note || '').trim()) {
-    return {
-      code: 'BAD_FIELD',
-      message: 'An open item cannot be published without a sentence.',
-      hint: 'Say what is being worked on, in your own words. One line is the whole entry.',
-    };
+    return refuse('BAD_FIELD', 'An open item cannot be published without a sentence.', 'Say what is being worked on, in your own words. One line is the whole entry.');
   }
 
   // THE REDACTION FLOOR, server side. The desk runs the same rules live under the field,
@@ -267,11 +282,7 @@ export async function applyTransition(db, { id, actor, patch, now }) {
     }
   }
   if (to === 'duplicate' && !(patch.duplicate_of || '').trim()) {
-    return {
-      code: 'BAD_FIELD',
-      message: 'A report cannot be marked duplicate without naming the report it repeats.',
-      hint: 'Copy the id of the original into duplicate_of, or reject it instead.',
-    };
+    return refuse('BAD_FIELD', 'A report cannot be marked duplicate without naming the report it repeats.', 'Copy the id of the original into duplicate_of, or reject it instead.');
   }
 
   const decided = to === 'triaged' ? null : now;
@@ -293,7 +304,7 @@ export async function applyTransition(db, { id, actor, patch, now }) {
            ai_at         = COALESCE(?, ai_at),
            decided_at    = COALESCE(?, decided_at),
            fixed_at      = COALESCE(?, fixed_at)
-         WHERE id = ? AND status = ?`,
+         WHERE id = ? AND status = ? ${closing ? OUT_OF_QUEUE : ''}`,
       )
       .bind(
         to,
@@ -312,11 +323,7 @@ export async function applyTransition(db, { id, actor, patch, now }) {
       )
       .run();
     if (!res.meta || res.meta.changes === 0) {
-      return {
-        code: 'BAD_TRANSITION',
-        message: 'That report moved while this change was in flight.',
-        hint: 'Reload the queue and look at where it is now before deciding again.',
-      };
+      return refuse('BAD_TRANSITION', 'That report moved while this change was in flight.', 'Reload the queue and look at where it is now before deciding again.');
     }
   } catch (err) {
     return storeError('transition write', err);
@@ -420,7 +427,9 @@ export async function checkLock(db, key, now) {
   }
 }
 
-/** Recorded AFTER the comparison. Success clears the counter; failure advances it. */
+/** Recorded AFTER the comparison. Success clears the counter; failure advances it. A failure
+ *  once a lock has run out starts again at one, so an expired lock costs five more tries:
+ *  counting on from five, a stale credential on a schedule relocked the address every run. */
 export async function recordAuthResult(db, key, success, now) {
   try {
     if (success) {
@@ -432,11 +441,13 @@ export async function recordAuthResult(db, key, success, now) {
         `INSERT INTO auth_attempts (key, failures, locked_until, updated_at)
          VALUES (?, 1, 0, ?)
          ON CONFLICT(key) DO UPDATE SET
-           failures     = auth_attempts.failures + 1,
-           locked_until = CASE WHEN auth_attempts.failures + 1 >= ? THEN ? ELSE auth_attempts.locked_until END,
+           failures     = CASE WHEN auth_attempts.locked_until > 0 AND auth_attempts.locked_until <= ? THEN 1
+                               ELSE auth_attempts.failures + 1 END,
+           locked_until = CASE WHEN auth_attempts.locked_until > 0 AND auth_attempts.locked_until <= ? THEN 0
+                               WHEN auth_attempts.failures + 1 >= ? THEN ? ELSE auth_attempts.locked_until END,
            updated_at   = ?`,
       )
-      .bind(key, now, LOCKOUT_MAX_FAILURES, now + LOCKOUT_MS, now)
+      .bind(key, now, now, now, LOCKOUT_MAX_FAILURES, now + LOCKOUT_MS, now)
       .run();
   } catch (err) {
     console.error('d1 lock write failed:', err);
@@ -470,14 +481,20 @@ function toReport(row) {
     decided_at: row.decided_at || null,
     fixed_at: row.fixed_at || null,
     fixed_ref: row.fixed_ref || '',
-    // The open-item half. All five are null or empty on a correction, which is what makes
+    // The open-item half. All six are null or empty on a correction, which is what makes
     // this one queue with two feeds rather than two queues. `source_ref` and `body` are
     // the private halves: the desk shows them to the operator and no public query selects
-    // either one.
+    // either one. `filed_by` is set only on an item filed through POST /work/items.
     source: row.source || null,
     source_ref: row.source_ref || null,
     suggested: row.suggested || '',
     opened_at: row.opened_at || null,
     source_closed_at: row.source_closed_at || null,
+    filed_by: row.filed_by === 'human' || row.filed_by === 'ai' ? row.filed_by : null,
+    // Whether an agent has this item, so a desk card can say so instead of offering to hand
+    // it over twice. The run itself is GET /work's business; this is only the badge.
+    work: row.work_state
+      ? { state: row.work_state, mode: row.work_mode || null, attempts: row.work_attempts || 0, updated_at: row.work_updated_at || null }
+      : null,
   };
 }

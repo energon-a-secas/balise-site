@@ -26,9 +26,9 @@ compatibility_date = "2026-08-01"
 BALISE_ALLOWED_ORIGINS = "https://balise.neorgon.com,http://localhost:8876,http://127.0.0.1:8876"
 
 # ── D1 ────────────────────────────────────────────────────────────────────────
-# database_id is a placeholder on purpose. This campaign is local only: no database has
-# been created on the account and `wrangler d1 create` has not been run. The release
-# runbook fills the real id in at deploy time.
+# database_id is the real production database, bound since the first deploy (e9e7f76).
+# An id is not a secret: it names the database, and wrangler's own login decides who can
+# reach it. This comment used to call it a placeholder, which was true before that deploy.
 #
 # A bare `wrangler d1 ...` command is one keystroke from writing to production, because
 # the command reference documents --local and --remote and marks NEITHER as the default

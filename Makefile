@@ -40,10 +40,11 @@ help:
 # Local state lands in worker/.wrangler/state/v3/d1/, which is gitignored: after any
 # exercise it holds real report text.
 
-# migrations/0001_baseline.sql IS schema.sql, byte for byte, and the local D1 test asserts
-# it. schema.sql stays as the readable shape of the store; the migrations directory is what
-# is actually applied, because ALTER TABLE cannot be expressed as a CREATE TABLE IF NOT
-# EXISTS and a second run of the schema file would silently skip every later change.
+# migrations/0001_baseline.sql IS schema.sql, byte for byte, and tests/open-items.test.mjs
+# asserts it. So schema.sql is the baseline alone and none of what came after: the migrations
+# are the store's shape, and they are what is applied, because ALTER TABLE cannot be expressed
+# as a CREATE TABLE IF NOT EXISTS and a second run of the schema file would silently skip
+# every later change.
 .PHONY: d1-migrate
 d1-migrate:
 	@$(WRANGLER) d1 migrations apply balise --local
@@ -60,15 +61,17 @@ d1-query:
 
 .PHONY: d1-reset
 d1-reset:
-	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters; DROP TABLE IF EXISTS d1_migrations;"
+	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS work_runs; DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters; DROP TABLE IF EXISTS d1_migrations;"
 	@$(MAKE) d1-migrate
 
 # ── Worker ────────────────────────────────────────────────────────────────────
 # The secrets are passed as --var and never written to a file. With no
 # BALISE_OPERATOR_TOKEN in the environment one is generated for this run and printed,
 # so a local desk session needs no file and leaves nothing behind. The AUTOMATION token
-# is minted the same way: it is the credential the open-items importer is meant to hold,
-# and it cannot publish anything, so printing it here costs nothing.
+# is minted and printed the same way, for the importer and the runner to hold. Printing
+# either is fine only because it is this local Worker's token, made for this run. The
+# automation token is not harmless in itself (it reads every report and can plant drafts,
+# as worker/src/routes-open.js lists), so never run this with a production token exported.
 #
 # BALISE_TURNSTILE_SECRET is deliberately left unset by default: with no secret, /report
 # answers 501 NOT_CONFIGURED before it fetches anything, which is the path local work can

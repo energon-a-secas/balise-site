@@ -11,6 +11,9 @@
 // So the machine's job stops at "here is something worth saying", and the saying is a
 // person's.
 //
+// Cannot publish is not the same as harmless: the automation token it holds also reads every
+// report and can plant a draft the desk trusts like an import (worker/src/routes-open.js).
+//
 // Run it from anywhere; it reads the monorepo, not the working directory:
 //
 //   export BALISE_IMPORT_TOKEN=...            # the AUTOMATION token, printed by make worker-dev
@@ -46,8 +49,16 @@ const BODY_BUDGET = 7000;
 const TEXT_MAX = 2000;
 /** How long a suggested direction may be before it stops being one sentence. */
 const SUGGESTION_MAX = 240;
+/** Open runs asked of run.py in one read. Far more than a ledger holds open; a read that
+ *  comes back this full may have been cut short, and is refused rather than synced. */
+const HARNESS_LIST_LIMIT = 1000;
+/** The task a runner gives its own harness record (.claude/commands/work.md). */
+const RUNNER_TASK_RE = /^balise-work [0-9a-f]{8}: /;
 
 const SOURCES = ['queue', 'brief', 'harness', 'registry'];
+
+/** Every flag this script knows, so a value that is one of them reads as a forgotten value. */
+const FLAGS = new Set(['--api', '--source', '--root', '--dry-run', '--help', '-h']);
 
 // ── Arguments ─────────────────────────────────────────────────────────────────
 
@@ -56,9 +67,9 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--dry-run') opts.dryRun = true;
-    else if (arg === '--api') opts.api = argv[++i];
-    else if (arg === '--source') opts.source = argv[++i];
-    else if (arg === '--root') opts.root = argv[++i];
+    else if (arg === '--api') opts.api = flagValue(argv, ++i, arg);
+    else if (arg === '--source') opts.source = flagValue(argv, ++i, arg);
+    else if (arg === '--root') opts.root = flagValue(argv, ++i, arg);
     else if (arg === '--help' || arg === '-h') opts.help = true;
     else die(`Unknown argument: ${arg}. Run with --help.`);
   }
@@ -67,6 +78,15 @@ function parseArgs(argv) {
   }
   if (!opts.api || !/^https?:\/\//.test(opts.api)) die(`--api needs a full URL, got ${JSON.stringify(opts.api)}.`);
   return opts;
+}
+
+/** The value after a flag, or a usage error. A trailing --source read as a source named undefined,
+ *  a trailing --root failed every tracker in path.join, and a blank one read the working directory. */
+function flagValue(argv, i, flag) {
+  const value = argv[i];
+  if (value === undefined || !value.trim()) die(`${flag} needs a value.`);
+  if (FLAGS.has(value)) die(`${flag} needs a value, and the next argument is the flag ${value}.`);
+  return value;
 }
 
 const die = (message) => {
@@ -130,7 +150,7 @@ const item = (ref, text, { opened_at = null, closed_at = null, suggested } = {})
  *
  * A `## Done` line carries `opened -> closed`, and closing an item is the entry this
  * board exists to show, so those are imported too and arrive already carrying the date
- * they closed on.
+ * they closed on, or on the import's own time when that date does not parse.
  */
 function readQueue(root) {
   const path = join(root, 'docs', 'prompt-queue.md');
@@ -149,7 +169,7 @@ function readQueue(root) {
     const isDone = section === 'done';
     items.push(item(ref, text.trim(), {
       opened_at: dayMs(opened),
-      closed_at: isDone ? dayMs(closed || opened) : null,
+      closed_at: isDone ? (dayMs(closed || opened) ?? Date.now()) : null,
     }));
   }
   return items;
@@ -236,6 +256,11 @@ function bulletsIn(block) {
  * from the ref list, and POST /open-items/sync closes it: that is what the sync route is
  * for, and it means this parser never has to reason about which terminal states count.
  *
+ * That reading is only true of a COMPLETE list. run.py lists the newest 20 runs of any
+ * status unless told otherwise, so an open run with twenty newer runs above it went missing,
+ * and a sync carrying the newer open runs closed its draft for good. So the status is asked
+ * of run.py, and a read that reaches the limit is refused whole.
+ *
  * There are zero open runs on this machine today, so this path is exercised by a fixture
  * in the worker tests rather than by the real ledger.
  */
@@ -244,7 +269,8 @@ function readHarness(root) {
   if (!existsSync(script)) throw new Error(`no harness at ${script}`);
   let out;
   try {
-    out = execFileSync('python3', [script, 'list'], { cwd: root, encoding: 'utf8', timeout: 60_000 });
+    const args = [script, 'list', '--status', 'open', '--limit', String(HARNESS_LIST_LIMIT)];
+    out = execFileSync('python3', args, { cwd: root, encoding: 'utf8', timeout: 60_000 });
   } catch (err) {
     throw new Error(`the harness ledger did not answer: ${err.message}`);
   }
@@ -257,8 +283,16 @@ function readHarness(root) {
   if (!envelope || envelope.ok !== true || !Array.isArray(envelope.runs)) {
     throw new Error('the harness ledger answered with something this script could not read');
   }
+  if (envelope.runs.length >= HARNESS_LIST_LIMIT) {
+    throw new Error(`the harness ledger returned ${envelope.runs.length} open runs, the most one read asks for, so the list may be cut short`);
+  }
   return envelope.runs
     .filter((run) => run.status === 'open')
+    // A runner working a Balise item opens its own harness record in this shape. Importing
+    // it would put the work back into the queue as a fresh draft of itself, so those runs
+    // belong to the work queue and are left there. The whole shape, not the prefix, so a
+    // person's own "balise-worker ..." task is still imported.
+    .filter((run) => !RUNNER_TASK_RE.test(String(run.task || '')))
     .map((run) => item(String(run.id), String(run.task || run.id), {
       opened_at: run.started_at ? Date.parse(`${run.started_at}Z`) || null : null,
     }));
@@ -358,7 +392,7 @@ async function main() {
   }
 
   const wanted = opts.source === 'all' ? SOURCES : [opts.source];
-  const totals = { created: 0, unchanged: 0, closed: 0 };
+  const totals = { created: 0, unchanged: 0, closed: 0, reopened: 0 };
   const suggestions = [];
   let failed = 0;
 
@@ -393,7 +427,7 @@ async function main() {
 
     let sent = 0;
     let bad = false;
-    const counts = { created: 0, unchanged: 0, closed: 0 };
+    const counts = { created: 0, unchanged: 0, closed: 0, reopened: 0 };
     for (const group of groups) {
       const answer = await post(opts.api, '/open-items', token, { v: 1, source, items: group });
       if (!answer || answer.ok !== true) {
@@ -405,6 +439,8 @@ async function main() {
       counts.created += answer.created;
       counts.unchanged += answer.unchanged;
       counts.closed += answer.closed;
+      // Close marks this batch cleared, on rows the tracker lists as open again; older Workers omit it.
+      counts.reopened += answer.reopened || 0;
       sent += group.length;
     }
 
@@ -416,7 +452,8 @@ async function main() {
 
     // Sync is a decision made from an ABSENCE: everything of this source that is not in
     // the ref list is marked as having left its tracker. A partial list would therefore
-    // close items that are still open, so it is all of them or none of them.
+    // close items that are still open, so it is all of them or none of them. It never clears
+    // a mark, so a close made in error heals in a later run's batches and not here.
     const refs = items.map((entry) => entry.ref);
     const refBytes = Buffer.byteLength(JSON.stringify({ source, refs }), 'utf8');
     if (refBytes > BODY_BUDGET) {
@@ -432,14 +469,15 @@ async function main() {
       }
     }
 
-    console.log(`  ${source}: ${counts.created} created / ${counts.unchanged} unchanged / ${counts.closed} closed  (${items.length} read)`);
+    console.log(`  ${source}: ${counts.created} created / ${counts.unchanged} unchanged / ${counts.closed} closed / ${counts.reopened} reopened  (${items.length} read)`);
     totals.created += counts.created;
     totals.unchanged += counts.unchanged;
     totals.closed += counts.closed;
+    totals.reopened += counts.reopened;
   }
 
   if (!opts.dryRun) {
-    console.log(`\n  total: ${totals.created} created / ${totals.unchanged} unchanged / ${totals.closed} closed`);
+    console.log(`\n  total: ${totals.created} created / ${totals.unchanged} unchanged / ${totals.closed} closed / ${totals.reopened} reopened`);
   }
 
   // Three suggestions, so whoever ran this can see what kind of sentence arrived without
