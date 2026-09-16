@@ -346,6 +346,12 @@ export async function applyTransition(db, { id, actor, patch, now }) {
  * board entry and not a correction: it names no site, no page and no reporter, so it
  * would land in the corrections log as a line about nothing. The term is written the same
  * way in migrations/0002_open_items.sql, which is what lets its partial index serve this.
+ *
+ * `url` is TRIMMED on the way out, by `publicUrl` below, for the same reason `body` is
+ * absent: a page address the reporter was looking at is not neutral. /log is the only
+ * cacheable, crawler-visible route this service has, and the Beacon sends `location.href`,
+ * so the query string arrives whole. The stored column stays whole too, because the desk
+ * needs it to reproduce the report. Only this projection is cut.
  */
 export async function publicLog(db, { before, limit }) {
   const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;
@@ -361,12 +367,42 @@ export async function publicLog(db, { before, limit }) {
       .run();
     const rows = res.results || [];
     return {
-      entries: rows,
+      entries: rows.map((row) => ({ ...row, url: publicUrl(row.url) })),
       rowsRead: res.meta ? res.meta.rows_read : null,
       next: rows.length === limit ? rows[rows.length - 1].fixed_at : null,
     };
   } catch (err) {
     return storeError('log', err);
+  }
+}
+
+/**
+ * A stored page address as the public log may show it: origin plus pathname, and nothing
+ * else. The key keeps the name `url`: the /log response shape is a frozen contract, and
+ * the suite asserts its exact key set. This changes the value, never the envelope.
+ *
+ * What this drops, and why each one is not a hypothetical:
+ *
+ *   - the QUERY. A report filed from a Vitrina public shelf carries the owner's handle
+ *     there, which privacy/index.html promises is kept out of any directory, and one filed
+ *     from a Sash claim page carries a live bearer token until it expires.
+ *   - the FRAGMENT. Purely client state, and the one place a page puts a value it never
+ *     meant to send anywhere.
+ *   - the USERINFO prefix. `new URL().origin` drops it, which is the reason the trim goes
+ *     through the parser rather than through a regex over the string.
+ *
+ * Anything that does not parse, or is not http(s), becomes `null` rather than being passed
+ * through: a `javascript:` or `data:` address reaching a public page as a rendered link is
+ * a worse outcome than a log entry with no address on it.
+ */
+function publicUrl(url) {
+  if (typeof url !== 'string' || url === '') return null;
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
+    return parsed.origin + parsed.pathname;
+  } catch {
+    return null;
   }
 }
 

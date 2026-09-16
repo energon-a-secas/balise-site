@@ -1,9 +1,10 @@
 // The offline half of the Balise Worker's tests. No network, no database, no workerd.
 //
-// Three jobs:
+// Four jobs:
 //   1. C2.1's drift test: the Worker's ERROR_CODES must equal the site's HANDLED_CODES.
 //   2. C1's field rules, over src/validate.js.
 //   3. C4's transition table, over src/store.js, including the AI's single edge.
+//   4. What the public log projects, over src/store.js. Pure enough for a stub db.
 //
 // The flows that need a real D1 (rows_read, the lockout, ingest end to end) are in
 // tests/local-d1.test.mjs, which runs the Worker under workerd. They are separate on
@@ -20,7 +21,7 @@ import {
 } from '../src/validate.js';
 import {
   STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition, rowsReadBudget,
-  normaliseForFingerprint,
+  normaliseForFingerprint, publicLog,
 } from '../src/store.js';
 import { OPEN_SOURCES, IMPORT_BATCH_MAX, SYNC_REFS_MAX, openFingerprintInput, dayStamp } from '../src/store-open.js';
 
@@ -400,4 +401,72 @@ test('the open-item fingerprint separates its three parts', () => {
 test('the board shows a day and never a time', () => {
   assert.equal(dayStamp(Date.UTC(2026, 8, 9, 23, 59)), '2026-09-09');
   for (const bad of [null, undefined, 0, -1, NaN, 'yesterday']) assert.equal(dayStamp(bad), null);
+});
+
+// ── The public projection of a report's url ───────────────────────────────────
+
+/**
+ * GET /log is the only public, cacheable, crawler-visible route this service has, and it
+ * carries the url of every fixed report. A url is not neutral. The Beacon sends
+ * `location.href`, so a report filed from a Vitrina public shelf carries the owner's handle
+ * in the query, and one filed from a Sash claim page carries a WORKING bearer token there.
+ *
+ * Trimming to origin plus pathname keeps what the log is for (which page was wrong) and
+ * drops what it was never for (who was looking at it, and with what). The STORED column
+ * keeps the whole address: the operator needs it to reproduce the report, and that is the
+ * job of the desk routes, not of this one.
+ */
+
+/** The smallest thing `publicLog` can read: one prepare, one bind, one run. */
+function logStub(urls) {
+  const results = urls.map((url, i) => ({
+    site: 'vitrina-site',
+    url,
+    target_label: null,
+    public_note: 'Corrected that entry.',
+    fixed_ref: null,
+    fixed_at: 2_000 - i,
+  }));
+  const run = async () => ({ results, meta: { rows_read: results.length } });
+  return { prepare: () => ({ bind: () => ({ run }) }) };
+}
+
+async function loggedUrls(urls) {
+  const { entries } = await publicLog(logStub(urls), { before: null, limit: urls.length });
+  return entries.map((e) => e.url);
+}
+
+test('#76: the public log publishes the page, never the query that identifies the reader', async () => {
+  assert.deepEqual(
+    await loggedUrls([
+      'https://vitrina.neorgon.com/u/?owner=a-real-handle',
+      'https://sash.neorgon.com/claim.html?t=eyJhbGciOiJIUzI1NiJ9.made-up.token',
+    ]),
+    ['https://vitrina.neorgon.com/u/', 'https://sash.neorgon.com/claim.html'],
+  );
+});
+
+test('#76: a fragment and a userinfo prefix are dropped too', async () => {
+  assert.deepEqual(
+    await loggedUrls([
+      'https://parla.neorgon.com/glossary#deep/state',
+      'https://reader:hunter2@vitrina.neorgon.com/shelf/12',
+    ]),
+    ['https://parla.neorgon.com/glossary', 'https://vitrina.neorgon.com/shelf/12'],
+  );
+});
+
+test('#76: anything that is not an http address becomes null rather than reaching the page', async () => {
+  assert.deepEqual(
+    await loggedUrls(['not a url at all', 'javascript:alert(1)', 'data:text/html,<b>x', '', null]),
+    [null, null, null, null, null],
+  );
+});
+
+test('#76: the key is still called url, because the /log response shape is frozen', async () => {
+  const { entries } = await publicLog(logStub(['https://vitrina.neorgon.com/u/?owner=x']), { before: null, limit: 1 });
+  assert.deepEqual(
+    Object.keys(entries[0]).sort(),
+    ['fixed_at', 'fixed_ref', 'public_note', 'site', 'target_label', 'url'],
+  );
 });

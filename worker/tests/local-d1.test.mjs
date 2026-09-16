@@ -306,6 +306,48 @@ test('C4: a report cleared of public never reaches the log', async () => {
   assert.ok(!body.entries.some((e) => e.public_note === 'Held back deliberately.'), 'a non public report reached the log');
 });
 
+/**
+ * #76 end to end. The Beacon sends `location.href`, so a report filed from a Vitrina
+ * public shelf arrives carrying the owner's handle in the query. The desk needs that
+ * address whole to reproduce the report; the public log needs the page and nothing else.
+ * Both halves are asserted here because the two projections read the same stored column,
+ * and trimming the column instead of the projection would pass one and break the other.
+ */
+test('#76: the log carries the page, and the desk keeps the whole address', async () => {
+  const full = 'https://vitrina.neorgon.com/u/?owner=a-real-handle#shelf-3';
+  const posted = await call('/report', {
+    method: 'POST',
+    ip: '198.51.100.90',
+    body: report(9001, {
+      site: 'vitrina-site',
+      url: full,
+      target: null,
+      body: 'The spine order on this shelf does not match the list printed under it.',
+    }),
+  });
+  assert.equal(posted.res.status, 200, JSON.stringify(posted.body));
+  const id = posted.body.id;
+
+  await call(`/reports/${id}`, { method: 'PATCH', body: { status: 'accepted' }, token: TOKEN, ip: '192.0.2.30' });
+  const fixed = await call(`/reports/${id}`, {
+    method: 'PATCH',
+    body: { status: 'fixed', public_note: 'Reordered the spines to match the list.' },
+    token: TOKEN,
+    ip: '192.0.2.30',
+  });
+  assert.equal(fixed.body.report.status, 'fixed', JSON.stringify(fixed.body));
+
+  const log = await call('/log?limit=50');
+  const entry = log.body.entries.find((e) => e.public_note === 'Reordered the spines to match the list.');
+  assert.ok(entry, 'the fixed report never reached the log');
+  assert.equal(entry.url, 'https://vitrina.neorgon.com/u/');
+
+  const desk = await call('/reports?status=fixed&limit=50', { token: TOKEN, ip: '192.0.2.30' });
+  const row = desk.body.reports.find((r) => r.id === id);
+  assert.ok(row, 'the fixed report is not on the desk');
+  assert.equal(row.url, full, 'the desk lost the address it needs to reproduce the report');
+});
+
 test('C4: an unknown status is refused before it reaches the store', async () => {
   const r = await firstNew();
   const { res, body } = await call(`/reports/${r.id}`, { method: 'PATCH', body: { status: 'done' }, token: TOKEN, ip: '192.0.2.14' });

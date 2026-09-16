@@ -147,6 +147,14 @@ visitor can actually see.
 visitor types `kind`, `body` and `contact` on this site, same origin, so their
 words and their contact address never enter a URL or a browser history.
 
+**The public log publishes a page, not an address.** The beacon sends
+`location.href`, so a report from a Vitrina public shelf arrives with the owner's
+handle in the query and one from a Sash claim page arrives with a live bearer
+token. `publicLog` cuts every address back to its origin and path, and anything
+that does not parse as http(s) becomes `null` rather than reaching a public page
+as a link. The stored column stays whole: the desk needs it to reproduce the
+report, and `DESK_COLUMNS` and the operator routes are untouched.
+
 **Nothing on any feed publishes itself.** The importer writes rows at status
 `new`, which is private. The automation credential is refused every transition
 on an open item, and any patch that sets `public`, `public_note` or `fixed_ref`.
