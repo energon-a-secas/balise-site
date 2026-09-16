@@ -211,6 +211,26 @@ before its first release to add `filed_by` and drop the unused index. Wrangler r
 applied migration by file name and never runs it twice, so a local database that applied the
 earlier 0003 has no `filed_by` column: `make d1-reset` rebuilds it.
 
+**A migration is frozen once the remote records it, not once anything has applied it.** While
+production has not applied a file, editing it in place is the right move: there is one
+statement of the shape, and a numbered patch on top of an unreleased file makes the store's
+history a puzzle for no benefit. The cost is local, and it falls on the one machine that
+already applied the older text, so the local database is what gets rebuilt. Once
+`scripts/release-work-queue.sh` has applied a file to `--remote`, that file is closed and any
+further change is a new numbered migration. So: no `0004` for `filed_by`, and `0004` for
+whatever comes after the release.
+
+**What made this expensive was not the edit, it was the silence.** `make d1-migrate` answered
+"No migrations to apply!" about a database with no `filed_by` column, and the operator met
+the difference days later as a 502 `STORE_ERROR` from every `GET /reports` (queue #82). So
+`d1-migrate` now ends with `make d1-check`, which compares the local database's tables and
+columns against the migrations applied to an in-memory SQLite, and names `make d1-reset` when
+they disagree. `tools/d1-drift.mjs` owns both halves and `worker/tests/d1-drift.test.mjs`
+trips it, including on exactly the `reports.filed_by` case. Tables and columns only: D1's
+authorizer refuses `pragma_index_list`, and every index here is `CREATE INDEX IF NOT EXISTS`,
+so re-applying a migration restores a missing index while a column added by an `ALTER` never
+comes back on its own.
+
 ## 5. Routes
 
 Every `/work` route: `Authorization: Bearer`, provider `desk`, `Cache-Control: no-store`, the

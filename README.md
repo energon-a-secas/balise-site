@@ -239,10 +239,18 @@ have happened: check the repository, then withdraw it.
 ```bash
 make serve         # the site        -> http://localhost:8876
 make worker-dev    # wrangler dev    -> http://127.0.0.1:8877
-make d1-migrate    # apply worker/migrations/*.sql to the LOCAL D1
+make d1-migrate    # apply worker/migrations/*.sql to the LOCAL D1, then check the shape
 make d1-schema     # the same thing, under the name the runbook uses
+make d1-check      # fail if the LOCAL D1 disagrees with worker/migrations
+make d1-reset      # drop the local tables and apply every migration again
 make worker-test   # node --test
 ```
+
+`d1-check` runs after every apply and exists because `d1-migrate` cannot catch its own worst
+case: wrangler records an applied migration by file name, so a migration edited after it was
+applied stays applied, and the column it gained never arrives. `make d1-reset` is the fix, and
+the check names it. Migrations may be edited in place until the release script applies them to
+`--remote`; after that they are frozen (`docs/DESIGN-WORK-QUEUE.md` section 4).
 
 Import the trackers into a local desk, from the monorepo root:
 

@@ -7,6 +7,10 @@ PORT        = 8876
 WORKER_PORT = 8877
 WORKER_DIR  = worker
 WRANGLER    = npx --prefix $(WORKER_DIR) wrangler --cwd $(WORKER_DIR)
+# node:sqlite is still flagged experimental and says so on every run. The drift check is
+# read by an operator deciding whether the local database is sound, so the one line that
+# matters is not worth burying under two of warning.
+DRIFT       = node --disable-warning=ExperimentalWarning tools/d1-drift.mjs
 
 # ── Help ──────────────────────────────────────────────────────────────────────
 .PHONY: help
@@ -23,6 +27,7 @@ help:
 	@echo "  make d1-migrate   Apply worker/migrations/*.sql to the LOCAL D1 database"
 	@echo "  make d1-schema    Same thing: 0001 IS schema.sql, byte for byte"
 	@echo "  make d1-query Q=  Run one read-only query against the LOCAL D1 database"
+	@echo "  make d1-check     Fail if the LOCAL D1 disagrees with worker/migrations"
 	@echo "  make d1-reset     Drop the local D1 tables and re-apply the schema"
 	@echo ""
 
@@ -48,11 +53,27 @@ help:
 .PHONY: d1-migrate
 d1-migrate:
 	@$(WRANGLER) d1 migrations apply balise --local
+	@$(MAKE) --no-print-directory d1-check
 
 # The name the README and the runbook already use. It runs the migrations, so an operator
 # who types the command they know does not end up with a database missing half its columns.
 .PHONY: d1-schema
 d1-schema: d1-migrate
+
+# The check `d1-migrate` cannot make for itself. Wrangler records an applied migration BY
+# FILE NAME and never runs it again, so a migration edited after it was applied stays
+# applied: the line above prints "No migrations to apply!" and the column the file gained is
+# still missing. On 2026-09-16 that column was reports.filed_by and the operator met it as a
+# 502 STORE_ERROR from every GET /reports (queue #82), which is why this runs after every
+# apply rather than on request.
+#
+# tools/d1-drift.mjs owns both halves: it prints the statement, and it reads the answer. The
+# D1 command stays here, with its explicit --local, because that is the rule this section
+# opens with.
+.PHONY: d1-check
+d1-check:
+	@Q="$$($(DRIFT) --query)" \
+	  && $(WRANGLER) d1 execute balise --local --json --command="$$Q" | $(DRIFT)
 
 .PHONY: d1-query
 d1-query:
