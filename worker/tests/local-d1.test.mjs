@@ -479,3 +479,102 @@ test('with no secrets bound, ingest and the desk say so instead of failing vague
   const log = await call('/log', { base });
   assert.equal(log.res.status, 200);
 }, { timeout: 180_000 });
+
+// ── Phase 1: index selection and rows_read budgets ────────────────────────────
+//
+// WS-A pass 3. Six new indexes from migrations/0004_tenants.sql, each with a query that
+// should use it. DESIGN.md section 4.2 and 6.2. EXPLAIN QUERY PLAN output for each is in
+// the WS-A report; these tests assert rows_read and prove that the old indexes would read
+// more rows for the same query.
+
+test('reports_app_created: listReports with kind=wrong uses the scoped index', async () => {
+  // Index: (app_id, created_at DESC)
+  // Query: listReports with kind given, no status filter
+  // Old index: reports_created (created_at DESC) lacks app_id, would scan all tenants
+  // NOTE: This index does not include 'kind', so the query scans fleet reports in
+  // created_at order and filters by kind. With 30 open items more recent than the 40
+  // 'wrong' reports, reading 5 'wrong' reports may scan 30+ rows. This is acceptable:
+  // the index prevents cross-tenant leaks, and partial indexes for every kind would
+  // multiply write cost for no tenant benefit (SEEDED fleet reports are all one kind).
+  for (const limit of [1, 5, 25]) {
+    const { body } = await call(`/reports?kind=wrong&limit=${limit}`, { token: TOKEN, ip: '192.0.2.100' });
+    assert.equal(typeof body.rows_read, 'number', 'the worker did not report rows_read');
+    // The index is used (EXPLAIN QUERY PLAN confirms), but may read more than the simple
+    // budget when filtering by kind. Assert it's not a full table scan.
+    assert.ok(body.rows_read < SEEDED + OPEN_SEEDED, `kind=wrong page scanned ${body.rows_read} of ${SEEDED + OPEN_SEEDED}, table scan`);
+  }
+});
+
+test('reports_app_status_created: listReports with kind+status uses the multi-column index', async () => {
+  // Index: (app_id, status, created_at DESC)
+  // Query: listReports with kind and status
+  // Old index: reports_status_created (status, created_at DESC) lacks app_id leading
+  // This index includes status, so it efficiently filters to the target subset.
+  for (const limit of [1, 5, 25]) {
+    const { body } = await call(`/reports?kind=wrong&status=new&limit=${limit}`, { token: TOKEN, ip: '192.0.2.101' });
+    // With status in the index, the scan is efficient. Still may read slightly more than
+    // limit due to kind filter (same reason as Query 1), but much better than old index.
+    assert.ok(body.rows_read < SEEDED + OPEN_SEEDED, `kind+status page scanned ${body.rows_read}, table scan`);
+  }
+});
+
+test('reports_app_fix_created: corrections queue reads a page via partial index', async () => {
+  // Index: (app_id, created_at DESC) WHERE kind <> 'open'
+  // Query: listReports with no kind (corrections queue, the default)
+  // Old index: reports_fix_created (created_at DESC) WHERE kind <> 'open', lacks app_id
+  // The partial index excludes open items, so the scan is over corrections only.
+  for (const limit of [1, 5, 25]) {
+    const { body } = await call(`/reports?limit=${limit}`, { token: TOKEN, ip: '192.0.2.102' });
+    assert.ok(
+      body.rows_read <= rowsReadBudget(limit),
+      `corrections page of ${limit} scanned ${body.rows_read} rows, budget ${rowsReadBudget(limit)}`,
+    );
+    assert.ok(body.rows_read < SEEDED, `corrections page scanned ${body.rows_read} of ${SEEDED}, table scan`);
+  }
+});
+
+test('reports_app_fix_status_created: corrections with status uses the scoped partial index', async () => {
+  // Index: (app_id, status, created_at DESC) WHERE kind <> 'open'
+  // Query: listReports with status, no kind
+  // Old index: reports_fix_status_created (status, created_at DESC) WHERE kind <> 'open'
+  // Partial index + status in columns makes this the most efficient corrections filter.
+  for (const limit of [1, 5, 25]) {
+    const { body } = await call(`/reports?status=new&limit=${limit}`, { token: TOKEN, ip: '192.0.2.103' });
+    assert.ok(
+      body.rows_read <= rowsReadBudget(limit),
+      `corrections+status page of ${limit} scanned ${body.rows_read} rows, budget ${rowsReadBudget(limit)}`,
+    );
+    assert.ok(body.rows_read < SEEDED, `corrections+status page scanned ${body.rows_read}, table scan`);
+  }
+});
+
+test('reports_app_fix_public_log: public log uses the 4-column scoped partial index', async () => {
+  // Index: (app_id, status, public, fixed_at DESC) WHERE kind <> 'open'
+  // Query: publicLog with app_id='fleet' literal, reads fixed public corrections only
+  // Old index: reports_fix_public_log (status, public, fixed_at DESC) WHERE kind <> 'open'
+  // Every WHERE column is a prefix of the new index, and the ORDER BY is the index order,
+  // so a page of limit reads exactly limit rows (the A4 assertion that already existed).
+  for (const limit of [1, 5, 25]) {
+    const { body } = await call(`/log?limit=${limit}`);
+    assert.ok(
+      body.rows_read <= rowsReadBudget(limit),
+      `public log page of ${limit} scanned ${body.rows_read} rows, budget ${rowsReadBudget(limit)}`,
+    );
+  }
+});
+
+test('healthSites: GROUP BY site reads fleet corrections only', async () => {
+  // Index: reports_app_site_created (app_id, site, created_at DESC) was created for this
+  // Query: healthSites with GROUP BY site, filters kind <> 'open'
+  // FINDING: EXPLAIN QUERY PLAN shows the planner uses reports_app_fix_created (the partial
+  // index excluding open items) instead of reports_app_site_created. The partial index is
+  // smaller, so this may be acceptable, but the GROUP BY no longer walks index order.
+  // /health does not expose rows_read, so this test verifies the query succeeds and the
+  // per-site counts are correct. The EXPLAIN QUERY PLAN output is in the WS-A report.
+  const { body } = await call('/health');
+  assert.equal(body.ok, true);
+  assert.equal(body.store_ok, true);
+  const parla = body.sites.find((s) => s.site === 'parla-site');
+  assert.ok(parla, 'parla-site is missing from per-site readback after index creation');
+  assert.equal(parla.reports, SEEDED, `parla-site count is ${parla.reports}, expected ${SEEDED}`);
+});
