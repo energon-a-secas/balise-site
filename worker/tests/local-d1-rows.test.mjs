@@ -325,29 +325,49 @@ test('the tenant fixture reaches no reader through any route this Worker serves'
   }
 });
 
-// ── Phase 2 pass 0: what the two board reads cost, and what that number grows with ────────────
+// ── Phase 2 pass 0b: what the two board reads cost, and what that number grows with ───────────
 //
 // Review condition C2 asked for warnRowsRead on GET /board and GET /board/summary, on the reading
-// that /board has a `limit` so rowsReadBudget applies to it. It does not, and these two tests are
-// why the call was not made. src/routes-open.js carries the argument; this is the measurement.
+// that /board has a `limit` so rowsReadBudget applies to it. It does not, and these tests are why
+// the call was not made. src/routes-open.js carries the argument; this is the measurement.
 //
-// MEASURED 2026-09-18 through the two routes, in a fleet-only database, at four populations from
-// one published entry to ninety-nine. O is published entries at accepted, R is published fleet
-// rows at fixed of either kind:
+// FOUR POPULATIONS MOVE THESE NUMBERS, NOT TWO. Pass 0 fitted `2 x O + R + 2` and `O + 2 x R + 3`
+// to four populations that only ever moved O and R together, and the second is not a law: A39
+// held O and R fixed, added seven rows that are neither, and moved the summary from 14 to 21 while
+// that formula predicted 15 at all three. This file asserted a THIRD formula at the time, so the
+// source's prose and this assertion disagreed and the suite was green anyway. Re-measured
+// 2026-09-18 at ten populations, each term moved on its own through the real PATCH route:
 //
-//   GET /board            rows_read = 2 x O + R + 2       identical at limit=5 and limit=50
-//   GET /board/summary    rows_read = O + 2 x R + 3       it has no limit at all
+//   O     fleet rows at kind='open', public=1, status='accepted': the published entries
+//   Ra    every row at status='fixed' AND public=1, ANY tenant, either kind
+//   Af    fleet rows at status='accepted', WHATEVER their kind and visibility
+//   Ff    fleet rows at status='fixed', WHATEVER their kind and visibility
+//   rank  where the newest FLEET entry's resolution sits within Ra in fixed_at DESC order. A
+//         RANK AND NOT A COUNT: one tenant resolution newer than the fleet's costs this term 1
+//         and three hundred of them cost it three hundred.
 //
-// Neither is a function of `limit`, and both grow without bound as the board is used: /board went
-// past rowsReadBudget(50) at 61 published entries, which is an ordinary board. So a constant is
-// either a warning an operator meets in normal service and deletes, or one that detects nothing.
-// The equality below is the instrument instead. It says nothing about how busy the board is and
-// everything about what one row costs, which is the regression this file exists to catch.
+//   GET /board            rows_read = 2 x O + Ra + 2       identical at limit=5 and limit=50
+//   GET /board/summary    rows_read = Af + Ff + rank + 4   it has no limit at all
 //
-// THE R TERM IS NOT SCOPED, and that is the finding rather than a detail. Both reads seek on
-// (status, public) through reports_public_log, which leads on neither app_id nor kind, so the
-// walk includes the fixture's TENANT_FIXED fixed-and-public rows and rejects them one at a time.
-// The six indexes of 0004_tenants.sql do not cover this: the scoped twin for the log,
+// Exact at all ten. The trailing constant is one per statement whose seek range is NOT empty, so
+// a board with nothing published of some kind pays less: measured 7 rather than 8 for /board at
+// O=3 with Ra=0, and 6 rather than 7 for the summary at Af=3, Ff=0, rank=0. This fixture has
+// every range non-empty, so the constants below are exact rather than a bound.
+//
+// EVERY TERM IS MEASURED FROM THE DATABASE BELOW rather than written as a constant, and that is
+// the difference between a law and a curve fitted to one fixture: these assertions survive the
+// fixture growing and go red when the cost of a ROW moves, which is the only thing a plan
+// regression can do here. Neither number is a function of `limit`, and every term grows without
+// bound as the board is used: at this fixture's two published resolutions /board crosses
+// rowsReadBudget(50) = 110 at O = 54. So a constant threshold is either a warning an operator
+// meets in normal service and deletes, or one that detects nothing.
+//
+// THE Ra AND rank TERMS ARE NOT SCOPED, and that is the finding rather than a detail. Both of
+// those walks seek on (status, public) through reports_public_log, which leads on neither app_id
+// nor kind, so they include the fixture's TENANT_FIXED fixed-and-public rows and reject them one
+// at a time. The summary's cost therefore depends on how many resolutions ANOTHER TENANT has
+// published since the fleet's newest one, which is why rank is the honest term and a count is
+// not. The six indexes of 0004_tenants.sql do not cover this: the scoped twin for the log,
 // reports_app_fix_public_log, is partial on `kind <> 'open'` and both board queries carry
 // `kind = 'open'`, so it is not a candidate for either of them. Reported to delivery-lead for
 // data-engineer; constraint 3 of this pass forbids adding the index here.
@@ -385,23 +405,42 @@ test('C2: both board reads cost exactly what the measured law says, per row and 
   // eventually fires for no reason; equality on the law fires when the COST OF A ROW changes,
   // which is the only thing a plan regression can do here.
   //
-  // FIXED_PUBLIC is the unscoped term: every fixed, public row in the table, the tenant's
-  // included, because reports_public_log leads on neither app_id nor kind. If a scoped index
-  // ever serves these two reads, both numbers drop by TENANT_FIXED and both assertions go red
-  // with the arithmetic in the message. That is the intended red, not a regression.
-  const FIXED_PUBLIC = TENANT_FIXED + PUBLISHED_FIXED;
+  // The five terms are READ BACK FROM THE DATABASE, one statement each, in the wording of the
+  // definitions at the head of this section. Writing them as constants is what let the pass-0
+  // formula and the pass-0 prose disagree while both matched one fixture (A39 finding F2).
+  const [[o], [ra], [af], [ff], [rk], [tied]] = await d1(
+    `SELECT count(*) AS n FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND public = 1 AND status = 'accepted'`,
+    `SELECT count(*) AS n FROM reports WHERE status = 'fixed' AND public = 1`,
+    `SELECT count(*) AS n FROM reports WHERE app_id = 'fleet' AND status = 'accepted'`,
+    `SELECT count(*) AS n FROM reports WHERE app_id = 'fleet' AND status = 'fixed'`,
+    `SELECT count(*) AS n FROM reports WHERE status = 'fixed' AND public = 1 AND fixed_at >= (SELECT max(fixed_at) FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND public = 1 AND status = 'fixed')`,
+    `SELECT count(*) AS n FROM reports WHERE status = 'fixed' AND public = 1 AND fixed_at = (SELECT max(fixed_at) FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND public = 1 AND status = 'fixed')`,
+  );
+  const [O, Ra, Af, Ff, rank] = [o.n, ra.n, af.n, ff.n, rk.n];
+
+  // The law's terms have to be non-degenerate or it is satisfied by arithmetic rather than by a
+  // plan. rank is a position in a fixed_at DESC walk, so a TIE at the row the walk stops on makes
+  // it exact only up to the size of the tie: this fixture has none, and if it grows one the right
+  // answer is to give the tenant rows distinct fixed_at values, not to widen the assertion.
+  assert.ok(O > 0 && Ra > 0 && Af > 0 && Ff > 0, `a term of the law is zero (O=${O} Ra=${Ra} Af=${Af} Ff=${Ff}), so the constants below are not the ones this fixture pays`);
+  assert.equal(rank, TENANT_FIXED + PUBLISHED_FIXED - 1, `the newest fleet resolution sits at rank ${rank} of the ${Ra} published resolutions, not under all ${TENANT_FIXED} tenant ones: the fixture has moved and the two laws want re-measuring`);
+  assert.equal(tied.n, 1, `${tied.n} published resolutions share the fixed_at the summary's walk stops on, so rank is exact only to within that tie`);
+
   const board = await call('/board?limit=50');
   const summary = await call('/board/summary');
 
-  const boardLaw = 2 * PUBLISHED_OPEN + FIXED_PUBLIC + 2;
+  const boardLaw = 2 * O + Ra + 2;
   assert.equal(
     board.body.rows_read, boardLaw,
-    `GET /board scanned ${board.body.rows_read}, and the law 2xO + R + 2 with O=${PUBLISHED_OPEN} and R=${FIXED_PUBLIC} says ${boardLaw}. Either the plan moved or the fixture did; re-measure before adjusting the number.`,
+    `GET /board scanned ${board.body.rows_read}, and the law 2xO + Ra + 2 with O=${O} and Ra=${Ra} says ${boardLaw}. Either the plan moved or the fixture did; re-measure before adjusting the number.`,
   );
-  const summaryLaw = PUBLISHED_OPEN + PUBLISHED_FIXED + FIXED_PUBLIC + 3;
+  // Ra and rank are the UNSCOPED terms: if a scoped index ever serves these two reads, both
+  // numbers drop by about TENANT_FIXED and both assertions go red with the arithmetic in the
+  // message. That is the intended red, not a regression.
+  const summaryLaw = Af + Ff + rank + 4;
   assert.equal(
     summary.body.rows_read, summaryLaw,
-    `GET /board/summary scanned ${summary.body.rows_read}, and the law O + R_fleet + R_all + 3 with O=${PUBLISHED_OPEN}, R_fleet=${PUBLISHED_FIXED} and R_all=${FIXED_PUBLIC} says ${summaryLaw}.`,
+    `GET /board/summary scanned ${summary.body.rows_read}, and the law Af + Ff + rank + 4 with Af=${Af}, Ff=${Ff} and rank=${rank} says ${summaryLaw}. rank is a POSITION in the published resolutions ordered by fixed_at DESC, not a count of them: read the section head above before adjusting anything.`,
   );
 
   // And the number these two routes report is above the floor the five cases above are built

@@ -28,7 +28,7 @@
 // planted value in that column is a faithful tenant row for every question asked.
 
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -40,6 +40,87 @@ export const SRC = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src')
 
 /** A Worker source file as text, for the assertions that are about an ABSENCE (C6.5). */
 export const source = (file) => readFileSync(join(SRC, file), 'utf8');
+
+/** Every `*.js` under src/, RECURSIVELY, as paths relative to src/ with forward slashes.
+ *
+ *  Recursive because the assertions that enumerate this directory are about what no file does,
+ *  and a one-level readdir answers that question for one level: A39 found that a module under
+ *  src/<dir>/ was never scanned by the credential-boundary test and so was never covered by it.
+ *  There is no such directory today, and this is what stops the day there is one from being the
+ *  day the property quietly stops holding. */
+export function srcFiles(dir = SRC, prefix = '') {
+  const out = [];
+  for (const item of readdirSync(dir, { withFileTypes: true })) {
+    if (item.isDirectory()) out.push(...srcFiles(join(dir, item.name), `${prefix}${item.name}/`));
+    else if (item.name.endsWith('.js')) out.push(`${prefix}${item.name}`);
+  }
+  return out.sort();
+}
+
+/**
+ * A Worker source file with its COMMENTS REMOVED and everything else left where it was, for the
+ * assertions that are about what the code does rather than what a comment says about it.
+ *
+ * IT IS A SCANNER AND NOT A REGEX, and the reason is a hole A39 found by exploiting it. The
+ * previous version was `text.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')`, which cannot tell a
+ * comment from a `//` inside a string: one `https://` on a line DELETED THE REST OF THAT LINE,
+ * real code included, so a credential read written after a URL literal was invisible to the test
+ * that exists to find it. Strings, template literals and regex literals are tracked here for that
+ * reason, and newlines are preserved so a reported position still means something.
+ *
+ * What it is not: a parser. A `//` inside a template literal's ${} expression is treated as
+ * string content rather than as a comment, which leaves a comment in place (a false POSITIVE, so
+ * it fails loudly) and never removes code.
+ */
+export function stripComments(text) {
+  let out = '';
+  let i = 0;
+  // The last character that was neither whitespace nor part of a comment. It is what tells a
+  // regex literal from a division: `/` after a value divides, `/` after an operator opens one.
+  let prev = '';
+  const REGEX_MAY_START = '=(,:[!&|?{};+-*%~^<>';
+  while (i < text.length) {
+    const c = text[i];
+    const d = text[i + 1];
+    if (c === '/' && d === '/') {
+      while (i < text.length && text[i] !== '\n') i += 1;
+      continue;
+    }
+    if (c === '/' && d === '*') {
+      i += 2;
+      while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
+        // Newlines are kept so that nothing downstream reads a 40-line comment as one line.
+        if (text[i] === '\n') out += '\n';
+        i += 1;
+      }
+      i += 2;
+      continue;
+    }
+    if (c === "'" || c === '"' || c === '`' || (c === '/' && (prev === '' || REGEX_MAY_START.includes(prev)))) {
+      const close = c;
+      out += c;
+      i += 1;
+      while (i < text.length) {
+        if (text[i] === '\\') { out += text.slice(i, i + 2); i += 2; continue; }
+        out += text[i];
+        i += 1;
+        if (text[i - 1] === close) break;
+        // An unterminated literal would otherwise run to the end of the file and hide
+        // everything after it, which is the failure mode this whole function exists to refuse.
+        if (text[i - 1] === '\n' && close !== '`') break;
+      }
+      prev = close;
+      continue;
+    }
+    out += c;
+    i += 1;
+    if (!/\s/.test(c)) prev = c;
+  }
+  return out;
+}
+
+/** One Worker source file, comments removed. The pairing the assertions use. */
+export const codeOf = (file) => stripComments(source(file));
 
 export const T = 1_757_000_000_000;
 export const FLEET_MARK = 'FLEET-CANARY';

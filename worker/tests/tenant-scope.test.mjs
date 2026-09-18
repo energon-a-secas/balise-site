@@ -7,8 +7,6 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readdirSync } from 'node:fs';
-
 import { sqliteD1 } from './sqlite-d1.mjs';
 import { FLEET, FLEET_SCOPE, scopeFor } from '../src/scope.js';
 import { principalFor } from '../src/routes-desk.js';
@@ -25,7 +23,7 @@ import {
 } from '../src/store-work-runner.js';
 import {
   T, FLEET_MARK, TENANT_MARK, TENANT, TENANT_KEY, markOf, json,
-  snapshot, plantReport, fleetOnly, source, SRC,
+  snapshot, plantReport, fleetOnly, source, srcFiles, codeOf, stripComments,
 } from './tenant-fixture.mjs';
 
 // ── The seam ──────────────────────────────────────────────────────────────────
@@ -190,6 +188,28 @@ test('C6.5: the three public reads count the fleet only, and take the literal ra
   }
 });
 
+/** The two files the four credential-free routes live in. /report and /log are in the first,
+ *  /board and /board/summary in the second. */
+const PUBLIC_ROUTE_FILES = ['routes-public.js', 'routes-open.js'];
+/** The only file in the Worker that may read a credential out of a request. */
+const MAY_READ_A_CREDENTIAL = ['auth.js'];
+/** The only file that may reach src/auth.js. Named rather than counted: a count passes when the
+ *  importer MOVES, and where it lives is the point. */
+const MAY_IMPORT_AUTH = ['routes-desk.js'];
+/** Request headers that carry who the caller is. X-Balise-Actor is gone for good (src/auth.js and
+ *  src/routes-desk.js both say why) and is listed so that bringing it back is a red. */
+const CREDENTIAL_HEADERS = ['authorization', 'x-balise-actor', 'cookie', 'proxy-authorization'];
+/** Any `.headers` that is not the spread of a plain object. The lookbehind is what keeps
+ *  `...headers` out of it; `request.headers` and `res?.headers` are both in. */
+const ANY_HEADERS = /(?<!\.)\.headers\b/g;
+/** A header touched BY A NAME THAT IS WRITTEN OUT. Anchored, so it is tested against the text
+ *  from one `.headers` onwards. */
+const NAMED_HEADER = /^\.headers\s*\.\s*(get|has|set|append|delete)\s*\(\s*(['"])([^'"\n]*)\2/;
+/** A module specifier that IS src/auth.js, however it is quoted and however deep the path it is
+ *  reached by. `from './auth.js'`, `from "../auth.js"` and `await import('./auth.js')` all match;
+ *  './store-auth.js' does not, because the optional prefix has to end at a slash. */
+const AUTH_SPECIFIER = /(['"])(?:[^'"\n]*\/)?auth\.js\1/;
+
 test('the four public routes cannot read a credential, because the file they live in cannot', () => {
   // The other half of "structural rather than a policy", and it is new with the router split in
   // phase 2 pass 0. /report, /log, /board and /board/summary must never read the Authorization
@@ -203,18 +223,87 @@ test('the four public routes cannot read a credential, because the file they liv
   // absence, and an absence has no value to compare. A public route that started reading a
   // credential would not fail any other test in this repository, it would just quietly answer
   // differently to a caller holding a token.
-  for (const file of ['routes-public.js', 'routes-open.js']) {
-    const text = source(file);
-    const code = text.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '');
-    assert.doesNotMatch(code, /from '\.\/auth\.js'/, `src/${file} imports src/auth.js`);
-    assert.doesNotMatch(code, /Authorization|X-Balise-Actor/i, `src/${file} reads a request credential header`);
+  //
+  // IT IS WRITTEN AS A WHITELIST OVER THE WHOLE DIRECTORY, and pass 0b rewrote it that way
+  // because the version that named two files and grepped for one spelling had five ways past it
+  // and one way to fail for nothing (A39 finding F3). A matcher with holes is worse than no
+  // matcher: it reports that a boundary is held. The three rules below are each general, so a
+  // NEW public route in a NEW file is covered by all three the moment it exists:
+  //
+  //   1. only MAY_READ_A_CREDENTIAL may touch a credential header, in ANY file under src/,
+  //      and every other file has to name every header it touches as a plain literal. That
+  //      refuses `headers.get(['Author','ization'].join(''))` by SHAPE rather than by spelling,
+  //      which is the evasion no grep for a word can catch.
+  //   2. only MAY_IMPORT_AUTH may reach src/auth.js, by a static import in either quote or by
+  //      `await import()`, from any depth of subdirectory.
+  //   3. the two files the public routes live in may not name a credential header at all, which
+  //      is the stricter belt on the files the rule is actually about.
+  //
+  // Comments are removed by tenant-fixture's codeOf(), a scanner rather than a regex, for a
+  // reason recorded there: the regex this test used to use deleted real code that followed a
+  // URL literal on the same line.
+  const files = srcFiles();
+  for (const file of [...PUBLIC_ROUTE_FILES, ...MAY_READ_A_CREDENTIAL, ...MAY_IMPORT_AUTH]) {
+    assert.ok(files.includes(file), `src/${file} is gone, so this test is asserting a rule about files that do not exist`);
   }
-  // And exactly one file in the Worker may import it. Named rather than counted: a count would
-  // pass if the importer MOVED, and where it lives is the point.
-  const importers = readdirSync(SRC)
-    .filter((f) => f.endsWith('.js'))
-    .filter((f) => /from '\.\/auth\.js'/.test(source(f).replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')));
-  assert.deepEqual(importers, ['routes-desk.js'], 'src/auth.js is imported by a file that is not the desk router');
+
+  const importers = [];
+  for (const file of files) {
+    const code = codeOf(file);
+    if (AUTH_SPECIFIER.test(code)) importers.push(file);
+    if (MAY_READ_A_CREDENTIAL.includes(file)) continue;
+
+    for (const at of code.matchAll(ANY_HEADERS)) {
+      const named = code.slice(at.index).match(NAMED_HEADER);
+      assert.ok(
+        named,
+        `src/${file} touches .headers in a way this test cannot read a header NAME out of: ${code.slice(at.index, at.index + 70).replace(/\s+/g, ' ')}. A file that may not read a credential names every header it touches as a plain string literal, so that reading the source is the whole check. If that is genuinely what this new code needs, the rule to change is this test, in a commit that says why.`,
+      );
+      assert.ok(
+        !CREDENTIAL_HEADERS.includes(named[3].toLowerCase()),
+        `src/${file} reads the ${named[3]} request header, and only src/${MAY_READ_A_CREDENTIAL.join(', src/')} may`,
+      );
+    }
+  }
+  assert.deepEqual(
+    importers, MAY_IMPORT_AUTH,
+    `src/auth.js is imported by ${importers.join(', ') || 'nothing'}, and the only file that may is ${MAY_IMPORT_AUTH.join(', ')}`,
+  );
+
+  for (const file of PUBLIC_ROUTE_FILES) {
+    const code = codeOf(file);
+    for (const name of CREDENTIAL_HEADERS) {
+      assert.doesNotMatch(code, new RegExp(name, 'i'), `src/${file} names the ${name} header in its code, and the four routes it holds carry no credential`);
+    }
+  }
+});
+
+test('the credential matcher reads the code and not a comment about it', () => {
+  // The matcher above is only as good as its comment stripper, and a stripper's failure is
+  // SILENT: it makes a planted violation invisible, so nothing goes red until somebody plants
+  // one. A39 planted one. This is the unit test that means the next rewrite of codeOf() cannot
+  // reopen the hole without a name attached to it.
+  // 1. THE EVASION ITSELF: a real credential read after a URL literal on the same line. The old
+  //    regex stripper deleted from the `//` of `https://` to the end of the line, so the read
+  //    vanished before the matcher saw it.
+  const planted = "const u = 'https://balise.neorgon.com/x'; const h = request.headers.get('Authorization');";
+  assert.equal(stripComments(`${planted} // a comment naming Authorization`), `${planted} `, 'the stripper either kept a comment or ate the code after a URL literal');
+  // 2. A block comment goes and its newlines stay, so a position still means something.
+  assert.equal(stripComments('a\n/* two\nlines */\nb'), 'a\n\n\nb', 'the stripper lost or invented a newline');
+  // 3. A `//` inside a double-quoted string is not a comment either.
+  assert.equal(stripComments('const u = "http://x/y";'), 'const u = "http://x/y";', 'the stripper treated a URL inside a string as a comment');
+  // 4. A regex literal holding a quote does not open a string. Without this the rest of the file
+  //    reads as one long string and every assertion over it passes on nothing.
+  assert.equal(stripComments("const q = /['\"]/; const k = 'x';"), "const q = /['\"]/; const k = 'x';", 'the stripper read a regex literal as a string');
+  // 5. And on the real file: the comment lines that DECLARE the prohibition are gone while the
+  //    file itself is still there. That declaration is the false positive A39 warned about, and a
+  //    red nobody can act on gets deleted, taking the real assertion with it. Matched on the
+  //    declaring WORDING rather than on the header name, so that a real violation planted in this
+  //    file turns the matcher above red and leaves this one green, which is the difference between
+  //    a diagnosis and two alarms.
+  const code = codeOf('routes-public.js');
+  assert.doesNotMatch(code, /MUST NEVER/, 'the stripper left a comment declaring the prohibition in the code it hands the matcher');
+  assert.match(code, /export async function resolvedLog/, 'the stripper ate the file');
 });
 
 // ── Every read and every write that takes a handle ────────────────────────────

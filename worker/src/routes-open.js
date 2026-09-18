@@ -117,32 +117,88 @@ export async function openSync(env, payload, { origin, now }) {
  *
  * NEITHER BOARD ROUTE CALLS warnRowsRead, AND THAT IS NOW A DECISION RATHER THAN A DEFERRAL.
  * Phase 1's review condition C2 asked for the call on both, on the reading that /board has a
- * `limit` so `rowsReadBudget(limit)` applies to it. Measured 2026-09-18 through these two
- * routes, it does not, and the two laws are these (O = published entries at accepted, R =
- * published fleet rows at fixed, both kinds, seeded through the real PATCH route):
+ * `limit` so `rowsReadBudget(limit)` applies to it. Measured through these two routes, it does
+ * not. FOUR populations of `reports` move these numbers, not two, and naming all four is the
+ * whole point of writing them down (re-measured 2026-09-18, pass 0b, ten populations with each
+ * term moved on its own through the real PATCH route):
  *
- *   GET /board            rows_read = 2 x O + R + 2      independent of `limit`
- *   GET /board/summary    rows_read = O + 2 x R + 3      it has no `limit`
+ *   O     published entries: fleet rows at kind='open', public=1, status='accepted'
+ *   Ra    ALL published resolutions: every row at status='fixed' AND public=1, any tenant,
+ *         either kind. Unscoped, and that is the finding rather than a detail; see below.
+ *   Af    fleet rows at status='accepted', WHATEVER their kind and visibility
+ *   Ff    fleet rows at status='fixed', WHATEVER their kind and visibility
+ *   rank  how far down the published resolutions the newest FLEET entry's resolution sits,
+ *         counted over Ra in fixed_at DESC order. A RANK AND NOT A COUNT: one tenant
+ *         resolution newer than the fleet's costs this term 1, and 300 of them cost it 300.
  *
- * Both fitted exactly at four populations, from O=1,R=2 up to O=99,R=22. Three things follow
- * and all three are why a runtime threshold is the wrong instrument here:
+ *   GET /board            rows_read = 2 x O + Ra + 2      independent of `limit`
+ *   GET /board/summary    rows_read = Af + Ff + rank + 4  it has no `limit`
+ *
+ * Exact at all ten. The trailing constant is one per statement whose seek range is NOT empty, so
+ * a board with nothing published of some kind pays less: measured 7 rather than 8 for /board at
+ * O=3 with Ra=0, and 6 rather than 7 for the summary at Af=3, Ff=0, rank=0. Read both constants
+ * as the upper bound they are at a board that has published anything at all.
+ *
+ * WHAT THE SUMMARY'S LAW USED TO SAY HERE, and how it was got wrong, because the shape repeats.
+ * This block said `rows_read = O + 2 x R + 3`, from four populations that only ever moved O and
+ * R together. Both statements behind the summary seek on terms that EXCLUDE kind and public
+ * (counts on (app_id, status), latest on (status, public)), so a private draft at `accepted` and
+ * a resolved CORRECTION each cost rows while moving neither O nor R: holding O and R fixed and
+ * adding seven such rows moved the number from 14 to 21 while the old law predicted 15 at all
+ * three populations. A curve fitted to a fixture is not a law, and four points that move two
+ * variables in step cannot tell the two apart. The four terms above were derived from the SQL
+ * first and then measured against populations built to move one term at a time.
+ *
+ * Three things follow and all three are why a runtime threshold is the wrong instrument here:
  *
  *   1. /board SCANS THE SAME NUMBER OF ROWS AT limit=5 AS AT limit=50. Its open half is on
  *      reports_board, whose trailing column is created_at while the sort is on opened_at, so
  *      SQLite walks every matching entry into a temp b-tree before LIMIT applies. A budget
  *      keyed on `limit` is not a budget for this query in either direction.
- *   2. BOTH NUMBERS GROW LINEARLY WITH THE BOARD EXISTING, without bound and without any
- *      query getting worse. /board passed rowsReadBudget(50) = 110 at 61 published entries,
- *      which is an ordinary working board. A threshold that logs at 61 entries is a warning
- *      whoever meets it will delete, and a threshold set past that detects nothing.
- *   3. Both numbers also move with rows on NO board at all: a resolved CORRECTION costs
- *      /board 1 and the summary 2, because `kind` is only a per-row test under the pinned
- *      plans. So even a per-entry ratio computed from what the route RETURNED is not a bound.
+ *   2. EVERY TERM GROWS WITH THE BOARD EXISTING, without bound and without any query getting
+ *      worse. At the two published resolutions this Worker's fixture has, /board crosses
+ *      rowsReadBudget(50) = 110 at O = 54: 2 x 53 + 2 + 2 is exactly 110 and O = 54 is the
+ *      first count over it. Fifty-four entries is an ordinary working board. A threshold that
+ *      logs there is a warning whoever meets it will delete, and one set past it detects
+ *      nothing. (This said 61, which is not reachable under the law at all: 2 x 60 + 2 is
+ *      already 122. The 61 came from a mixed population and was read back as a property of
+ *      the route.)
+ *   3. Both numbers move with rows on NO board at all, which is what Af, Ff and rank say: a
+ *      resolved CORRECTION costs /board 1 and the summary 2, a PRIVATE accepted draft costs
+ *      the summary 1, and a tenant's published resolution costs /board 1 and the summary 1.
+ *      So even a per-entry ratio computed from what the route RETURNED is not a bound.
  *
- * So the detector is the equality assertion in tests/local-d1-rows.test.mjs against a known
- * fixture population, not a console.warn against a constant. It is the stronger of the two: it
- * is red rather than logged, and it fires on a one-row change in the per-row cost, which is the
- * regression class that matters, while being silent about a board that is merely busy.
+ * So the detector is the equality assertion in tests/local-d1-rows.test.mjs, not a console.warn
+ * against a constant. It measures all four terms from the database and asserts the law, so it is
+ * red when the COST OF A ROW changes and silent when the board is merely busy.
+ *
+ * Two things it is honestly not. It is a build-time check against a fixture, so it cannot see a
+ * production population. And it is only PARTLY a scope test, which pass 0b measured rather than
+ * assumed: deleting `app_id = 'fleet'` from each of the three board statements in turn, one at a
+ * time, against this fixture.
+ *
+ *   summary, counts    RED     the one statement that spans every kind. Unscoped it walks the
+ *                              tenant's rows too, so Af + Ff no longer bound it.
+ *   /board             green   both arms filter kind = 'open'
+ *   summary, latest    green   filters kind = 'open'
+ *
+ * The two greens are not holes in the assertion, and this is the useful part: on those statements
+ * the literal is REDUNDANT TO THE COST, because no row a `kind = 'open'` seek can reach belongs to
+ * a tenant. A rows_read law cannot detect the removal of a predicate that excludes nothing, and no
+ * measurement will ever make it. What makes those two literals load-bearing is DESIGN.md 4.3, and
+ * what holds 4.3 is a COUNT in tests/tenant-invariants.test.mjs, not this file's arithmetic.
+ * (A39 reported two of three blind, which is still the count. The set is not the same set, and the
+ * reason per statement is what was missing.)
+ *
+ * WHICH LEAVES A GAP, MEASURED IN THE SAME PASS AND NOT CLOSED IN IT. Deleting that one literal
+ * from the summary's `latest` statement turns NOTHING in the suite red. The C6.5 structural
+ * assertion in tests/tenant-scope.test.mjs is `literals.length >= 2` over the whole file, and this
+ * file's store carries eleven, so nine of them can go while it stays green: it is COUNTED where it
+ * needed to be per statement, which is the same defect A39 filed against the credential matcher
+ * one test down. So do not delete a fleet literal on the strength of a green suite. Reported to
+ * delivery-lead in the pass 0b report and qa-engineer's to close; not touched here, because this
+ * pass was scoped to the credential matcher and widening it silently is how a gate loses its
+ * meaning.
  *
  * WHAT IS STILL UNDETECTED, so nobody has to rediscover it: growth in PRODUCTION. The law says
  * a 500-entry board costs about 1,000 rows_read per uncached request, and nothing in this

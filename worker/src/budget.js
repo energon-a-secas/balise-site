@@ -20,6 +20,11 @@
  * between the two numbers is wide. Doubling the measurement and adding ten leaves room
  * for a range scan stepping over non-matching rows without leaving room for a table scan.
  *
+ * THAT MEASUREMENT IS FROM BEFORE migrations/0004_tenants.sql AND IT DID NOT INCLUDE kind=open.
+ * "Every keyset page read exactly `limit` rows" is no longer true of every page: read the
+ * enumeration on warnRowsRead below before quoting this paragraph. The budget itself is
+ * unchanged, because what moved is a query's cost and not what a page ought to cost.
+ *
  * IT IS A BUDGET FOR A PAGE, so it takes a `limit` and only a route with one may use it. The
  * fixed-shape reads have no limit to hand it and are bounded a different way: see the growth
  * law written down at the foot of src/routes-open.js.
@@ -42,14 +47,52 @@ export function rowsReadBudget(limit) {
  * arms for that reason, so there is nothing for a caller to branch on, and 'C2: warnRowsRead
  * observes and returns nothing' in tests/api.test.mjs is what holds that: it captures
  * console.warn and requires undefined from both arms and from a rows_read that is not a number.
- * It has to call the function directly, and the reason is worth knowing: NO POPULATION CAN PUT A
- * KEYSET PAGE OVER ITS OWN BUDGET. Both callers read exactly `limit` rows under every index the
- * store has, measured, so the warning has never fired through a route and cannot be made to.
- * It is a tripwire for a future plan regression, not a thing operations will see.
+ * That much is unchanged, and it is the load-bearing half: nothing here may become behaviour.
+ *
+ * IT FIRES THROUGH A ROUTE, ON THE DESK'S DEFAULT VIEW, TODAY. This block said the opposite in
+ * capitals until pass 0b: "NO POPULATION CAN PUT A KEYSET PAGE OVER ITS OWN BUDGET ... so the
+ * warning has never fired through a route and cannot be made to". It is false. Measured through
+ * the real handler on a fleet of 50 open items under 96 newer corrections, with the tenant
+ * fixture planted:
+ *
+ *   GET /reports?kind=open&limit=1     returned  1   rows_read  96   budget  12   OVER
+ *   GET /reports?kind=open&limit=5     returned  5   rows_read 100   budget  20   OVER
+ *   GET /reports?kind=open&limit=25    returned 25   rows_read 121   budget  60   OVER
+ *   GET /reports?kind=open&limit=50    returned 50   rows_read 146   budget 110   OVER
+ *
+ * No index serves `app_id = ? AND kind = 'open'` in created_at order, so under that filter the
+ * kind term is a per-row test over reports_app_created and every newer correction is walked and
+ * discarded. The cost is (fleet corrections) + `limit`, and limit=1 is the worst case, because
+ * the budget shrinks with the page and the walk does not. THE CALLER IS THE SHIPPED DESK: the
+ * open-items view sends exactly this request on every load (js/api.js fetchQueue, from
+ * js/desk.js). So this is a live detector of a live cost rather than a tripwire, and
+ * tests/api.test.mjs calls the function directly for the ordinary reason a unit test does, to
+ * reach both arms with chosen numbers and capture what they write.
+ *
+ * HOW THE FALSE CLAIM WAS REACHED, which is worth more than the correction. Pass 0 measured the
+ * TWO BOARD ROUTES, found that a budget keyed on `limit` says nothing about either of them, and
+ * wrote that down as a property of this function rather than of those two routes. It never ran
+ * the route that already calls it. A negative claim about reachability is a claim about EVERY
+ * caller, so it may not be written until the callers have been enumerated and each one measured.
+ * The enumeration, so the next such claim starts from a list:
+ *
+ *   GET /log       src/routes-public.js   CALLS THIS. Under budget: 'A4: the public log reads
+ *                                         matching rows, not the table' in
+ *                                         tests/local-d1-rows.test.mjs holds that at 1, 5, 25.
+ *   GET /reports   src/routes-desk.js     CALLS THIS. Over budget under kind=open, above. Under
+ *                                         budget unfiltered, by status, and on the corrections
+ *                                         feed, all three asserted in the same file.
+ *   GET /work      src/routes-work.js     NOT a caller, and it is the one route with a `limit`
+ *                                         and a rows_read whose plan nobody has measured against
+ *                                         this budget. An open question, not a decision.
+ *   GET /board     src/routes-open.js     NOT callers, deliberately, see below.
+ *   GET /board/summary
  *
  * THE TWO BOARD ROUTES ARE NOT CALLERS AND THAT IS ON PURPOSE. See the growth laws at
  * src/routes-open.js, measured: neither board read is bounded by a `limit`, so this function
- * has nothing true to say about either one.
+ * has nothing true to say about either one. That decision is unaffected by the correction above.
+ * The over-budget arm being reachable on /reports makes no board route instrumentable: what is
+ * wrong there is that `rowsReadBudget` takes a page size and those two routes do not have one.
  */
 export function warnRowsRead(what, rowsRead, limit) {
   const budget = rowsReadBudget(limit);
