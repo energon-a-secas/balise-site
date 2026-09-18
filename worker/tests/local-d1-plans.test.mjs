@@ -36,6 +36,11 @@ import {
 } from './harness.mjs';
 import { plantTenant, d1For, TENANT_ROWS } from './tenant-rows.mjs';
 import { TENANT, TENANT_MARK } from './tenant-fixture.mjs';
+// The two the import pins need: the fingerprint the Worker would compute for a (source, ref), and
+// the hash it computes it with. Imported rather than copied, so a change to either shows up here
+// as a failed lookup instead of as a pin on a statement nobody runs.
+import { openFingerprintInput } from '../src/store-open.js';
+import { sha256Hex } from '../src/keys.js';
 
 const STATE = join(WORKER_DIR, '.wrangler/plans-state');
 const PORT = 8886;
@@ -243,4 +248,142 @@ test('the tenant fixture reaches neither the board nor the summary', async () =>
     assert.ok(!text.includes(TENANT_MARK), `${path} answered with a tenant row: ${text.slice(0, 400)}`);
     assert.ok(!text.includes(TENANT), `${path} answered with a tenant app id: ${text.slice(0, 400)}`);
   }
+});
+
+// ── The import and sync statements, pinned by SEEK SHAPE and not by index name ─────────────────
+//
+// A36 finding A: the four statements behind POST /open-items and POST /open-items/sync had no
+// pinned plan, and the only record of where they sit was a paragraph in src/store-open.js. Two of
+// them are the widest reads in the Worker. These pins are that gap closed, re-measured here rather
+// than transcribed from the amendment, and they are shaped differently from the ten above for two
+// reasons that are the whole judgement in them.
+//
+// ONE: THE PIN IS THE SEEK, THE NAME IS ONLY AN ALLOWED SET. Three indexes lead on `app_id` and
+// carry no partial predicate: reports_app_created, reports_app_status_created and
+// reports_app_site_created. For a query whose only usable term is `app_id`, all three give the
+// identical one-column seek and the identical cost, so SQLite's pick among them is a TIE-BREAK.
+// Pinning the winning name would make this file go red the first time a planner build, a new index
+// or `PRAGMA optimize` on a populated table breaks that tie differently, and nothing would be
+// wrong: same seek, same rows, same bill. A red nobody can act on gets deleted by whoever meets
+// it, which would cost the real assertion too. So the hard assertion is the seek term, which is
+// what decides the cost, and the name is checked only against the three that tie.
+//
+// TWO: THE IN LIST HAS TO BE THREE OR LONGER OR THE PIN IS WORTHLESS. Measured at IN-list sizes 1,
+// 2, 3 and 50: at one or two entries SQLite takes the UNIQUE reports_fp and seeks on
+// (fingerprint), and AT THREE IT SWITCHES to seeking on (app_id) alone and testing the fingerprint
+// per row. Real batches are 25 items and real sync chunks are 50, so the wide plan is the one
+// production runs, and a pin written with a two-element list would have pinned the good plan that
+// nothing executes and passed forever. Both sides of the threshold are pinned below, because the
+// threshold is the finding.
+//
+// WHAT THIS DOES NOT PIN. The `rows_read` these plans cost: that is through the route, in
+// tests/local-d1-rows.test.mjs, which is why POST /open-items reports rows_read at all.
+
+/** The three indexes that tie for a bare `app_id` seek: app_id leading, no partial predicate. */
+const APP_LEADING = ['reports_app_created', 'reports_app_status_created', 'reports_app_site_created'];
+/** The UNIQUE index on the fingerprint. A28's rule applies here too: this is a measurement. */
+const FP_UNIQUE = ['reports_fp'];
+
+const SEEK_LINE = /^SEARCH reports USING INDEX (\S+) (\(.+\))$/;
+
+/** Three fingerprints of rows seedOpenItems already imported, and three of rows nobody has. The
+ *  refs are #901 to #903: `openBatch` marks every fourth item closed at its source, so #900 is
+ *  closed and these three are not, which keeps every statement below a no-op on this fixture. */
+const LIVE_REFS = ['#901', '#902', '#903'];
+
+async function fingerprints(refs) {
+  return await Promise.all(refs.map((ref) => sha256Hex(openFingerprintInput('queue', ref))));
+}
+
+/** `wrangler d1 execute` takes no parameters, so an IN list is rendered as literals. */
+const inList = (values) => values.map((v) => `'${v}'`).join(',');
+
+test('A36 finding A: the import and sync statements seek where they are pinned to seek', async () => {
+  const live = await fingerprints(LIVE_REFS);
+  const absent = ['no-such-fingerprint-1', 'no-such-fingerprint-2', 'no-such-fingerprint-3'];
+
+  const pins = [
+    {
+      name: 'openImport, dedupe read, batch of 3',
+      seek: '(app_id=?)',
+      anyOf: APP_LEADING,
+      sql: `SELECT fingerprint, source_closed_at FROM reports WHERE app_id = 'fleet' AND fingerprint IN (${inList(live)})`,
+    },
+    {
+      name: 'openImport, dedupe read, batch of 2',
+      seek: '(fingerprint=?)',
+      anyOf: FP_UNIQUE,
+      sql: `SELECT fingerprint, source_closed_at FROM reports WHERE app_id = 'fleet' AND fingerprint IN (${inList(live.slice(0, 2))})`,
+    },
+    {
+      name: 'openImport, the close mark, one fingerprint',
+      seek: '(fingerprint=?)',
+      anyOf: FP_UNIQUE,
+      sql: `UPDATE reports SET source_closed_at = 1 WHERE app_id = 'fleet' AND fingerprint = '${absent[0]}' AND source_closed_at IS NULL`,
+    },
+    {
+      name: 'openSync, the open items of one source',
+      seek: '(app_id=?)',
+      anyOf: APP_LEADING,
+      sql: `SELECT fingerprint, source_ref FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND source = 'queue' AND source_closed_at IS NULL`,
+    },
+    {
+      name: 'openSync, the chunked close, 3 fingerprints',
+      seek: '(app_id=?)',
+      anyOf: APP_LEADING,
+      sql: `UPDATE reports SET source_closed_at = 1 WHERE app_id = 'fleet' AND source_closed_at IS NULL AND fingerprint IN (${inList(absent)})`,
+    },
+  ];
+
+  const sets = await d1(...pins.map((pin) => `EXPLAIN QUERY PLAN ${pin.sql}`));
+  for (const [i, pin] of pins.entries()) {
+    const detail = sets[i].map((row) => row.detail).join(' | ');
+    const parsed = SEEK_LINE.exec(detail);
+    assert.ok(parsed, `${pin.name} no longer plans onto a single index SEARCH: ${detail}`);
+    const [, index, seek] = parsed;
+    // The assertion that matters. A change here is a change in what the database reads.
+    assert.equal(seek, pin.seek, `${pin.name} seeks ${seek} where it sought ${pin.seek}: this is a cost change, not a tie-break`);
+    // And the softer one, with its own message so the two are never confused.
+    assert.ok(
+      pin.anyOf.includes(index),
+      `${pin.name} seeks ${seek} on ${index}, which is not one of ${pin.anyOf.join(', ')}. If the seek above is unchanged this is a tie broken differently and costs nothing: add the index to the list rather than deleting the test.`,
+    );
+  }
+});
+
+test('A36 finding A: the two import transcriptions are the store\'s own statements', async () => {
+  // The companion discipline the ten plans above already have: a pinned plan for a statement the
+  // Worker does not run is worth nothing. Both SELECTs are run and their answers compared with
+  // what the ROUTES say, on the same database, with the tenant fixture in it.
+  const live = await fingerprints(LIVE_REFS);
+  const [dedupe, syncRead] = await d1(
+    `SELECT fingerprint, source_closed_at FROM reports WHERE app_id = 'fleet' AND fingerprint IN (${inList(live)})`,
+    `SELECT fingerprint, source_ref FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND source = 'queue' AND source_closed_at IS NULL`,
+  );
+
+  // The dedupe read: the three fingerprints the Worker computes for these three refs are exactly
+  // the three rows the transcription finds, and re-importing the same three items is the route
+  // saying so in its own counters. Nothing is written: the items are unchanged and unclosed.
+  assert.deepEqual(dedupe.map((r) => r.fingerprint).sort(), [...live].sort(), 'the dedupe transcription did not find the rows the Worker fingerprinted');
+  const items = LIVE_REFS.map((ref, i) => ({ ref, text: `Seeded tracker line ${i + 1}: unchanged on purpose, this import writes nothing`, opened_at: Date.UTC(2026, 7, 1), closed_at: null }));
+  const reimport = await call('/open-items', { method: 'POST', body: { v: 1, source: 'queue', items }, token: AI_TOKEN });
+  assert.equal(reimport.res.status, 200, JSON.stringify(reimport.body));
+  assert.equal(reimport.body.created, 0, 'the three refs this test reuses were not already imported, so it measures nothing');
+  assert.equal(reimport.body.unchanged, LIVE_REFS.length, `the re-import reported ${JSON.stringify(reimport.body)}`);
+  assert.equal(reimport.body.closed + reimport.body.reopened, 0, 'the transcription test changed the fixture');
+
+  // The sync read: every open item of this source, which is what the desk lists as kind=open with
+  // no close mark on it. Set equality on the ref, because the two statements project differently.
+  const desk = await call('/reports?kind=open&limit=50', { token: TOKEN, ip: '192.0.2.114' });
+  const deskOpen = desk.body.reports.filter((r) => !r.source_closed_at).map((r) => r.source_ref).sort();
+  assert.deepEqual(syncRead.map((r) => r.source_ref).sort(), deskOpen, 'the sync transcription does not see the rows the desk calls open');
+  assert.ok(deskOpen.length >= 3, `only ${deskOpen.length} open items, so this comparison is weak`);
+
+  // THE TWO UPDATE TRANSCRIPTIONS ARE NOT PROVED THIS WAY AND CANNOT BE. Running a write here
+  // would change the fixture every test after it reads. They are pinned above with fingerprints
+  // nobody holds, so EXPLAIN QUERY PLAN answers and nothing is written; what that leaves unproved
+  // is that their TEXT still matches src/store-open.js. The behaviour is asserted over node:sqlite
+  // in tests/open-store.test.mjs (RECHECK 66) and the tenant term in tests/tenant-predicates.test.mjs,
+  // so the gap is narrow and named: a rewrite of either WHERE would pass here. Closing it needs a
+  // rollback-capable path to the local database, which this harness does not have.
 });

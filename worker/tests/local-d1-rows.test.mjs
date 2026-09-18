@@ -29,7 +29,7 @@ import {
 // The tenant fixture, the floor an unscoped plan cannot get under, and the one-statement query
 // helper, all in ./tenant-rows.mjs. Read its header before changing any ceiling below: the
 // measured pairs that make these cases discriminate are recorded there.
-import { plantTenant, d1For, PLANTED_AT, TENANT_ROWS, UNSCOPED_FLOOR } from './tenant-rows.mjs';
+import { plantTenant, d1For, PLANTED_AT, TENANT_ROWS, TENANT_FIXED, UNSCOPED_FLOOR } from './tenant-rows.mjs';
 import { TENANT, TENANT_MARK } from './tenant-fixture.mjs';
 import { rowsReadBudget } from '../src/store.js';
 
@@ -309,6 +309,8 @@ test('the tenant fixture reaches no reader through any route this Worker serves'
   // exact range the public log reads.
   const surfaces = [
     call('/log?limit=50'),
+    call('/board?limit=50'),
+    call('/board/summary'),
     call('/health'),
     call('/reports?limit=50', { token: TOKEN, ip: '192.0.2.120' }),
     call('/reports?status=fixed&limit=50', { token: TOKEN, ip: '192.0.2.120' }),
@@ -321,4 +323,156 @@ test('the tenant fixture reaches no reader through any route this Worker serves'
     assert.ok(!text.includes(TENANT_MARK), `a route answered with a tenant row: ${text.slice(0, 400)}`);
     assert.ok(!text.includes(TENANT), `a route answered with a tenant app id: ${text.slice(0, 400)}`);
   }
+});
+
+// ── Phase 2 pass 0: what the two board reads cost, and what that number grows with ────────────
+//
+// Review condition C2 asked for warnRowsRead on GET /board and GET /board/summary, on the reading
+// that /board has a `limit` so rowsReadBudget applies to it. It does not, and these two tests are
+// why the call was not made. src/routes-open.js carries the argument; this is the measurement.
+//
+// MEASURED 2026-09-18 through the two routes, in a fleet-only database, at four populations from
+// one published entry to ninety-nine. O is published entries at accepted, R is published fleet
+// rows at fixed of either kind:
+//
+//   GET /board            rows_read = 2 x O + R + 2       identical at limit=5 and limit=50
+//   GET /board/summary    rows_read = O + 2 x R + 3       it has no limit at all
+//
+// Neither is a function of `limit`, and both grow without bound as the board is used: /board went
+// past rowsReadBudget(50) at 61 published entries, which is an ordinary board. So a constant is
+// either a warning an operator meets in normal service and deletes, or one that detects nothing.
+// The equality below is the instrument instead. It says nothing about how busy the board is and
+// everything about what one row costs, which is the regression this file exists to catch.
+//
+// THE R TERM IS NOT SCOPED, and that is the finding rather than a detail. Both reads seek on
+// (status, public) through reports_public_log, which leads on neither app_id nor kind, so the
+// walk includes the fixture's TENANT_FIXED fixed-and-public rows and rejects them one at a time.
+// The six indexes of 0004_tenants.sql do not cover this: the scoped twin for the log,
+// reports_app_fix_public_log, is partial on `kind <> 'open'` and both board queries carry
+// `kind = 'open'`, so it is not a candidate for either of them. Reported to delivery-lead for
+// data-engineer; constraint 3 of this pass forbids adding the index here.
+
+/** What harness.seedPublished leaves behind, which is the whole published population of this
+ *  fixture: one open item at accepted, and two rows at fixed (a correction and an open item).
+ *  Asserted from the routes below rather than trusted, because the ceilings are formulas in it. */
+const PUBLISHED_OPEN = 1;
+const PUBLISHED_FIXED = 2;
+
+test('C2: the board fixture holds the published population the two laws below are written in', async () => {
+  const { body } = await call('/board/summary');
+  assert.equal(body.open, PUBLISHED_OPEN, `the summary counts ${body.open} open entries, not ${PUBLISHED_OPEN}: re-measure the two laws before touching them`);
+  assert.equal(body.resolved, PUBLISHED_FIXED - 1, 'the summary counts a resolution this fixture did not publish');
+  assert.equal(body.in_progress, 0, 'the work queue reached this fixture, so the board laws are measuring something else');
+});
+
+test('C2: GET /board scans the same rows at limit=5 as at limit=50, so no budget keyed on limit bounds it', async () => {
+  // The direct refutation of C2's premise, and the cheapest thing in this file to keep true.
+  // The open half sorts on opened_at while reports_board ends in created_at, so SQLite fills a
+  // temp b-tree from every matching entry BEFORE the LIMIT applies. Read it as: the page size a
+  // caller asks for does not change what the database does.
+  const five = await call('/board?limit=5');
+  const fifty = await call('/board?limit=50');
+  assert.equal(five.res.status, 200);
+  assert.equal(fifty.res.status, 200);
+  assert.equal(
+    five.body.rows_read, fifty.body.rows_read,
+    `a page of 5 scanned ${five.body.rows_read} and a page of 50 scanned ${fifty.body.rows_read}: /board has become bounded by its limit, which would mean the open list stopped needing a temp b-tree. Good news, and it makes rowsReadBudget applicable for the first time.`,
+  );
+});
+
+test('C2: both board reads cost exactly what the measured law says, per row and not per page', async () => {
+  // Equality, not a ceiling. A ceiling on a number that grows with the board is a ceiling that
+  // eventually fires for no reason; equality on the law fires when the COST OF A ROW changes,
+  // which is the only thing a plan regression can do here.
+  //
+  // FIXED_PUBLIC is the unscoped term: every fixed, public row in the table, the tenant's
+  // included, because reports_public_log leads on neither app_id nor kind. If a scoped index
+  // ever serves these two reads, both numbers drop by TENANT_FIXED and both assertions go red
+  // with the arithmetic in the message. That is the intended red, not a regression.
+  const FIXED_PUBLIC = TENANT_FIXED + PUBLISHED_FIXED;
+  const board = await call('/board?limit=50');
+  const summary = await call('/board/summary');
+
+  const boardLaw = 2 * PUBLISHED_OPEN + FIXED_PUBLIC + 2;
+  assert.equal(
+    board.body.rows_read, boardLaw,
+    `GET /board scanned ${board.body.rows_read}, and the law 2xO + R + 2 with O=${PUBLISHED_OPEN} and R=${FIXED_PUBLIC} says ${boardLaw}. Either the plan moved or the fixture did; re-measure before adjusting the number.`,
+  );
+  const summaryLaw = PUBLISHED_OPEN + PUBLISHED_FIXED + FIXED_PUBLIC + 3;
+  assert.equal(
+    summary.body.rows_read, summaryLaw,
+    `GET /board/summary scanned ${summary.body.rows_read}, and the law O + R_fleet + R_all + 3 with O=${PUBLISHED_OPEN}, R_fleet=${PUBLISHED_FIXED} and R_all=${FIXED_PUBLIC} says ${summaryLaw}.`,
+  );
+
+  // And the number these two routes report is above the floor the five cases above are built
+  // around, which is what makes this a finding rather than a note. Asserted as a comparison so
+  // the message carries both numbers when it changes in either direction.
+  assert.ok(
+    board.body.rows_read > UNSCOPED_FLOOR,
+    `GET /board scanned ${board.body.rows_read}, at or under the ${UNSCOPED_FLOOR} row floor: an index now covers the resolved list, so this test and the two laws above need re-measuring and this assertion should be inverted.`,
+  );
+});
+
+test('C2: the board answers 200 with its full cache policy while it is reading 300 rows', async () => {
+  // The other half of C2: whatever is done about cost, it may not touch the answer. These two
+  // routes are cached for five minutes and answer any origin (A8), so a header lost here is a
+  // fleet-wide breakage that no other assertion in this file would see.
+  for (const path of ['/board?limit=50', '/board/summary']) {
+    const { res } = await call(path);
+    assert.equal(res.status, 200, `${path} did not answer 200`);
+    assert.equal(res.headers.get('cache-control'), 'public, max-age=300', `${path} lost its cache policy`);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*', `${path} stopped answering any origin`);
+  }
+});
+
+// ── Phase 2 pass 0: what an import batch costs, and what that number grows with ────────────────
+//
+// POST /open-items was the last read in this Worker with no rows_read on it, which is why
+// upsertOpenItems now returns one. A36 finding A is why it matters here rather than only in the
+// plans file: the dedupe read is the one statement whose cost is NOT the size of what the caller
+// sent. Measured with make d1-query at IN-list sizes 1, 2, 3 and 50, and pinned by seek shape in
+// tests/local-d1-plans.test.mjs: at one or two items it seeks the UNIQUE reports_fp on
+// (fingerprint), and at THREE it switches to seeking (app_id) alone and testing the fingerprint
+// per row. Real batches are 25.
+//
+// So the two assertions below are one fact in two halves: a batch of one costs one row, and a batch
+// of three costs the whole of the fleet's half of the table. That is the regression made visible.
+// It is not fixed here: the fix is an index and an index is not this file's to add.
+
+/** Three refs `seedOpenItems` already imported and `openBatch` did NOT mark closed at its source
+ *  (every fourth one is), so re-importing them with no closed_at writes nothing at all: three
+ *  unchanged items, no INSERT, no UPDATE, and the only statement that runs is the dedupe read. */
+const REIMPORT_REFS = ['#901', '#902', '#903'];
+
+const reimport = async (refs) => {
+  const items = refs.map((ref) => ({ ref, text: `Seeded tracker line for ${ref}: re-imported to measure the dedupe read`, opened_at: Date.UTC(2026, 7, 1), closed_at: null }));
+  const { res, body } = await call('/open-items', { method: 'POST', body: { v: 1, source: 'queue', items }, token: AI_TOKEN });
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(body.created, 0, `a ref this test reuses was not already imported: ${JSON.stringify(body)}`);
+  assert.equal(body.unchanged, refs.length, `the re-import wrote something: ${JSON.stringify(body)}`);
+  assert.equal(body.closed + body.reopened, 0, 'the measurement changed the fixture');
+  assert.equal(typeof body.rows_read, 'number', 'POST /open-items does not report rows_read');
+  return body.rows_read;
+};
+
+test('A36 finding A: an import of three items scans the fleet, and an import of one scans one row', async () => {
+  const one = await reimport(REIMPORT_REFS.slice(0, 1));
+  const three = await reimport(REIMPORT_REFS);
+  const FLEET_ROWS = SEEDED + OPEN_SEEDED;
+
+  assert.ok(one <= 2, `a one-item batch scanned ${one} rows, so it is no longer taking the UNIQUE reports_fp`);
+  assert.equal(
+    three, FLEET_ROWS,
+    `a three-item batch scanned ${three} rows and the fleet has ${FLEET_ROWS}: the dedupe read is meant to walk all of them under the (app_id=?) seek pinned in tests/local-d1-plans.test.mjs. A LOWER number is good news and means an index now serves the fingerprint term, at which point re-measure this file and that pin together.`,
+  );
+  assert.ok(
+    three > one * 3,
+    `three items cost ${three} and one cost ${one}, so the cost is now proportional to the batch and the finding has been fixed`,
+  );
+  // And the walk is the FLEET's rows and not the table's: the tenant literal in the dedupe read is
+  // what keeps 600 planted rows out of a number the importer pays for on every run.
+  assert.ok(
+    three < TENANT_ROWS,
+    `a three-item batch scanned ${three} rows of a table holding ${TENANT_ROWS} tenant rows besides: the dedupe read has lost its app_id term`,
+  );
 });

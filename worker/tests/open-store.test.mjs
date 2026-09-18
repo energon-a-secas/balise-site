@@ -63,6 +63,13 @@ async function reached(db, limit) {
   return ids.size;
 }
 
+/** The four counters an import reports, WITHOUT `rowsRead`. The counters are a property of the
+ *  code and reproduce over node:sqlite; `rowsRead` is a D1 measurement, and ./sqlite-d1.mjs's
+ *  stand-in for it is the number of rows a statement RETURNED, which is not what D1 counts. So it
+ *  is asserted where it is real, through the route in tests/local-d1-rows.test.mjs, and dropped
+ *  here rather than compared against a fiction. */
+const counters = ({ created, unchanged, closed, reopened }) => ({ created, unchanged, closed, reopened });
+
 /** A route's answer, read the way the importer reads it. */
 async function answer(response) {
   const body = await response.json();
@@ -76,7 +83,7 @@ test('an import batch is one read and one write per item, and every row it write
   const db = sqliteD1();
   let from = db.log.length;
   assert.deepEqual(
-    await upsertOpenItems(db, { source: 'queue', items: lines(1, IMPORT_BATCH_MAX), now: T }),
+    counters(await upsertOpenItems(db, { source: 'queue', items: lines(1, IMPORT_BATCH_MAX), now: T })),
     { created: IMPORT_BATCH_MAX, unchanged: 0, closed: 0, reopened: 0 },
   );
   const full = spent(db, from);
@@ -87,7 +94,7 @@ test('an import batch is one read and one write per item, and every row it write
   await upsertOpenItems(db, { source: 'harness', items: lines(101, IMPORT_BATCH_MAX), now: T });
   from = db.log.length;
   assert.deepEqual(
-    await upsertOpenItems(db, { source: 'queue', items: lines(1, IMPORT_BATCH_MAX), now: T }),
+    counters(await upsertOpenItems(db, { source: 'queue', items: lines(1, IMPORT_BATCH_MAX), now: T })),
     { created: 0, unchanged: IMPORT_BATCH_MAX, closed: 0, reopened: 0 },
   );
   assert.equal(spent(db, from).statements, 1, 'a batch with nothing to write sent more than its one read');
@@ -160,7 +167,15 @@ test('RECHECK 66: a sync naming one ref closes a whole source, and the next hone
   const db = sqliteD1();
   const env = { DB: db };
   const DONE_AT = Date.UTC(2026, 8, 3);
-  const run = (items, now) => openImport(env, { v: 1, source: 'queue', items }, { origin: null, now }).then(answer);
+  // `rows_read` comes off the body for the reason `counters` exists above: over ./sqlite-d1.mjs
+  // the number is a row count rather than D1's scan count, so this file asserts that the field is
+  // there and a number, and tests/local-d1-rows.test.mjs asserts what it says.
+  const run = async (items, now) => {
+    const body = await answer(await openImport(env, { v: 1, source: 'queue', items }, { origin: null, now }));
+    assert.equal(typeof body.rows_read, 'number', 'POST /open-items stopped reporting rows_read');
+    delete body.rows_read;
+    return body;
+  };
   const sync = (refs, now) => openSync(env, { source: 'queue', refs }, { origin: null, now }).then(answer);
 
   // The tracker: #1 to #24 open and #25 done in one batch, and #26 open in a second.

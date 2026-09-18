@@ -43,27 +43,42 @@
 //      0004_tenants.sql (A28 has the numbers and why that cost is accepted knowingly).
 //      tests/open-items.test.mjs asserts the desk and board budgets.
 //
-//      THE IMPORT AND SYNC STATEMENTS ARE NOT PINNED, AND THE FLEET TERM MOVED THREE OF THEM.
-//      Measured 2026-09-18 with make d1-query, each against the same statement without the
-//      term. The two UPDATEs keyed by fingerprint and the sync's chunked write are unmoved: all
-//      three still seek the UNIQUE reports_fp from 0001 on (fingerprint). The three reads did
-//      move, and only the first of them costs anything worth writing down:
+//      THE FLEET TERM MOVED FOUR OF THESE STATEMENTS, AND WHICH FOUR DEPENDS ON THE BATCH SIZE.
+//      Re-measured 2026-09-18 with make d1-query, each statement against itself without the term,
+//      and at IN-list sizes 1, 2, 3 and 50. The threshold is the part that matters: a statement
+//      whose fingerprint term is `= ?` keeps the UNIQUE reports_fp, and so does an IN list of one
+//      or two entries, but AT THREE ENTRIES SQLITE ABANDONS reports_fp AND SEEKS ON app_id ALONE.
 //
-//        the dedupe read below    reports_app_site_created on (app_id), where it sought
-//                                 reports_fp on (fingerprint) before the term. It now walks the
-//                                 fleet's rows instead of taking one index entry per
-//                                 fingerprint, which is the widest change this file took.
+//        the dedupe read below    IN 1 or 2: reports_fp on (fingerprint). IN 3 or more:
+//                                 reports_app_site_created on (app_id), walking the fleet's half
+//                                 of the table and testing the fingerprint per row. The real
+//                                 batches are 25, so this is the plan production runs.
+//        the sync's chunked write  the same threshold and the same pair of plans. The chunks are
+//                                 50, so again the wide plan is the one that runs. An earlier
+//                                 reading of this file said this write was unmoved; that was
+//                                 measured with a short IN list and it is wrong.
 //        the sync's read          reports_app_site_created on (app_id), where it took
 //                                 reports_open_status_created on (kind): one prefix seek for
 //                                 another, on terms that both match nearly every row.
 //        the INSERT's inner MAX   reports_app_created on (app_id), where it had a covering seek
 //                                 on reports_open_created. Still one indexed MAX per row.
 //
-//      No test pins any of those three and neither import route has a rows_read budget, so
-//      nothing would tell you if they moved again: this paragraph is the whole record, which is
-//      a gap rather than a plan. Also note that reports_app_site_created is what serves the
-//      first two, so it is not the dead weight A21 took it for. And do not move a term to
-//      change any of this: A28 settled that position is not the mechanism, presence is.
+//      The two single-fingerprint UPDATEs (close and reopen) are genuinely unmoved: `= ?` on a
+//      UNIQUE index, reports_fp, at any batch size.
+//
+//      ALL THREE WIDE PLANS ARE NOW PINNED, by SEEK SHAPE rather than by index name, in
+//      tests/local-d1-plans.test.mjs, which carries the argument for that choice and the reason
+//      every IN list there is three long; the cost is pinned through the route in
+//      tests/local-d1-rows.test.mjs, which is why upsertOpenItems returns rowsRead and
+//      POST /open-items reports it. This paragraph is no longer the whole record.
+//
+//      Note also that reports_app_site_created is what serves the wide plans, so it is not the
+//      dead weight A21 took it for. And do not move a term to change any of this: A28 settled
+//      that position is not the mechanism, presence is.
+//
+//      WHAT WOULD FIX IT IS AN INDEX, AND AN INDEX IS NOT THIS FILE'S TO ADD. Reported to
+//      delivery-lead in the phase 2 pass 0 report for data-engineer. Do not "fix" the dedupe read
+//      by dropping the tenant term: the comment on the statement says what the term is for.
 //
 // D1 also caps BOUND PARAMETERS per query at 100, which is why the sync route resolves
 // what to close in JS from one small SELECT instead of sending the whole ref set into a
@@ -114,7 +129,7 @@ export function dayStamp(ms) {
 // ── The import route ──────────────────────────────────────────────────────────
 
 /**
- * Upsert one batch. Returns { created, unchanged, closed, reopened }.
+ * Upsert one batch. Returns { created, unchanged, closed, reopened, rowsRead }.
  *
  * NOTHING HERE PUBLISHES, and nothing here can. The route that calls this writes
  * `status = 'new'` as a literal, and 'new' is private on both feeds. An imported row
@@ -136,9 +151,25 @@ export function dayStamp(ms) {
  * left refs out or a `closed_at` sent by mistake, heals on the next honest import.
  */
 export async function upsertOpenItems(db, { source, items, now }) {
-  if (!items.length) return { created: 0, unchanged: 0, closed: 0, reopened: 0 };
+  if (!items.length) return { created: 0, unchanged: 0, closed: 0, reopened: 0, rowsRead: 0 };
 
   const prints = await Promise.all(items.map((item) => sha256Hex(openFingerprintInput(source, item.ref))));
+
+  /* WHAT THIS BATCH COSTS IN ROWS SCANNED, and why the number leaves the store (phase 2 pass 0).
+   *
+   * Summed across every statement this function runs and returned, so POST /open-items reports it
+   * the way /reports, /log, /board and /work already do. It is not a nicety here: the dedupe read
+   * below plans onto `app_id` alone as soon as the IN list reaches three entries, so its cost is
+   * the size of the FLEET's half of the table and not the size of the batch. Nothing in this
+   * repository could see that before, because the importer's route was the one read with no
+   * rows_read on it. Measured and pinned in tests/local-d1-rows.test.mjs; the plans are pinned in
+   * tests/local-d1-plans.test.mjs. A4's warnRowsRead is deliberately NOT called on it: a batch has
+   * a size but not a `limit`, and rowsReadBudget is a budget for a page. */
+  let rowsRead = 0;
+  const spent = (res) => {
+    if (res && res.meta && typeof res.meta.rows_read === 'number') rowsRead += res.meta.rows_read;
+    return res;
+  };
 
   let existing;
   try {
@@ -156,6 +187,7 @@ export async function upsertOpenItems(db, { source, items, now }) {
       )
       .bind(...prints)
       .run();
+    spent(res);
     existing = new Map((res.results || []).map((r) => [r.fingerprint, r]));
   } catch (err) {
     return storeError('open items read', err);
@@ -230,6 +262,7 @@ export async function upsertOpenItems(db, { source, items, now }) {
             item.closed_at || null,
           )
           .run();
+        spent(res);
         if (res.meta && res.meta.changes > 0) created += 1;
         else unchanged += 1;
       } catch (err) {
@@ -252,6 +285,7 @@ export async function upsertOpenItems(db, { source, items, now }) {
         // the database had declined: the tenant literal is a third way for this UPDATE to match
         // no row, so a row handed to a tenant between the read and this write answered
         // `closed: 1` while its mark stayed where it was.
+        spent(res);
         if (res.meta && res.meta.changes > 0) closed += 1;
         else unchanged += 1;
       } catch (err) {
@@ -270,6 +304,7 @@ export async function upsertOpenItems(db, { source, items, now }) {
                      WHERE app_id = 'fleet' AND fingerprint = ? AND source_closed_at IS NOT NULL`)
           .bind(fingerprint)
           .run();
+        spent(res);
         if (res.meta && res.meta.changes > 0) reopened += 1;
         else unchanged += 1;
       } catch (err) {
@@ -281,7 +316,7 @@ export async function upsertOpenItems(db, { source, items, now }) {
     unchanged += 1;
   }
 
-  return { created, unchanged, closed, reopened };
+  return { created, unchanged, closed, reopened, rowsRead };
 }
 
 /**
@@ -423,8 +458,22 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
 
 /**
  * GET /board/summary: how many published open entries, how many of those are moving, how
- * many resolutions in the window, and the newest resolution's sentence. Two queries, both
- * on the index that serves the board.
+ * many resolutions in the window, and the newest resolution's sentence. Two queries, on two
+ * DIFFERENT indexes, and neither of them is the index that serves the open half of the board.
+ *
+ * That opening line read "Two queries, both on the index that serves the board" until phase 2,
+ * and A28's own measurement fifteen lines below it had already refuted it (A36 finding C). The
+ * four board plans, all pinned in tests/local-d1-plans.test.mjs:
+ *
+ *   /board, open list      reports_board                 three-term seek, plus a temp b-tree
+ *   /board, resolved list  reports_public_log
+ *   summary, counts        reports_app_status_created    the literal's cost, below
+ *   summary, latest        reports_public_log            the one index the two routes share
+ *
+ * So "both" was wrong, "the index" was wrong, and one of the two is an index no board query
+ * touches. The sentence was true when it was written and the measurement that made it false was
+ * added UNDERNEATH it rather than over it. A docstring's first line is what a reader believes,
+ * so a measurement that contradicts one is an edit to it and not a paragraph after it.
  *
  * PUBLISHED ROWS ONLY. Every term carries `public = 1` and a published status. A number
  * that moved when a private draft moved would let anyone watching it learn when the desk is

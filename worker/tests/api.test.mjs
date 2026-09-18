@@ -23,6 +23,9 @@ import {
   STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition, rowsReadBudget,
   normaliseForFingerprint,
 } from '../src/store.js';
+// From src/budget.js rather than through the re-export in src/store.js, on purpose: this
+// assertion is about the function itself and not about what the store hands on.
+import { warnRowsRead } from '../src/budget.js';
 // `publicLog` moved to src/store-public.js with the C6 split: the two queries a stranger can
 // reach take the literal 'fleet' rather than a bound scope (C6.5), and that rule is now a
 // property of a file. Only the path changed here; every expectation below is untouched.
@@ -278,6 +281,34 @@ test('A4: the rows_read budget grows with the page and stays a small multiple of
   assert.ok(rowsReadBudget(25) < 200);
   assert.ok(rowsReadBudget(50) < 200);
   assert.ok(rowsReadBudget(1) < rowsReadBudget(50));
+});
+
+test('C2: warnRowsRead observes and returns nothing, on both arms', () => {
+  // One of its two callers is GET /log, which is public and cached for five minutes, so the
+  // rule this asserts is not a style preference: a warning that can change an answer is a
+  // warning nobody may leave switched on. Both arms must be indistinguishable to a caller,
+  // which means `undefined` on both and console.warn as the only effect.
+  //
+  // It is asserted HERE, with no database, because no population can put a keyset page over
+  // its own budget: /log reads exactly `limit` rows under every index the store has, measured
+  // in tests/local-d1-rows.test.mjs. The over-budget arm is unreachable through a route, so
+  // calling the function directly is the only way anyone sees it run at all.
+  const said = [];
+  const real = console.warn;
+  console.warn = (...args) => said.push(args.join(' '));
+  try {
+    assert.equal(warnRowsRead('log', 5, 25), undefined, 'the under-budget arm returned something to branch on');
+    assert.equal(said.length, 0, 'a page inside its budget was warned about');
+    assert.equal(warnRowsRead('log', 5000, 25), undefined, 'the over-budget arm returned something to branch on');
+    assert.equal(said.length, 1, 'a page over its budget was not warned about');
+    assert.match(said[0], /5000 rows for a page of 25, over the budget of 60/);
+    // A non-number is what a store error looks like on the way through: it must not warn and
+    // must not throw, because a route that already failed may not fail twice.
+    assert.equal(warnRowsRead('log', undefined, 25), undefined);
+    assert.equal(said.length, 1, 'a missing rows_read produced a warning');
+  } finally {
+    console.warn = real;
+  }
 });
 
 // ── The duplicate guard ───────────────────────────────────────────────────────

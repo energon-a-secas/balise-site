@@ -8,15 +8,30 @@
 // proves it holds an item by quoting its run id, every write repeats that id in its guard,
 // and a run that lost its lease is told so rather than overwriting the run that replaced it.
 //
-// C6: TWENTY-FOUR STATEMENTS AND ONE TENANT PREDICATE. Read this before adding either.
+// C6: TWENTY-FOUR STATEMENTS AND FIVE TENANT PREDICATES. Read this before adding either.
 //
-// The predicate is in CLAIMABLE below, written as the literal 'fleet' and repeated outside
-// the subquery exactly as the lease guard is. That one term is the gate: CLAIMABLE is the
-// only thing in this Worker that chooses an item nobody named, so it is the only statement
-// here that could reach a row the caller did not already have a handle on. A16 is what it
-// enforces: no tenant item ever enters the fleet work queue.
+// The first is in CLAIMABLE below, written as the literal 'fleet' and repeated outside the
+// subquery exactly as the lease guard is. That one term is the gate for a claim with no id:
+// CLAIMABLE is the only thing in this Worker that chooses an item nobody named, so it is the
+// only statement here that could reach a row the caller did not already have a handle on. A16
+// is what it enforces: no tenant item ever enters the fleet work queue.
 //
-// Every other statement carries NO predicate, and each says which of two invariants excuses
+// THE UNREAD WRITES, and why they are not the invariant's business (A17). The other four are on
+// the `reports` UPDATE of heartbeat, release, and both branches of land. Those three actions
+// take an `id` and a `run` from the caller and go STRAIGHT to the write: nothing reads the row
+// first, so before this pass the guard on a caller-supplied id was invariant 4.3 alone, and 4.3
+// is a claim about the table's contents rather than a term in a statement. The design document
+// classified all three as "none, inherited" (DESIGN.md 5.4), which was never true of them:
+// "inherited" is the SECOND statement of each batch, and the first is what it inherits from.
+// A single row whose tenancy changed after it entered the queue, by any route, and the write
+// lands on a tenant's report. That row should not exist, which is exactly the shape of argument
+// the literal costs one term to stop needing.
+//
+// submit is deliberately NOT among them, and that asymmetry is the point: it calls readRow(),
+// which carries the literal, before it decides anything, so a tenant row is notFound() and the
+// batch is never built. It is the one runner action the invariant genuinely covers.
+//
+// The remaining statements carry NO predicate, and each says which of two invariants excuses
 // it, because C6 admits no third answer:
 //
 //   INVARIANT 4.3   `work_state IS NOT NULL` implies `app_id = 'fleet'`. Every guard here
@@ -34,6 +49,14 @@
 // The invariant is ASSERTED, not assumed: tests/tenant-scope.test.mjs counts the rows that
 // would break it after a full exercise of this file and requires zero. If that count is ever
 // non-zero, the comments above stop being true and every guard here becomes a hole.
+//
+// And the four new literals are asserted the same way, not trusted: RUNNER_WRITES in
+// tests/tenant-predicates.test.mjs hands each of these three actions a queued row that is NOT
+// the fleet's and requires the write to decline, with the same call on the same row shape in the
+// fleet's tenancy as the control. It needs no reassignment hook, unlike every other case in that
+// file, and that is the whole finding: there is no read here to race. Neutering any one of the
+// four to `AND 1 = 1` turns exactly one of those tests red, proved by hand on 2026-09-18. A term
+// nobody has watched go red is not known to be load bearing.
 
 import { storeError } from './store.js';
 import { OPEN_KIND } from './store-open.js';
@@ -165,18 +188,19 @@ async function whyNotClaimable(db, id, actor, now) {
 
 /** heartbeat: extend the lease. A lease that ran out but was not yet reclaimed revives.
  *
- *  C6: no predicate on either statement. The first is INVARIANT 4.3, through
- *  `work_state = 'claimed'`; the second is INHERITED, conditioned by EXISTS on the row the
- *  first just wrote and on the stamp it set. The same pair, for the same two reasons, is in
- *  release, submit and land below, and each says so on itself. */
+ *  C6: the first statement carries the LITERAL (A17, see UNREAD WRITES above); the second is
+ *  INHERITED, conditioned by EXISTS on the row the first just wrote and on the stamp it set.
+ *  The same pair, for the same two reasons, is in release and land below, and each says so on
+ *  itself. submit is the odd one out and its own comment says why. */
 export async function heartbeatWork(db, { id, actor, run, leaseSeconds, now }) {
   const leaseUntil = now + leaseSeconds * 1000;
   try {
     const [moved] = await db.batch([
-      // C6: INVARIANT 4.3, through work_state = 'claimed'.
+      // C6: THE LITERAL, not invariant 4.3. This write never read the row it moves, so the
+      // invariant is the only thing standing between a caller-supplied id and a tenant row.
       db.prepare(
         `UPDATE reports SET work_lease_until = ?, work_updated_at = ?
-          WHERE id = ? AND work_state = 'claimed' AND work_run = ?`,
+          WHERE id = ? AND work_state = 'claimed' AND work_run = ? AND app_id = 'fleet'`,
       ).bind(leaseUntil, now, id, run),
       // C6: INHERITED. work_runs only, and the EXISTS names the row above and its stamp.
       db.prepare(
@@ -196,10 +220,11 @@ export async function heartbeatWork(db, { id, actor, run, leaseSeconds, now }) {
 export async function releaseWork(db, { id, actor, run, note, now }) {
   try {
     const [moved] = await db.batch([
-      // C6: INVARIANT 4.3, through work_state = 'claimed'.
+      // C6: THE LITERAL, not invariant 4.3, and for the same reason as heartbeat: nothing
+      // read this row before this statement moved it.
       db.prepare(
         `UPDATE reports SET work_state = 'approved', work_lease_until = NULL, work_updated_at = ?
-          WHERE id = ? AND work_state = 'claimed' AND work_run = ?`,
+          WHERE id = ? AND work_state = 'claimed' AND work_run = ? AND app_id = 'fleet'`,
       ).bind(now, id, run),
       // C6: INHERITED. work_runs only, and the EXISTS names the row above and its stamp.
       db.prepare(
@@ -237,7 +262,14 @@ export async function submitWork(db, { id, actor, run, outcome, summary, evidenc
   const sentence = row.kind === OPEN_KIND ? cleanSuggestion(suggestedNote) : '';
   try {
     const [moved] = await db.batch([
-      // C6: INVARIANT 4.3, through work_state = 'claimed'.
+      // C6: INVARIANT 4.3, through work_state = 'claimed', and it is sound HERE and not in
+      // heartbeat, release or land because of the readRow twelve lines above: submit is the
+      // only runner action that reads the row before it writes, and readRow carries the
+      // literal, so a tenant row is notFound() before this statement is built. It is the
+      // one runner write the invariant genuinely covers, which is why it is the one write
+      // A17 left alone. Do not "make it consistent" with its three neighbours by adding a
+      // term: the asymmetry is the argument, and RUNNER_WRITES in
+      // tests/tenant-predicates.test.mjs holds the read-back that keeps it honest.
       db.prepare(
         `UPDATE reports SET work_state = 'review', work_lease_until = NULL, work_updated_at = ?
           WHERE id = ? AND work_state = 'claimed' AND work_run = ?`,
@@ -266,10 +298,11 @@ export async function landWork(db, { id, actor, run, landed, refs, note, now }) 
   const action = landed ? 'land' : 'unland';
   const statements = landed
     ? [
-      // C6: INVARIANT 4.3, through work_state = 'accepted'.
+      // C6: THE LITERAL, not invariant 4.3. Nothing read this row first, and this is the
+      // write that marks an item DONE.
       db.prepare(
         `UPDATE reports SET work_state = 'done', work_updated_at = ?
-          WHERE id = ? AND work_state = 'accepted' AND work_run = ?`,
+          WHERE id = ? AND work_state = 'accepted' AND work_run = ? AND app_id = 'fleet'`,
       ).bind(now, id, run),
       // C6: INHERITED. work_runs only, and the EXISTS names the row above and its stamp.
       db.prepare(
@@ -279,10 +312,12 @@ export async function landWork(db, { id, actor, run, landed, refs, note, now }) 
       ).bind(now, refs.length ? JSON.stringify(refs) : null, note, run, id, id, run, now),
     ]
     : [
-      // C6: INVARIANT 4.3, through work_state = 'accepted'.
+      // C6: THE LITERAL, same as the land branch above. BOTH branches take it: a predicate on
+      // the arm that finishes an item and not on the arm that sends it back would be a guard
+      // that depends on which boolean the caller sent.
       db.prepare(
         `UPDATE reports SET work_state = 'review', work_updated_at = ?
-          WHERE id = ? AND work_state = 'accepted' AND work_run = ?`,
+          WHERE id = ? AND work_state = 'accepted' AND work_run = ? AND app_id = 'fleet'`,
       ).bind(now, id, run),
       // C6: INHERITED. work_runs only, and the EXISTS names the row above and its stamp.
       db.prepare(

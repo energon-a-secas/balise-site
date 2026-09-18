@@ -5,6 +5,14 @@
 // Every authenticated route calls authenticate() and nothing else. /report, /log, /board
 // and /board/summary NEVER import this file: a public route that also honours a credential
 // is one refactor away from leaking the queue.
+//
+// THAT SENTENCE IS NOW TRUE OF THE FILES AND NOT ONLY OF THE FUNCTIONS. It used to be a claim
+// about four handlers inside src/index.js, which imported this module for the desk, so nothing
+// could check it. src/routes-public.js and src/routes-open.js hold the credential-free route
+// bodies and neither imports this file; src/routes-desk.js is the only file in the Worker that
+// does, and src/index.js no longer does either. `actorKey` moved to src/keys.js to make that
+// so: it is the key the ingest rate limit and the C3 lockout share, so a credential-free route
+// needing it was the one thing forcing /report to import the authentication module.
 
 import { checkLock, recordAuthResult } from './store-auth.js';
 
@@ -18,17 +26,6 @@ const AUTH_GENERIC = {
 
 async function sha256Bytes(input) {
   return new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(input)));
-}
-
-/**
- * The key both the rate limit binding and the C3 lockout count against. The salted hash
- * when a salt is bound, the raw address when it is not, and one shared bucket when there
- * is no address at all. That last case is local development and curl from the same box:
- * everyone shares a bucket, which is stricter than production rather than looser.
- */
-export function actorKey(hashed, ip) {
-  if (hashed) return hashed;
-  return ip ? `ip:${ip}` : 'anonymous';
 }
 
 /**

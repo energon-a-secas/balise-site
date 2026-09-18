@@ -12,6 +12,14 @@
 //
 // `message` and `hint` are shown to a person verbatim. Every hint ends by naming
 // something the person can still do.
+//
+// readJson() and tooLarge() are at the foot of this file rather than in a module of their
+// own. They were in src/index.js until the router was split out of the handlers, and they
+// belong here because every outcome either one has is a C2 envelope: readJson returns a
+// parsed value or one of the three envelopes above, and tooLarge IS an envelope. Nothing
+// about reading a body under a cap is a route's business, so no route file owns a copy.
+
+import { REQUEST_MAX_BYTES } from './validate.js';
 
 /**
  * Every code this Worker can put in an error envelope.
@@ -151,4 +159,42 @@ export function ok(provider, body, { origin = null, env = null, headers = {} } =
 export function fail(code, { provider = '', message, hint = '', origin = null, env = null, cors = true, headers = {} } = {}) {
   const merged = { 'Cache-Control': 'no-store', ...headers, ...(cors ? corsHeaders(origin, env) : {}) };
   return json({ ok: false, code, provider, message, hint }, HTTP_FOR[code] || 502, merged);
+}
+
+// ── The request body, read under a cap ────────────────────────────────────────
+
+export const tooLarge = (provider, origin, env, maxBytes, hint) =>
+  fail('TOO_LARGE', {
+    provider,
+    origin,
+    env,
+    message: `The request is over ${maxBytes / 1024} KB, which this service refuses before reading it.`,
+    hint: hint || 'Shorten the report to a couple of paragraphs and send it again.',
+  });
+
+/**
+ * Read a JSON body under a byte cap: 8 KB on every route but the work actions, which pass
+ * WORK_REQUEST_MAX_BYTES because a result's summary and evidence do not fit in 8 KB.
+ * Content-Length is checked first so an oversized request is refused before anything is
+ * read; a chunked request has no Content-Length, so the decoded length is checked as well.
+ *
+ * `allowEmpty` is for the work actions, where a body-less POST (withdraw) means "no
+ * fields" rather than a malformed request. Every other route keeps refusing an empty body.
+ */
+export async function readJson(request, provider, origin, env, { allowEmpty = false, maxBytes = REQUEST_MAX_BYTES, tooLargeHint } = {}) {
+  const declared = Number(request.headers.get('Content-Length') || '0');
+  if (declared > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
+  let text;
+  try {
+    text = await request.text();
+  } catch {
+    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body could not be read.', hint: 'Send it again from the beacon.' }) };
+  }
+  if (new TextEncoder().encode(text).length > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
+  if (allowEmpty && !text.trim()) return { value: {} };
+  try {
+    return { value: JSON.parse(text) };
+  } catch {
+    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body was not valid JSON.', hint: 'Reopen the beacon on the page you were reading and send it again.' }) };
+  }
 }

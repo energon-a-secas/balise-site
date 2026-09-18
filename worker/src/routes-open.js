@@ -55,7 +55,18 @@ const ANY_ORIGIN = { 'Access-Control-Allow-Origin': '*' };
 
 const CACHED = { 'Cache-Control': 'public, max-age=300', ...ANY_ORIGIN };
 
-/** POST /open-items. Returns { created, unchanged, closed, reopened }. */
+/**
+ * POST /open-items. Returns { source, created, unchanged, closed, reopened, rows_read }.
+ *
+ * `rows_read` is new in phase 2 pass 0 and it is additive: no caller loses a field. It is here
+ * because this was the last read in the Worker with no cost read-back on it, and it is the one
+ * whose cost is NOT the size of what the caller sent. See upsertOpenItems in src/store-open.js:
+ * the dedupe read seeks on `app_id` alone once the batch reaches three items, so a 25-item import
+ * scans the fleet's half of the table. tests/local-d1-rows.test.mjs pins that as a law and
+ * tests/local-d1-plans.test.mjs pins the plan it comes from.
+ *
+ * docs/DESIGN-OPEN-ITEMS.md section 7 still lists the four counters without this field.
+ */
 export async function openImport(env, payload, { origin, now }) {
   const P = 'desk';
   const checked = validateOpenBatch(payload, OPEN_SOURCES, IMPORT_BATCH_MAX);
@@ -70,6 +81,7 @@ export async function openImport(env, payload, { origin, now }) {
     unchanged: result.unchanged,
     closed: result.closed,
     reopened: result.reopened,
+    rows_read: result.rowsRead,
   }, { origin, env });
 }
 
@@ -99,13 +111,44 @@ export async function openSync(env, payload, { origin, now }) {
  *
  * `rows_read` rides along for the same reason it does on /log: local D1 enforces no
  * quota, so that number is the only thing that would notice this query starting to scan
- * the table. Two tests read it, and neither is on this file's side of the wire:
- * tests/open-items.test.mjs bounds it with rowsReadBudget, and
- * tests/local-d1-plans.test.mjs pins both board plans by index name.
+ * the table. Three tests read it, and none is on this file's side of the wire:
+ * tests/open-items.test.mjs, tests/local-d1-rows.test.mjs, which asserts the law below by
+ * EQUALITY, and tests/local-d1-plans.test.mjs, which pins both board plans by index name.
  *
- * Unlike the desk and the log, these two routes do NOT call warnRowsRead: a page over
- * budget is reported to the caller and never to the log. Wiring it here is a behaviour
- * change on a cacheable public route, so it is phase 2's to make, not a comment's.
+ * NEITHER BOARD ROUTE CALLS warnRowsRead, AND THAT IS NOW A DECISION RATHER THAN A DEFERRAL.
+ * Phase 1's review condition C2 asked for the call on both, on the reading that /board has a
+ * `limit` so `rowsReadBudget(limit)` applies to it. Measured 2026-09-18 through these two
+ * routes, it does not, and the two laws are these (O = published entries at accepted, R =
+ * published fleet rows at fixed, both kinds, seeded through the real PATCH route):
+ *
+ *   GET /board            rows_read = 2 x O + R + 2      independent of `limit`
+ *   GET /board/summary    rows_read = O + 2 x R + 3      it has no `limit`
+ *
+ * Both fitted exactly at four populations, from O=1,R=2 up to O=99,R=22. Three things follow
+ * and all three are why a runtime threshold is the wrong instrument here:
+ *
+ *   1. /board SCANS THE SAME NUMBER OF ROWS AT limit=5 AS AT limit=50. Its open half is on
+ *      reports_board, whose trailing column is created_at while the sort is on opened_at, so
+ *      SQLite walks every matching entry into a temp b-tree before LIMIT applies. A budget
+ *      keyed on `limit` is not a budget for this query in either direction.
+ *   2. BOTH NUMBERS GROW LINEARLY WITH THE BOARD EXISTING, without bound and without any
+ *      query getting worse. /board passed rowsReadBudget(50) = 110 at 61 published entries,
+ *      which is an ordinary working board. A threshold that logs at 61 entries is a warning
+ *      whoever meets it will delete, and a threshold set past that detects nothing.
+ *   3. Both numbers also move with rows on NO board at all: a resolved CORRECTION costs
+ *      /board 1 and the summary 2, because `kind` is only a per-row test under the pinned
+ *      plans. So even a per-entry ratio computed from what the route RETURNED is not a bound.
+ *
+ * So the detector is the equality assertion in tests/local-d1-rows.test.mjs against a known
+ * fixture population, not a console.warn against a constant. It is the stronger of the two: it
+ * is red rather than logged, and it fires on a one-row change in the per-row cost, which is the
+ * regression class that matters, while being silent about a board that is merely busy.
+ *
+ * WHAT IS STILL UNDETECTED, so nobody has to rediscover it: growth in PRODUCTION. The law says
+ * a 500-entry board costs about 1,000 rows_read per uncached request, and nothing in this
+ * repository would notice that. It is not a query regression, it is the shape of the index, and
+ * an index is data-engineer's. Reported to delivery-lead in the phase 2 pass 0 report, not
+ * fixed here.
  */
 export async function openBoard(request, env) {
   const P = 'log';

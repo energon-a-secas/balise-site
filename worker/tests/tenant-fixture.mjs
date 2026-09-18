@@ -34,7 +34,9 @@ import { fileURLToPath } from 'node:url';
 
 import { FLEET } from '../src/scope.js';
 
-const SRC = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src');
+/** Exported because one assertion is about which FILE does something, so it has to enumerate
+ *  the directory rather than name a file (see the auth.js importer test in tenant-scope). */
+export const SRC = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src');
 
 /** A Worker source file as text, for the assertions that are about an ABSENCE (C6.5). */
 export const source = (file) => readFileSync(join(SRC, file), 'utf8');

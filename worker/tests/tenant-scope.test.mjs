@@ -7,10 +7,11 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readdirSync } from 'node:fs';
 
 import { sqliteD1 } from './sqlite-d1.mjs';
 import { FLEET, FLEET_SCOPE, scopeFor } from '../src/scope.js';
-import { principalFor } from '../src/index.js';
+import { principalFor } from '../src/routes-desk.js';
 import {
   fingerprintInput, listReports, getReport, applyTransition,
 } from '../src/store.js';
@@ -24,7 +25,7 @@ import {
 } from '../src/store-work-runner.js';
 import {
   T, FLEET_MARK, TENANT_MARK, TENANT, TENANT_KEY, markOf, json,
-  snapshot, plantReport, fleetOnly, source,
+  snapshot, plantReport, fleetOnly, source, SRC,
 } from './tenant-fixture.mjs';
 
 // ── The seam ──────────────────────────────────────────────────────────────────
@@ -48,7 +49,7 @@ test('C6: the scope seam has one answer per principal kind and refuses to invent
 
 test('C6: the actor seam above scopeFor has one answer per actor and refuses to invent one', () => {
   // The seam above the seam. scopeFor throws on a kind it does not know, but principalFor in
-  // src/index.js is what decides the kind, and while it read
+  // src/routes-desk.js is what decides the kind, and while it read
   // `actor === 'ai' ? 'automation' : 'operator'` every unknown actor arrived as an OPERATOR:
   // fleet-scoped, silent, and the throw above unreachable from any route. That is the failure
   // this test exists to keep red. It costs nothing in phase 1, where authenticate() returns
@@ -189,6 +190,33 @@ test('C6.5: the three public reads count the fleet only, and take the literal ra
   }
 });
 
+test('the four public routes cannot read a credential, because the file they live in cannot', () => {
+  // The other half of "structural rather than a policy", and it is new with the router split in
+  // phase 2 pass 0. /report, /log, /board and /board/summary must never read the Authorization
+  // header and must never import src/auth.js. That was a RULE while every route body shared
+  // src/index.js with the desk's: nothing could assert it, because the import the rule forbids
+  // was in the same file as the routes it forbids it to, and a reviewer reading a 522 line
+  // router was the whole detector. Split, it is a property of two files and this is the
+  // assertion. It is the reason the seam was cut where it was cut.
+  //
+  // Asserted over the TEXT, not over behaviour, for the same reason as C6.5 above: this is an
+  // absence, and an absence has no value to compare. A public route that started reading a
+  // credential would not fail any other test in this repository, it would just quietly answer
+  // differently to a caller holding a token.
+  for (const file of ['routes-public.js', 'routes-open.js']) {
+    const text = source(file);
+    const code = text.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '');
+    assert.doesNotMatch(code, /from '\.\/auth\.js'/, `src/${file} imports src/auth.js`);
+    assert.doesNotMatch(code, /Authorization|X-Balise-Actor/i, `src/${file} reads a request credential header`);
+  }
+  // And exactly one file in the Worker may import it. Named rather than counted: a count would
+  // pass if the importer MOVED, and where it lives is the point.
+  const importers = readdirSync(SRC)
+    .filter((f) => f.endsWith('.js'))
+    .filter((f) => /from '\.\/auth\.js'/.test(source(f).replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')));
+  assert.deepEqual(importers, ['routes-desk.js'], 'src/auth.js is imported by a file that is not the desk router');
+});
+
 // ── Every read and every write that takes a handle ────────────────────────────
 //
 // The table below is the campaign's riskiest surface: each of these takes an id, a run id or a
@@ -265,14 +293,15 @@ const KEYED = [
     name: 'heartbeatWork',
     over: { work_state: 'claimed', work_run: 'run', work_lease_until: T + 1_800_000 },
     runId: 'run',
-    invariantGuarded: true,
+    // A17, phase 2 pass 0: this one carried `invariantGuarded: true` until the first statement of
+    // its batch took `AND app_id = 'fleet'`. It is an ordinary keyed write now.
     call: (db, id, runId) => heartbeatWork(db, { id, actor: 'ai', run: runId, leaseSeconds: 1800, now: T + 100 }),
   },
   {
     name: 'releaseWork',
     over: { work_state: 'claimed', work_run: 'run', work_lease_until: T + 1_800_000 },
     runId: 'run',
-    invariantGuarded: true,
+    // A17: same move as heartbeat above, same statement shape, same pass.
     call: (db, id, runId) => releaseWork(db, { id, actor: 'ai', run: runId, note: '', now: T + 100 }),
   },
   {
@@ -289,7 +318,9 @@ const KEYED = [
     over: { work_state: 'accepted', work_run: 'run' },
     runId: 'run',
     run: { needs_landing: 1, review: 'accepted' },
-    invariantGuarded: true,
+    // A17: BOTH of land's first statements took the literal, the landed path and the not-landed
+    // one, so the entry below covers the landed path and tests/tenant-predicates.test.mjs covers
+    // the other. Neither is invariant-guarded any more.
     call: (db, id, runId) => landWork(db, {
       id, actor: 'ai', run: runId, landed: true, refs: [{ repo: 'balise-site', commit: 'abc1234' }],
       note: '', now: T + 100,
@@ -335,29 +366,20 @@ test('C6: every read and every write that takes a handle serves the fleet row an
       assert.ok(!json(out).includes(TENANT_MARK), `${where} answered with the tenant's own row: ${json(out)}`);
       assert.ok(!json(out).includes(id), `${where} answered with the tenant's row id: ${json(out)}`);
 
-      if (entry.invariantGuarded) {
-        // THREE WRITES ARE GUARDED BY INVARIANT 4.3 AND NOT BY A TERM, and this branch is where
-        // that costs something. heartbeat, release and land do not read the row first: they go
-        // straight to a batch whose first statement is
-        // `UPDATE reports SET ... WHERE id = ? AND work_state = 'claimed' AND work_run = ?`,
-        // which DESIGN.md section 5 assigns no predicate because a claimed row is the fleet's.
-        // On the row planted here, which the invariant forbids, that write lands.
-        //
-        // It is asserted rather than hidden. What it takes to reach: a row that already breaks
-        // invariant 4.3, plus its id, plus its run id, which is a UUID this Worker generates and
-        // never gives to a tenant. The answer still leaks nothing, because it comes back through
-        // workItem and explain, and both of those carry the literal. The two counts asserted
-        // below are therefore the whole defence, which is the reason they are asserted at all.
-        //
-        // If this ever fails because the row did NOT change, a predicate was added to one of
-        // those three statements. That is a good change and it is a contract change: move the
-        // entry out of this branch deliberately rather than loosening the assertion.
-        assert.notEqual(
-          after.report, before.report,
-          `${entry.name} no longer writes a row that breaks invariant 4.3, so its taxonomy in section 5 changed: update this table`,
-        );
-        continue;
-      }
+      // THE THREE WRITES THAT USED TO LAND HERE NOW DECLINE, and the branch that asserted they
+      // landed is gone (A17, phase 2 pass 0). What it said, for whoever reads this next to
+      // understand what changed rather than only that it did: heartbeat, release and land do not
+      // read the row first, they go straight to a batch whose first statement was
+      // `UPDATE reports SET ... WHERE id = ? AND work_state = 'claimed' AND work_run = ?`, and
+      // DESIGN.md section 5 assigned it no predicate on the argument that a claimed row is the
+      // fleet's by invariant 4.3. On a row that already breaks the invariant, which is exactly
+      // what this loop plants, that write landed on a tenant's row. The branch asserted that
+      // rather than hiding it, and said in as many words that a predicate on those statements
+      // would be a good change and a contract change.
+      //
+      // It is now the literal on all four of those statements, so the three entries fall through
+      // to the two assertions below like every other keyed write, and nothing in this file is
+      // still resting on an invariant a COUNT can only report after it is broken.
       assert.equal(after.report, before.report, `${where} wrote a tenant's report row`);
       assert.equal(after.run, before.run, `${where} wrote a tenant's run row`);
     }

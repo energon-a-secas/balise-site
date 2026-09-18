@@ -30,7 +30,7 @@
 
 import { redactionFindings } from './redact.js';
 import { ACTIVE_STATES, CLOSED_STATUSES } from './work.js';
-import { FLEET, tenantKey, scopeKeyId } from './scope.js';
+import { tenantKey, scopeKeyId } from './scope.js';
 
 // ── C4: the status vocabulary and the transition tables ───────────────────────
 //
@@ -41,78 +41,21 @@ import { STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition 
 
 export { STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition };
 
-// ── Budgets ───────────────────────────────────────────────────────────────────
+// ── Budgets and derived keys, re-exported ─────────────────────────────────────
+//
+// Both groups MOVED OUT in the phase 2 router split and are re-exported here, the same way
+// and for the same reason src/transitions.js is above: this file is where they are used, every
+// existing caller already imports them from here, and neither group contains any SQL. The
+// header above says this is one of the six files in the Worker that contain SQL, and the two
+// budget functions and the five key functions were the parts of it that a reader auditing the
+// store had to page past. They are in src/budget.js and src/keys.js now, both of which are
+// reachable from any file here without closing an import cycle.
 
-/**
- * What a keyset page of `limit` rows should cost in rows SCANNED.
- *
- * The multiplier is not a guess. Measured against local D1 with 104 rows on 2026-08-29,
- * every keyset page read EXACTLY `limit` rows, at limits of 1, 5, 25 and 50, filtered and
- * unfiltered. Dropping reports_created and reports_status_created and repeating the same
- * requests read 208 rows for a page of 5, so the indexes are load bearing and the gap
- * between the two numbers is wide. Doubling the measurement and adding ten leaves room
- * for a range scan stepping over non-matching rows without leaving room for a table scan.
- */
-export function rowsReadBudget(limit) {
-  return limit * 2 + 10;
-}
+import { rowsReadBudget, warnRowsRead } from './budget.js';
+import { sha256Hex, normaliseForFingerprint, fingerprintInput, ipHash, actorKey } from './keys.js';
 
-// ── Hashing ───────────────────────────────────────────────────────────────────
-
-export async function sha256Hex(input) {
-  const bytes = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest('SHA-256', bytes);
-  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
-}
-
-/**
- * SHA-256(site, target id, normalised body). The UNIQUE index on this column IS the
- * duplicate guard: the insert below conflicts and writes nothing, which costs one no-op
- * insert rather than a read plus a write.
- *
- * Normalising case and runs of whitespace means "the same complaint typed twice" is one
- * report. It does not catch a reworded duplicate, and it is not meant to: that is the
- * `duplicate` status and a human.
- */
-export function normaliseForFingerprint(body) {
-  return body.toLowerCase().replace(/\s+/g, ' ').trim();
-}
-
-/**
- * A11: the tenant is scoped INSIDE the hash, not beside it.
- *
- * `reports_fp` is UNIQUE on `fingerprint` alone, and it stays that way. A composite
- * UNIQUE(app_id, fingerprint) would be the obvious move and it is the wrong one: the three
- * `ON CONFLICT(fingerprint) DO NOTHING` clauses in this Worker name that index by column,
- * so replacing it means editing every one of them and getting all three right, and the
- * failure mode of missing one is a thrown constraint error on a path whose whole design is
- * that a duplicate costs a no-op insert. Mixing the key into the hashed input instead
- * gives per-tenant duplicate detection with no index change and no conflict-clause change.
- *
- * `appId` COMES FIRST, NOT LAST. A call site that was not updated passes three arguments,
- * so `site` lands in `appId` and `body` is undefined, and the report is refused loudly.
- * With the key appended instead, the same stale call site would hash exactly as it always
- * did, which is to say it would silently file a tenant's report as the fleet's. That is
- * DESIGN.md section 9 item 13, and it is why the argument order is not a matter of taste.
- *
- * The fleet's input is byte-identical to what it was before this parameter existed, so
- * every fingerprint already in the table stays correct and no backfill is needed. That is
- * what the FLEET branch is for; it is not an optimisation.
- */
-export function fingerprintInput(appId, site, targetId, body) {
-  const base = `${site}\x00${targetId || ''}\x00${normaliseForFingerprint(body)}`;
-  return appId === FLEET ? base : `${appId}\x00${base}`;
-}
-
-/**
- * SHA-256(salt, address), truncated to 32 hex characters. Returns null with no salt,
- * because an unsalted hash of an IPv4 address is reversible by brute force in seconds and
- * storing that would be worse than storing nothing.
- */
-export async function ipHash(salt, address) {
-  if (!salt || !address) return null;
-  return (await sha256Hex(`${salt}\x00${address}`)).slice(0, 32);
-}
+export { rowsReadBudget, warnRowsRead };
+export { sha256Hex, normaliseForFingerprint, fingerprintInput, ipHash, actorKey };
 
 // ── Errors ────────────────────────────────────────────────────────────────────
 

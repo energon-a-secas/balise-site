@@ -42,8 +42,9 @@ database_id = "bd9caf38-a680-4e8d-97a5-5518e8e94391"
 
 # Spelled out rather than left to the default. `wrangler d1 migrations apply` is the only
 # thing that builds this database now: schema.sql is migrations/0001_baseline.sql byte for
-# byte and stays as the readable shape, and tests/local-d1.test.mjs asserts the two are
-# equal so they cannot drift.
+# byte and stays as the readable shape, and tests/open-items.test.mjs asserts the two are
+# equal so they cannot drift. (It named tests/local-d1.test.mjs until phase 2. That file
+# exists and holds no such assertion, so the pointer read as a live check and was not one.)
 migrations_dir = "migrations"
 
 # ── Ingest rate limiting ──────────────────────────────────────────────────────

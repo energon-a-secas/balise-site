@@ -1,7 +1,15 @@
 // CONTRACTS.md C6, asserted, part three: the eleven tenant predicates that A30 found nobody
-// was watching. Part one is tests/tenant-scope.test.mjs (every read and write that takes a
-// scope or a handle) and part two is tests/tenant-invariants.test.mjs (the import path, the
-// work queue, and the two invariants of DESIGN.md section 4.3).
+// was watching, plus the four A17 found were not there at all. Part one is
+// tests/tenant-scope.test.mjs (every read and write that takes a scope or a handle) and part two
+// is tests/tenant-invariants.test.mjs (the import path, the work queue, and the two invariants
+// of DESIGN.md section 4.3).
+//
+// THE FILE HAS TWO HALVES NOW AND THEY ARE NOT THE SAME KIND OF TEST. The first eleven cases
+// pin a predicate that already existed and needed the reassignment hook to be seen at all. The
+// last four (RUNNER_WRITES, at the foot) pin predicates this pass ADDED to heartbeat, release
+// and both branches of land, and they need no hook, because those three actions run no scoped
+// read for the hook to race. Read that section's own header before adding to either half: which
+// half a new case belongs in is decided by whether the write it guards is preceded by a read.
 //
 // WHY A THIRD FILE RATHER THAN MORE CASES IN THE OTHER TWO. `qa-engineer` neutered all 24
 // tenant predicates one at a time, keeping the SQL valid and the bind count identical, and 13
@@ -53,6 +61,7 @@ import {
 } from '../src/store-open.js';
 import { sha256Hex } from '../src/store.js';
 import { insertDirectItem, approveWork, withdrawWork, reviewWork } from '../src/store-work.js';
+import { heartbeatWork, releaseWork, landWork } from '../src/store-work-runner.js';
 import {
   T, FLEET_MARK, TENANT_MARK, TENANT, json, plantReport,
 } from './tenant-fixture.mjs';
@@ -355,7 +364,8 @@ const WORK_WRITES = [
 ];
 
 // One test per entry rather than one loop inside one test, so a neutered term is named by the
-// test that went red rather than only by an assertion message. Eleven predicates, eleven tests.
+// test that went red rather than only by an assertion message. Eleven predicates, eleven tests,
+// and the same rule applies to the four RUNNER_WRITES cases added below.
 for (const entry of WORK_WRITES) {
   test(`C6: ${entry.name} refuses an item that stopped being the fleet's after readRow saw it`, async () => {
     // NEUTER `AND app_id = 'fleet'` on ${entry.predicate} to `AND 1 = 1` and this test fails.
@@ -378,5 +388,91 @@ for (const entry of WORK_WRITES) {
     const out = await entry.call(db, id);
     assert.equal(shapeOf(db, id), before, `wrote a row that is no longer the fleet's: check the predicate on ${entry.predicate}`);
     assert.ok(out.code !== undefined, `answered as though the write had landed: ${json(out)}`);
+  });
+}
+
+// ── store-work-runner.js, the four UNREAD writes (A17) ────────────────────────
+//
+// A DIFFERENT SHAPE OF TEST, AND THE DIFFERENCE IS THE FINDING. Every case above needs the
+// reassignment hook because a scoped read runs first and would refuse the row before the write
+// is reached; the hook exists to open the gap between the two. heartbeat, release and land have
+// NO such read. They take an `id` and a `run` from the caller and go straight to a `db.batch`,
+// and `explain()` is only consulted once the write has already declined. So the tenant row is
+// simply planted as a tenant row: no hook, no gap to open, because the predicate on the write is
+// the only thing there is. That is what A17 found and what DESIGN.md 5.4's "none, inherited"
+// classification of these three got wrong.
+//
+// The planted rows carry `work_state` outside the fleet, which invariant 4.3 forbids. Same
+// argument as the two MAX subqueries above: a term can only be tested against the row it
+// excludes, and the whole point of adding these four literals is to stop depending on an
+// invariant that a COUNT can only report AFTER it has been broken.
+//
+// submit is deliberately absent. It is the one runner action that calls readRow() first, so its
+// write is covered the way the four cases above are covered, and giving it a literal too would
+// make the four tests below pass for a reason that has nothing to do with them.
+
+const RUNNER_WRITES = [
+  {
+    name: 'heartbeatWork',
+    predicate: "store-work-runner.js's heartbeat UPDATE, the first statement of its batch",
+    over: { work_state: 'claimed', work_run: 'a-run', work_lease_until: T + 60_000 },
+    call: (db, id) => heartbeatWork(db, { id, actor: 'ai', run: 'a-run', leaseSeconds: 1800, now: T + 100 }),
+    landed: (row) => row.work_lease_until !== T + 60_000,
+  },
+  {
+    name: 'releaseWork',
+    predicate: "store-work-runner.js's release UPDATE, the first statement of its batch",
+    over: { work_state: 'claimed', work_run: 'a-run', work_lease_until: T + 60_000 },
+    call: (db, id) => releaseWork(db, { id, actor: 'ai', run: 'a-run', note: '', now: T + 100 }),
+    landed: (row) => row.work_state === 'approved',
+  },
+  {
+    name: 'landWork, the land branch',
+    predicate: "store-work-runner.js's land UPDATE, the first statement of its batch",
+    over: { work_state: 'accepted', work_run: 'a-run' },
+    run: { needs_landing: 1, review: 'accepted', reviewed_at: T + 10, ended_at: T + 5, end_reason: 'submitted' },
+    call: (db, id) => landWork(db, { id, actor: 'ai', run: 'a-run', landed: true, refs: ['abc1234'], note: '', now: T + 100 }),
+    landed: (row) => row.work_state === 'done',
+  },
+  {
+    // BOTH BRANCHES, because the branch is chosen by a boolean the caller sends. A predicate on
+    // the arm that finishes an item and none on the arm that sends it back would be a guard a
+    // caller can step around by passing `landed: false`.
+    name: 'landWork, the unland branch',
+    predicate: "store-work-runner.js's unland UPDATE, the first statement of its batch",
+    over: { work_state: 'accepted', work_run: 'a-run' },
+    run: { needs_landing: 1, review: 'accepted', reviewed_at: T + 10, ended_at: T + 5, end_reason: 'submitted' },
+    call: (db, id) => landWork(db, { id, actor: 'ai', run: 'a-run', landed: false, refs: [], note: 'The push failed.', now: T + 100 }),
+    landed: (row) => row.work_state === 'review',
+  },
+];
+
+for (const entry of RUNNER_WRITES) {
+  test(`C6 and A17: ${entry.name} refuses a queued row that is not the fleet's, with no read to refuse it first`, async () => {
+    // NEUTER `AND app_id = 'fleet'` on ${entry.predicate} to `AND 1 = 1` and this test fails.
+    const id = 'held-item';
+    const plant = (db, appId) => plantReport(db, appId, { id, runId: 'a-run', over: entry.over, run: entry.run || {} });
+
+    // The control is the SAME call on the SAME row shape in the fleet's tenancy. Without it, a
+    // rule that refuses every one of these calls would leave the four tests below green while
+    // proving nothing, which is the failure mode A34 named.
+    const control = sqliteD1();
+    plant(control, FLEET);
+    const allowed = await entry.call(control, id);
+    assert.equal(allowed.code, undefined, `the control was refused, so the case below proves nothing: ${json(allowed)}`);
+    assert.ok(
+      entry.landed(control.sqlite.prepare('SELECT * FROM reports WHERE id = ?').get(id)),
+      'the control did not write the row it is supposed to write',
+    );
+
+    const db = sqliteD1();
+    plant(db, TENANT);
+    const before = shapeOf(db, id);
+    const out = await entry.call(db, id);
+    assert.equal(shapeOf(db, id), before, `wrote a tenant's row: check the predicate on ${entry.predicate}`);
+    // NOT_FOUND specifically, and it is worth naming: the write declines, `explain()` calls the
+    // fleet-scoped readRow(), that finds nothing, and the caller is told the honest thing rather
+    // than being told about a row they were never entitled to.
+    assert.equal(out.code, 'NOT_FOUND', `answered as though the write had landed, or named a row it should not: ${json(out)}`);
   });
 }
