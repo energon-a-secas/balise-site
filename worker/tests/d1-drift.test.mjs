@@ -42,7 +42,8 @@ function run(stdin) {
 
 test('the wanted shape is the migrations, columns and all', () => {
   const want = declaredSchema();
-  assert.deepEqual([...want.keys()].sort(), ['auth_attempts', 'reports', 'submit_counters', 'work_runs']);
+  assert.deepEqual([...want.keys()].sort(),
+    ['app_keys', 'apps', 'auth_attempts', 'reports', 'submit_counters', 'work_runs']);
   // The column whose absence was the whole of #82, and one from each earlier migration.
   assert.ok(want.get('reports').has('filed_by'), 'reports.filed_by, added to 0003 in place');
   assert.ok(want.get('reports').has('suggested'), 'reports.suggested, from 0002');

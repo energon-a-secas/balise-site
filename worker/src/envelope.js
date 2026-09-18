@@ -102,13 +102,19 @@ export function originVerdict(origin, env) {
  * Access-Control-Allow-Origin cannot hold a list, so exactly one validated origin is
  * echoed per response and `Vary: Origin` is mandatory: without it a cache could serve
  * one site's allowed response to another site's request.
+ *
+ * Allow-Headers names TWO request headers and that is the whole set. X-Balise-Actor was
+ * listed here and is gone (A13): the actor is decided by which secret matched, never
+ * declared by the caller, so advertising the header invited a client to send one. Nothing
+ * in this Worker reads it. Do not add it back, and do not add a header that names a tenant
+ * either, for the same reason: the tenant follows from the credential.
  */
 export function corsHeaders(origin, env) {
   if (originVerdict(origin, env) !== 'allowed') return {};
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Balise-Actor',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
     'Access-Control-Max-Age': '86400',
     Vary: 'Origin',
   };

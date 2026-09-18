@@ -21,8 +21,12 @@ import {
 } from '../src/validate.js';
 import {
   STATUSES, TRANSITIONS, AI_TRANSITIONS, OPEN_TRANSITIONS, canTransition, rowsReadBudget,
-  normaliseForFingerprint, publicLog,
+  normaliseForFingerprint,
 } from '../src/store.js';
+// `publicLog` moved to src/store-public.js with the C6 split: the two queries a stranger can
+// reach take the literal 'fleet' rather than a bound scope (C6.5), and that rule is now a
+// property of a file. Only the path changed here; every expectation below is untouched.
+import { publicLog } from '../src/store-public.js';
 import { OPEN_SOURCES, IMPORT_BATCH_MAX, SYNC_REFS_MAX, openFingerprintInput, dayStamp } from '../src/store-open.js';
 
 // ── C2.1: the drift test ──────────────────────────────────────────────────────

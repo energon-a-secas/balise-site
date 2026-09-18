@@ -1,6 +1,26 @@
-// One of the four files in this Worker that contain SQL. Everything about the open-items
-// board that touches D1 is here; src/store.js owns the corrections half, and
-// src/store-work.js with src/store-work-runner.js the work queue. Each says so in its header.
+// One of the six files in this Worker that contain SQL. Everything about the open-items
+// board that touches D1 is here; src/store.js owns the corrections desk, src/store-public.js
+// the two credential-free queries, src/store-auth.js the lockout, and src/store-work.js with
+// src/store-work-runner.js the work queue. Each says so in its header.
+//
+// C6, AND WHY EVERY PREDICATE IN THIS FILE IS THE LITERAL 'fleet'.
+//
+// An open item is a row with kind = 'open', and invariant 4.3 says a row with kind = 'open'
+// is ALWAYS the fleet's. That is not a hope about the data, it is a property of the writes:
+// the only INSERT that sets kind = 'open' is in this file, it is reachable only through the
+// two import routes, both of which need the operator's or the automation credential, and it
+// writes app_id = 'fleet' as a literal. Nothing else in the Worker writes that kind.
+//
+// So no function here takes a scope, and none should be given one. The board is the FLEET's
+// board: it is served at addresses with no credential on them, and C6.5 is that a public
+// query names its tenant as a literal so that no tenant row CAN be published, whatever a
+// caller sends. A bound parameter would move that guarantee out to every call site.
+//
+// The literals are still written on every statement rather than left implicit in the kind,
+// because a `kind = 'open'` term is an invariant one edit away from being wrong, and the
+// cost of the second term on a row set that all matches is a per-row check that rows_read
+// does not notice. The invariant is asserted, not assumed: tests/tenant-scope.test.mjs
+// counts the rows that would break it and requires zero.
 //
 // The split is by FEED, not by table: an open item is a row in `reports` with
 // kind = 'open', so C3's token gate, C4's transition guard, C5's rendering rule and the
@@ -95,9 +115,15 @@ export async function upsertOpenItems(db, { source, items, now }) {
   try {
     const res = await db
       .prepare(
+        // C6: the tenant literal, and here it does real work rather than restating the
+        // kind. A fingerprint is looked up ACROSS kinds by the UNIQUE index, so without
+        // this term a tenant row whose fingerprint collided with an open item's would be
+        // read as an existing open item and the import would take the UPDATE branch
+        // against someone else's row. A11 makes such a collision improbable; the term
+        // makes it impossible.
         `SELECT fingerprint, source_closed_at
            FROM reports
-          WHERE fingerprint IN (${prints.map(() => '?').join(',')})`,
+          WHERE app_id = 'fleet' AND fingerprint IN (${prints.map(() => '?').join(',')})`,
       )
       .bind(...prints)
       .run();
@@ -138,11 +164,19 @@ export async function upsertOpenItems(db, { source, items, now }) {
       try {
         const res = await db
           .prepare(
+            // C6: `app_id` is WRITTEN here, as the literal 'fleet', and this is the write
+            // that makes invariant 4.3 true. The inner MAX carries the same literal, so
+            // the cursor an open row takes is one past the newest FLEET open row: a tenant
+            // row could not be one of these anyway (nothing gives a tenant this kind), but
+            // the subquery is a read over `reports` and C6 admits no unpredicated read.
+            // ON CONFLICT(fingerprint) is UNCHANGED: A11 keeps `reports_fp` UNIQUE on the
+            // one column, and naming a different index here is exactly what it avoids.
             `INSERT INTO reports
                (id, created_at, site, url, kind, body, status, public, fingerprint,
-                source, source_ref, suggested, opened_at, source_closed_at)
-             VALUES (?, MAX(?, COALESCE((SELECT MAX(created_at) FROM reports WHERE kind = ?), 0) + 1),
-                     ?, '', ?, ?, 'new', 1, ?, ?, ?, ?, ?, ?)
+                source, source_ref, suggested, opened_at, source_closed_at, app_id)
+             VALUES (?, MAX(?, COALESCE((SELECT MAX(created_at) FROM reports
+                                          WHERE kind = ? AND app_id = 'fleet'), 0) + 1),
+                     ?, '', ?, ?, 'new', 1, ?, ?, ?, ?, ?, ?, 'fleet')
              ON CONFLICT(fingerprint) DO NOTHING`,
           )
           .bind(
@@ -178,7 +212,10 @@ export async function upsertOpenItems(db, { source, items, now }) {
     if (item.closed_at && !row.source_closed_at) {
       try {
         await db
-          .prepare('UPDATE reports SET source_closed_at = ? WHERE fingerprint = ? AND source_closed_at IS NULL')
+          // C6: keyed by fingerprint, so the tenant literal is what stops a collision from
+          // aiming this write at a row outside the fleet. Same reason as the read above.
+          .prepare(`UPDATE reports SET source_closed_at = ?
+                     WHERE app_id = 'fleet' AND fingerprint = ? AND source_closed_at IS NULL`)
           .bind(item.closed_at, fingerprint)
           .run();
         closed += 1;
@@ -193,7 +230,9 @@ export async function upsertOpenItems(db, { source, items, now }) {
     if (!item.closed_at && row.source_closed_at) {
       try {
         const res = await db
-          .prepare('UPDATE reports SET source_closed_at = NULL WHERE fingerprint = ? AND source_closed_at IS NOT NULL')
+          // C6: the tenant literal, for the same reason as the close above.
+          .prepare(`UPDATE reports SET source_closed_at = NULL
+                     WHERE app_id = 'fleet' AND fingerprint = ? AND source_closed_at IS NOT NULL`)
           .bind(fingerprint)
           .run();
         if (res.meta && res.meta.changes > 0) reopened += 1;
@@ -230,9 +269,12 @@ export async function syncOpenSource(db, { source, refs, now }) {
   try {
     const res = await db
       .prepare(
+        // C6: the tenant literal. The kind term already implies it by invariant 4.3, and it
+        // is written anyway because this SELECT decides what the chunked UPDATE below will
+        // close, so it is the widest read in the file.
         `SELECT fingerprint, source_ref
            FROM reports
-          WHERE kind = ? AND source = ? AND source_closed_at IS NULL`,
+          WHERE app_id = 'fleet' AND kind = ? AND source = ? AND source_closed_at IS NULL`,
       )
       .bind(OPEN_KIND, source)
       .run();
@@ -251,8 +293,10 @@ export async function syncOpenSource(db, { source, refs, now }) {
     try {
       const res = await db
         .prepare(
+          // C6: the tenant literal. This write takes a LIST of fingerprints, so it is the
+          // one statement here where a single collision could reach fifty rows at once.
           `UPDATE reports SET source_closed_at = ?
-            WHERE source_closed_at IS NULL
+            WHERE app_id = 'fleet' AND source_closed_at IS NULL
               AND fingerprint IN (${chunk.map(() => '?').join(',')})`,
         )
         .bind(now, ...chunk)
@@ -293,9 +337,20 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
   const query = async (status, order) => {
     const res = await db
       .prepare(
+        // C6.5: the tenant term is the LITERAL 'fleet' and never a parameter. GET /board
+        // reads no credential and answers 65 origins (A8), so a bound key here would put
+        // "no tenant row can be published" in the hands of whatever called this. Written
+        // as a literal, this query cannot select one.
+        //
+        // The literal goes LAST, after status, so the first three terms read as exactly
+        // reports_board(kind, public, status) from migrations/0002_open_items.sql, which is
+        // the index this still seeks. There is no tenant twin of that index and 4.2 says
+        // why there should not be: every row this query can match is the fleet's already,
+        // so the added term is a per-row test on rows that all pass it and rows_read does
+        // not move. SQLite reorders WHERE terms itself, so the placement is for the reader.
         `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state
            FROM reports
-          WHERE kind = ? AND public = 1 AND status = ?
+          WHERE kind = ? AND public = 1 AND status = ? AND app_id = 'fleet'
           ORDER BY ${order} DESC LIMIT ?`,
       )
       .bind(OPEN_KIND, status, capped)
@@ -326,6 +381,11 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
  * PUBLISHED ROWS ONLY. Every term carries `public = 1` and a published status. A number
  * that moved when a private draft moved would let anyone watching it learn when the desk is
  * busy with things nobody published, which is the side channel this endpoint must not be.
+ *
+ * FLEET ROWS ONLY, for the same class of reason and by the same kind of term. Both queries
+ * carry `app_id = 'fleet'` as a LITERAL (C6.5), placed last so that reports_board is still
+ * sought on its full key: a count that moved when a tenant's item moved would be exactly
+ * the side channel above, one tenant wide, on an endpoint with no credential on it.
  */
 export async function boardSummary(db, { now, windowDays = SUMMARY_WINDOW_DAYS }) {
   const since = now - windowDays * 24 * 60 * 60 * 1000;
@@ -337,7 +397,7 @@ export async function boardSummary(db, { now, windowDays = SUMMARY_WINDOW_DAYS }
                 COALESCE(SUM(CASE WHEN status = 'accepted' AND work_state IN (${moving}) THEN 1 ELSE 0 END), 0) AS moving_count,
                 COALESCE(SUM(CASE WHEN status = 'fixed' AND fixed_at >= ? THEN 1 ELSE 0 END), 0) AS resolved_count
            FROM reports
-          WHERE kind = ? AND public = 1 AND status IN ('accepted', 'fixed')`,
+          WHERE kind = ? AND public = 1 AND status IN ('accepted', 'fixed') AND app_id = 'fleet'`,
       )
       .bind(...IN_PROGRESS_STATES, since, OPEN_KIND)
       .run();
@@ -345,7 +405,7 @@ export async function boardSummary(db, { now, windowDays = SUMMARY_WINDOW_DAYS }
       .prepare(
         `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state
            FROM reports
-          WHERE kind = ? AND public = 1 AND status = 'fixed'
+          WHERE kind = ? AND public = 1 AND status = 'fixed' AND app_id = 'fleet'
           ORDER BY fixed_at DESC LIMIT 1`,
       )
       .bind(OPEN_KIND)

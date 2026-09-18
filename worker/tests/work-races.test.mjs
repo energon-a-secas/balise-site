@@ -15,6 +15,10 @@ import assert from 'node:assert/strict';
 
 import { sqliteD1 } from './sqlite-d1.mjs';
 import { applyTransition, insertReport } from '../src/store.js';
+// C6: both writes take a scope as their second argument now, and in phase 1 the only scope
+// there is is the fleet's. Nothing else changed here: every expectation below is the one
+// this file already had, because a fleet-scoped call is the call it was making before.
+import { FLEET_SCOPE } from '../src/scope.js';
 import { insertDirectItem, approveWork, withdrawWork, reviewWork } from '../src/store-work.js';
 import { claimWork, heartbeatWork, releaseWork, submitWork, landWork } from '../src/store-work-runner.js';
 
@@ -211,7 +215,7 @@ test('C-g: a run the sweep ended hears that its last attempt ran out, and is not
 });
 
 async function fileCorrection(db, id) {
-  const out = await insertReport(db, {
+  const out = await insertReport(db, FLEET_SCOPE, {
     id, created_at: T, site: 'vitrina', url: 'https://vitrina.neorgon.com/x', target: null, kind: 'wrong',
     body: `A reader's report, ${id}.`, contact: null, ip_hash: null, fingerprint: `fp-${id}`,
   });
@@ -230,7 +234,7 @@ test('#64: an approval landing between a close\'s read and its write leaves the 
     db.beforeStatement(CLOSE_UPDATE, async () => {
       assert.equal((await approveWork(db, { id, actor: 'human', ...approval, now: T + 1 })).item.work.state, 'approved');
     });
-    const out = await applyTransition(db, { id, actor, patch, now: T + 2 });
+    const out = await applyTransition(db, FLEET_SCOPE, { id, actor, patch, now: T + 2 });
     assert.equal(out.code, 'BAD_TRANSITION', `${patch.status}: ${JSON.stringify(out)}`);
     const row = reportRow(db, id);
     assert.deepEqual([row.status, row.work_state, row.decided_at], ['new', 'approved', null], `${patch.status} closed an item the queue had taken`);
@@ -247,7 +251,7 @@ test('#64: a close landing between an approval\'s read and its write keeps the i
   const db = sqliteD1();
   const id = await fileItem(db, 'An item handed over in one tab while another rejects it.');
   db.beforeStatement(APPROVE_UPDATE, async () => {
-    assert.equal((await applyTransition(db, { id, actor: 'human', patch: { status: 'rejected' }, now: T + 1 })).report.status, 'rejected');
+    assert.equal((await applyTransition(db, FLEET_SCOPE, { id, actor: 'human', patch: { status: 'rejected' }, now: T + 1 })).report.status, 'rejected');
   });
   const out = await approveWork(db, { id, actor: 'human', mode: 'ship', instruction: '', now: T + 2 });
   assert.equal(out.code, 'BAD_TRANSITION', JSON.stringify(out));
@@ -269,7 +273,7 @@ test('#64: approve refuses an item C4 has closed, says how to go on from each cl
   const ids = {};
   for (const [status, fields] of Object.entries(closes)) {
     const id = await fileItem(db, `An item closed as ${status} before it was handed over.`);
-    assert.equal((await applyTransition(db, { id, actor: 'human', patch: { status, ...fields }, now: T + 1 })).report.status, status);
+    assert.equal((await applyTransition(db, FLEET_SCOPE, { id, actor: 'human', patch: { status, ...fields }, now: T + 1 })).report.status, status);
     const before = reportRow(db, id);
     for (const approval of [{ mode: 'ship', instruction: '' }, { mode: 'investigate', instruction: 'Look at it again all the same.' }]) {
       const out = await approveWork(db, { id, actor: 'human', ...approval, now: T + 2 });
@@ -292,12 +296,12 @@ test('#64: approve refuses an item C4 has closed, says how to go on from each cl
   const finished = await fileItem(db, 'An investigation that finishes and is then resolved.');
   await inReview(db, finished, { now: T + 10 });
   assert.equal((await reviewWork(db, { id: finished, actor: 'human', decision: 'accept', note: '', now: T + 20 })).item.work.state, 'done');
-  assert.equal((await applyTransition(db, { id: finished, actor: 'human', patch: { status: 'fixed', public_note: 'Finished.' }, now: T + 21 })).report.status, 'fixed');
+  assert.equal((await applyTransition(db, FLEET_SCOPE, { id: finished, actor: 'human', patch: { status: 'fixed', public_note: 'Finished.' }, now: T + 21 })).report.status, 'fixed');
   const reopened = await approveWork(db, { id: finished, actor: 'human', mode: 'investigate', instruction: '', now: T + 22 });
   assert.equal(reopened.message, 'That item is resolved, so it cannot be handed to an agent.');
   assert.equal(reportRow(db, finished).work_state, 'done');
   // And the way on the hint gives works: reopened to accepted, a rejected item is handed over.
-  assert.equal((await applyTransition(db, { id: ids.rejected, actor: 'human', patch: { status: 'accepted', public_note: 'Being looked at again.' }, now: T + 30 })).report.status, 'accepted');
+  assert.equal((await applyTransition(db, FLEET_SCOPE, { id: ids.rejected, actor: 'human', patch: { status: 'accepted', public_note: 'Being looked at again.' }, now: T + 30 })).report.status, 'accepted');
   assert.equal((await approveWork(db, { id: ids.rejected, actor: 'human', mode: 'fix', instruction: '', now: T + 31 })).item.work.state, 'approved');
   assert.deepEqual(closedAndQueued(db), []);
 });
@@ -307,18 +311,18 @@ test('#64: what stays allowed: a close after a withdraw or once done, publishing
   const withdrawn = await fileItem(db, 'An item withdrawn and then resolved by hand.');
   await approveWork(db, { id: withdrawn, actor: 'human', mode: 'ship', instruction: '', now: T + 1 });
   assert.equal((await withdrawWork(db, { id: withdrawn, actor: 'human', now: T + 2 })).item.work, null);
-  assert.equal((await applyTransition(db, { id: withdrawn, actor: 'human', patch: { status: 'fixed', public_note: 'Done by hand.' }, now: T + 3 })).report.status, 'fixed');
+  assert.equal((await applyTransition(db, FLEET_SCOPE, { id: withdrawn, actor: 'human', patch: { status: 'fixed', public_note: 'Done by hand.' }, now: T + 3 })).report.status, 'fixed');
 
   const held = await fileItem(db, 'An item published as open while a runner holds it.');
   await approveWork(db, { id: held, actor: 'human', mode: 'fix', instruction: '', now: T + 4 });
   await claim(db, held, T + 5);
-  const published = await applyTransition(db, { id: held, actor: 'human', patch: { status: 'accepted', public_note: 'Work on this has started.' }, now: T + 6 });
+  const published = await applyTransition(db, FLEET_SCOPE, { id: held, actor: 'human', patch: { status: 'accepted', public_note: 'Work on this has started.' }, now: T + 6 });
   assert.deepEqual([published.report.status, published.report.work && published.report.work.state], ['accepted', 'claimed'], JSON.stringify(published));
 
   const finished = await fileItem(db, 'An investigation that finishes and is then closed.');
   await inReview(db, finished, { now: T + 10 });
   assert.equal((await reviewWork(db, { id: finished, actor: 'human', decision: 'accept', note: '', now: T + 20 })).item.work.state, 'done');
-  assert.equal((await applyTransition(db, { id: finished, actor: 'human', patch: { status: 'rejected' }, now: T + 21 })).report.status, 'rejected');
+  assert.equal((await applyTransition(db, FLEET_SCOPE, { id: finished, actor: 'human', patch: { status: 'rejected' }, now: T + 21 })).report.status, 'rejected');
 
   // POST /work/items with approve: the item is filed, then approved, in one call.
   const filed = await fileItem(db, 'An item filed and handed over at once.');

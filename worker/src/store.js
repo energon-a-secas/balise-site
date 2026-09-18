@@ -1,10 +1,18 @@
-// The corrections half of the store, and one of the four files in this Worker that
-// contain SQL. The others are src/store-open.js, which owns the open-items feed (queue
-// #58), and src/store-work.js with src/store-work-runner.js, which own the work queue. If
-// you are about to write a query somewhere else, put it in one of these instead: a short
-// list of files is a short list of places to audit what touches the store. The
-// C4 tables themselves are pure and live in src/transitions.js; this file is where they
-// are enforced.
+// The corrections desk half of the store, and one of the SIX files in this Worker that
+// contain SQL. The others are src/store-public.js, which owns the two queries a stranger
+// can reach; src/store-auth.js, which owns the operator lockout; src/store-open.js, which
+// owns the open-items feed (queue #58); and src/store-work.js with
+// src/store-work-runner.js, which own the work queue. If you are about to write a query
+// somewhere else, put it in one of these instead: a short list of files is a short list of
+// places to audit what touches the store. The C4 tables themselves are pure and live in
+// src/transitions.js; this file is where they are enforced.
+//
+// C6: EVERY STATEMENT BELOW THAT TOUCHES `reports` CARRIES A PREDICATE ON `app_id`, OR
+// CARRIES A COMMENT NAMING THE INVARIANT THAT MAKES ONE UNNECESSARY. There is no third
+// option, and a statement with neither is a defect whether or not it can be reached. The
+// tenant key comes from src/scope.js and from nowhere else: a store function takes the
+// scope as the argument right after `db`, and never a request, a header or a token. The
+// per-statement audit is DESIGN.md section 5.
 //
 // Two D1 limits shape everything below, and they bite at our SHAPE, not our volume
 // (https://developers.cloudflare.com/d1/platform/limits/, CONTRACTS.md A4):
@@ -22,6 +30,7 @@
 
 import { redactionFindings } from './redact.js';
 import { ACTIVE_STATES, CLOSED_STATUSES } from './work.js';
+import { FLEET, tenantKey, scopeKeyId } from './scope.js';
 
 // ── C4: the status vocabulary and the transition tables ───────────────────────
 //
@@ -69,8 +78,30 @@ export function normaliseForFingerprint(body) {
   return body.toLowerCase().replace(/\s+/g, ' ').trim();
 }
 
-export function fingerprintInput(site, targetId, body) {
-  return `${site}\x00${targetId || ''}\x00${normaliseForFingerprint(body)}`;
+/**
+ * A11: the tenant is scoped INSIDE the hash, not beside it.
+ *
+ * `reports_fp` is UNIQUE on `fingerprint` alone, and it stays that way. A composite
+ * UNIQUE(app_id, fingerprint) would be the obvious move and it is the wrong one: the three
+ * `ON CONFLICT(fingerprint) DO NOTHING` clauses in this Worker name that index by column,
+ * so replacing it means editing every one of them and getting all three right, and the
+ * failure mode of missing one is a thrown constraint error on a path whose whole design is
+ * that a duplicate costs a no-op insert. Mixing the key into the hashed input instead
+ * gives per-tenant duplicate detection with no index change and no conflict-clause change.
+ *
+ * `appId` COMES FIRST, NOT LAST. A call site that was not updated passes three arguments,
+ * so `site` lands in `appId` and `body` is undefined, and the report is refused loudly.
+ * With the key appended instead, the same stale call site would hash exactly as it always
+ * did, which is to say it would silently file a tenant's report as the fleet's. That is
+ * DESIGN.md section 9 item 13, and it is why the argument order is not a matter of taste.
+ *
+ * The fleet's input is byte-identical to what it was before this parameter existed, so
+ * every fingerprint already in the table stays correct and no backfill is needed. That is
+ * what the FLEET branch is for; it is not an optimisation.
+ */
+export function fingerprintInput(appId, site, targetId, body) {
+  const base = `${site}\x00${targetId || ''}\x00${normaliseForFingerprint(body)}`;
+  return appId === FLEET ? base : `${appId}\x00${base}`;
 }
 
 /**
@@ -102,15 +133,30 @@ const refuse = (code, message, hint) => ({ code, message, hint });
  * One INSERT. `ON CONFLICT DO NOTHING` turns a duplicate into `changes === 0` instead of
  * a thrown constraint error, so the duplicate path never depends on matching the text of
  * a D1 error message.
+ *
+ * C6: this is a WRITE, so the predicate is the column, bound from the scope. `app_id` and
+ * `app_key_id` are appended to the end of the column list rather than slotted in beside
+ * `site`, because a column list is order-sensitive against its VALUES and the two lists
+ * are read together far more often than either is read alone.
+ *
+ * `ON CONFLICT(fingerprint)` is UNCHANGED and must stay so: the tenant is already inside
+ * the hashed input (A11 above), so two tenants filing the same sentence about the same page
+ * produce two different fingerprints and both rows land. Naming a different index here
+ * would be the change A11 exists to avoid.
+ *
+ * `app_key_id` is null for every principal that exists in phase 1, because only an `app`
+ * principal presents a key. It is written now rather than in phase 2 so that the column
+ * list and the VALUES do not have to be touched again to start recording it.
  */
-export async function insertReport(db, row) {
+export async function insertReport(db, scope, row) {
   try {
     const res = await db
       .prepare(
         `INSERT INTO reports
            (id, created_at, site, url, target_kind, target_id, target_label,
-            kind, body, contact, status, public, ip_hash, fingerprint)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 1, ?, ?)
+            kind, body, contact, status, public, ip_hash, fingerprint,
+            app_id, app_key_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 1, ?, ?, ?, ?)
          ON CONFLICT(fingerprint) DO NOTHING`,
       )
       .bind(
@@ -126,6 +172,8 @@ export async function insertReport(db, row) {
         row.contact || null,
         row.ip_hash,
         row.fingerprint,
+        tenantKey(scope),
+        scopeKeyId(scope),
       )
       .run();
     if (!res.meta || res.meta.changes === 0) return { duplicate: true };
@@ -167,15 +215,29 @@ const DESK_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_
  * term is written here exactly as it is written in migrations/0002_open_items.sql, since
  * SQLite matches a partial index by implication and a reworded predicate silently loses
  * the index while returning identical rows.
+ *
+ * C6: the tenant term is bound, and it is written FIRST because `app_id` is the LEADING
+ * column of all four indexes this query now seeks (reports_app_created,
+ * reports_app_status_created, reports_app_fix_created, reports_app_fix_status_created, from
+ * migrations/0004_tenants.sql). The ORDER of the terms in this string is for the reader:
+ * SQLite reorders WHERE terms itself, so it is the term's PRESENCE that matters, and
+ * Cloudflare's rule is what makes presence non-optional. A multi-column index is used only
+ * if the query names every column to the left of the ones it needs, so a page that did not
+ * mention `app_id` at all would seek none of these four, be perfectly correct, and become a
+ * scan that only rows_read would report. Writing it first keeps the string in the shape of
+ * the index it is meant to land on, which is how the next person checks that it still does.
+ *
+ * No partial predicate mentions `app_id`, so the implication that matches `kind <> 'open'`
+ * against the two partial indexes is unaffected.
  */
-export async function listReports(db, { status, kind, before, limit }) {
+export async function listReports(db, scope, { status, kind, before, limit }) {
   const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;
   const kindTerm = kind ? 'kind = ?' : "kind <> 'open'";
   const statusTerm = status ? 'status = ? AND ' : '';
   const sql = `SELECT ${DESK_COLUMNS} FROM reports
-        WHERE ${kindTerm} AND ${statusTerm}created_at < ?
+        WHERE app_id = ? AND ${kindTerm} AND ${statusTerm}created_at < ?
         ORDER BY created_at DESC LIMIT ?`;
-  const args = [...(kind ? [kind] : []), ...(status ? [status] : []), cursor, limit];
+  const args = [tenantKey(scope), ...(kind ? [kind] : []), ...(status ? [status] : []), cursor, limit];
   try {
     const res = await db.prepare(sql).bind(...args).run();
     const rows = res.results || [];
@@ -189,9 +251,25 @@ export async function listReports(db, { status, kind, before, limit }) {
   }
 }
 
-export async function getReport(db, id) {
+/**
+ * One report by id.
+ *
+ * C6: the tenant term is bound, and it is what makes an id a per-tenant handle rather than
+ * a global one. An id is not a secret: it is in a URL, in a desk card, in an operator's
+ * clipboard. Without this term, knowing an id would be enough to read another tenant's
+ * report text, and the answer would look ordinary. With it, the row is simply not found,
+ * and NOT_FOUND is the honest answer to "a report you cannot see".
+ *
+ * The term is written after `id` because `reports` has `id` as its PRIMARY KEY: the lookup
+ * is one row by rowid and the tenant check is a comparison on that row, so no index choice
+ * turns on the order here.
+ */
+export async function getReport(db, scope, id) {
   try {
-    const row = await db.prepare(`SELECT ${DESK_COLUMNS} FROM reports WHERE id = ?`).bind(id).first();
+    const row = await db
+      .prepare(`SELECT ${DESK_COLUMNS} FROM reports WHERE id = ? AND app_id = ?`)
+      .bind(id, tenantKey(scope))
+      .first();
     return { report: row ? toReport(row) : null };
   } catch (err) {
     return storeError('get', err);
@@ -210,11 +288,31 @@ const OUT_OF_QUEUE = "AND (work_state IS NULL OR work_state NOT IN ('approved', 
  * operator could have moved the report, and without that guard the second writer would
  * win a transition that was never legal from the state the row is actually in. With it,
  * the write matches nothing and the caller gets BAD_TRANSITION, which is the truth.
+ *
+ * C6: BOTH statements carry the bound tenant term, and the second one is not redundant.
+ * The read establishing that the row is this tenant's does not constrain the write: they
+ * are separate statements with a decision between them, so the write is guarded on its own
+ * terms exactly as it already is for `status`. Adding the term to the read alone would make
+ * the tenant check a time-of-check-to-time-of-use gap in the one function in this file that
+ * has already been written twice to close such a gap.
+ *
+ * The write's tenant term is LAST, after the interpolated OUT_OF_QUEUE, and its position is
+ * not a preference. tests/work-rules.test.mjs's #64 tripwire matches the source text
+ * `WHERE id = ? AND status = ? ${closing ? OUT_OF_QUEUE : ''}` as one contiguous string, so a
+ * term inserted between `id` and `status` breaks a test that is watching something else
+ * entirely (that a closing move repeats the work-queue check inside its write). Keeping the
+ * shape it asserts means nothing here loosened an existing expectation to make room. The
+ * lookup is by primary key, so the term's position costs nothing: `id = ?` picks one row and
+ * `app_id = ?` decides whether this caller may have it.
  */
-export async function applyTransition(db, { id, actor, patch, now }) {
+export async function applyTransition(db, scope, { id, actor, patch, now }) {
+  const appId = tenantKey(scope);
   let current;
   try {
-    current = await db.prepare('SELECT id, status, kind, work_state FROM reports WHERE id = ?').bind(id).first();
+    current = await db
+      .prepare('SELECT id, status, kind, work_state FROM reports WHERE id = ? AND app_id = ?')
+      .bind(id, appId)
+      .first();
   } catch (err) {
     return storeError('transition read', err);
   }
@@ -304,7 +402,7 @@ export async function applyTransition(db, { id, actor, patch, now }) {
            ai_at         = COALESCE(?, ai_at),
            decided_at    = COALESCE(?, decided_at),
            fixed_at      = COALESCE(?, fixed_at)
-         WHERE id = ? AND status = ? ${closing ? OUT_OF_QUEUE : ''}`,
+         WHERE id = ? AND status = ? ${closing ? OUT_OF_QUEUE : ''} AND app_id = ?`,
       )
       .bind(
         to,
@@ -320,6 +418,7 @@ export async function applyTransition(db, { id, actor, patch, now }) {
         fixedAt,
         id,
         from,
+        appId,
       )
       .run();
     if (!res.meta || res.meta.changes === 0) {
@@ -329,166 +428,20 @@ export async function applyTransition(db, { id, actor, patch, now }) {
     return storeError('transition write', err);
   }
 
-  return getReport(db, id);
+  return getReport(db, scope, id);
 }
 
-// ── The public log ────────────────────────────────────────────────────────────
-
-/**
- * C4's public log query, byte for byte the shape the contract froze, plus the keyset
- * cursor and limit. Two conditions, one table, still a filter.
- *
- * `body` and `contact` are absent from this SELECT and that is the point: the stranger's
- * raw text is never served from a neorgon.com domain. Only the operator's `public_note`
- * is. Adding `body` here would break settled decision 3 in one line, so do not.
- *
- * `kind <> 'open'` is the one amendment this query has taken. A resolved open item is a
- * board entry and not a correction: it names no site, no page and no reporter, so it
- * would land in the corrections log as a line about nothing. The term is written the same
- * way in migrations/0002_open_items.sql, which is what lets its partial index serve this.
- *
- * `url` is TRIMMED on the way out, by `publicUrl` below, for the same reason `body` is
- * absent: a page address the reporter was looking at is not neutral. /log is the only
- * cacheable, crawler-visible route this service has, and the Beacon sends `location.href`,
- * so the query string arrives whole. The stored column stays whole too, because the desk
- * needs it to reproduce the report. Only this projection is cut.
- */
-export async function publicLog(db, { before, limit }) {
-  const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;
-  try {
-    const res = await db
-      .prepare(
-        `SELECT site, url, target_label, public_note, fixed_ref, fixed_at
-           FROM reports
-          WHERE kind <> 'open' AND status = 'fixed' AND public = 1 AND fixed_at < ?
-          ORDER BY fixed_at DESC LIMIT ?`,
-      )
-      .bind(cursor, limit)
-      .run();
-    const rows = res.results || [];
-    return {
-      entries: rows.map((row) => ({ ...row, url: publicUrl(row.url) })),
-      rowsRead: res.meta ? res.meta.rows_read : null,
-      next: rows.length === limit ? rows[rows.length - 1].fixed_at : null,
-    };
-  } catch (err) {
-    return storeError('log', err);
-  }
-}
-
-/**
- * A stored page address as the public log may show it: origin plus pathname, and nothing
- * else. The key keeps the name `url`: the /log response shape is a frozen contract, and
- * the suite asserts its exact key set. This changes the value, never the envelope.
- *
- * What this drops, and why each one is not a hypothetical:
- *
- *   - the QUERY. A report filed from a Vitrina public shelf carries the owner's handle
- *     there, which privacy/index.html promises is kept out of any directory, and one filed
- *     from a Sash claim page carries a live bearer token until it expires.
- *   - the FRAGMENT. Purely client state, and the one place a page puts a value it never
- *     meant to send anywhere.
- *   - the USERINFO prefix. `new URL().origin` drops it, which is the reason the trim goes
- *     through the parser rather than through a regex over the string.
- *
- * Anything that does not parse, or is not http(s), becomes `null` rather than being passed
- * through: a `javascript:` or `data:` address reaching a public page as a rendered link is
- * a worse outcome than a log entry with no address on it.
- */
-function publicUrl(url) {
-  if (typeof url !== 'string' || url === '') return null;
-  try {
-    const parsed = new URL(url);
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return null;
-    return parsed.origin + parsed.pathname;
-  } catch {
-    return null;
-  }
-}
-
-// ── The per-site read-back ────────────────────────────────────────────────────
-
-/**
- * One GROUP BY, and the only thing in the whole system that would ever notice a Beacon
- * that silently stopped working. Every other check this campaign builds is a static check
- * on files: they prove the widget was copied, not that a report ever arrived.
- *
- * A site absent from this list either has no visitors or has a broken widget, and the
- * operator can tell which in one click by opening the site.
- *
- * IMPORTED OPEN ITEMS ARE EXCLUDED, and that exclusion is the whole reason this signal
- * still means anything. They carry their source name in `site` because the column is NOT
- * NULL, they arrive in the hundreds from one command, and counting them here would put
- * four invented sites at the top of the list and drown the one number that says a real
- * Beacon is alive.
- */
-export async function healthSites(db, since) {
-  try {
-    const res = await db
-      .prepare(
-        `SELECT site, COUNT(*) AS reports, MAX(created_at) AS last_at
-           FROM reports
-          WHERE kind <> 'open' AND created_at >= ?
-          GROUP BY site
-          ORDER BY reports DESC`,
-      )
-      .bind(since)
-      .run();
-    return { sites: res.results || [], rowsRead: res.meta ? res.meta.rows_read : null };
-  } catch (err) {
-    return storeError('health', err);
-  }
-}
-
-// ── C3: the operator lockout ──────────────────────────────────────────────────
-
-export const LOCKOUT_MAX_FAILURES = 5;
-export const LOCKOUT_MS = 15 * 60 * 1000;
-
-/**
- * Checked BEFORE the token comparison, so a locked out caller never reaches the
- * comparison at all. Five failures then fifteen minutes. The binding cannot express this
- * (A3), which is why it is here.
- */
-export async function checkLock(db, key, now) {
-  try {
-    const row = await db.prepare('SELECT failures, locked_until FROM auth_attempts WHERE key = ?').bind(key).first();
-    if (!row) return { locked: false };
-    return { locked: row.locked_until > now, until: row.locked_until };
-  } catch (err) {
-    // A store failure must not open the door. Treat it as locked and let the operator
-    // read STORE_ERROR from /health rather than silently dropping the lockout.
-    console.error('d1 lock read failed:', err);
-    return { locked: true, unavailable: true };
-  }
-}
-
-/** Recorded AFTER the comparison. Success clears the counter; failure advances it. A failure
- *  once a lock has run out starts again at one, so an expired lock costs five more tries:
- *  counting on from five, a stale credential on a schedule relocked the address every run. */
-export async function recordAuthResult(db, key, success, now) {
-  try {
-    if (success) {
-      await db.prepare('DELETE FROM auth_attempts WHERE key = ?').bind(key).run();
-      return;
-    }
-    await db
-      .prepare(
-        `INSERT INTO auth_attempts (key, failures, locked_until, updated_at)
-         VALUES (?, 1, 0, ?)
-         ON CONFLICT(key) DO UPDATE SET
-           failures     = CASE WHEN auth_attempts.locked_until > 0 AND auth_attempts.locked_until <= ? THEN 1
-                               ELSE auth_attempts.failures + 1 END,
-           locked_until = CASE WHEN auth_attempts.locked_until > 0 AND auth_attempts.locked_until <= ? THEN 0
-                               WHEN auth_attempts.failures + 1 >= ? THEN ? ELSE auth_attempts.locked_until END,
-           updated_at   = ?`,
-      )
-      .bind(key, now, now, now, LOCKOUT_MAX_FAILURES, now + LOCKOUT_MS, now)
-      .run();
-  } catch (err) {
-    console.error('d1 lock write failed:', err);
-  }
-}
+// ── Moved out ─────────────────────────────────────────────────────────────
+//
+// `publicLog` and `healthSites` are in src/store-public.js, because both are reachable
+// with no credential and both carry `app_id = 'fleet'` as a LITERAL rather than as a bound
+// parameter (C6.5). Grouping them makes that rule a property of a file.
+//
+// `checkLock` and `recordAuthResult` are in src/store-auth.js, with the reason
+// `auth_attempts` has no tenant column and must not gain one.
+//
+// This file stayed under the 500-line repo limit only because they left. Do not move them
+// back to keep an import shorter.
 
 // ── Row shaping ───────────────────────────────────────────────────────────────
 

@@ -2,8 +2,20 @@
 // The runner's actions (claim, heartbeat, release, submit, land) are the other half, in
 // src/store-work-runner.js. The queue was split in two by WHO ACTS when one file passed the
 // fleet's 500 line cap, and that is also the line a reviewer most wants drawn: everything a
-// person decides is here, everything automation may do is there. With src/store.js and
-// src/store-open.js, these are the four files in this Worker that contain SQL.
+// person decides is here, everything automation may do is there. With src/store.js,
+// src/store-public.js, src/store-auth.js and src/store-open.js, these are the six files in
+// this Worker that contain SQL.
+//
+// C6, AND WHY EVERY PREDICATE IN THIS FILE IS THE LITERAL 'fleet'. Invariant 4.3:
+// `work_state IS NOT NULL` implies `app_id = 'fleet'`. It holds because the only statements
+// that write a non-null work_state are here and in src/store-work-runner.js and all carry the
+// literal (A16). No function here takes a scope: a scope parameter would say the queue is
+// per-tenant, and it is not. A statement with NO predicate is one of two kinds, and says which
+// on itself, because C6 admits no third kind. INHERITED: the second statement of the batch
+// shape described below, which carries EXISTS on the row the first one wrote and the stamp it
+// set, so the first statement's literal covers it. work_runs: that table only, which has no
+// tenant column and needs none, a run existing only for a queued row. ONE statement could not
+// take the predicate section 5 assigns it, listWork's TALLY; the reason is on the statement.
 //
 // Every action has the same three steps, for the reason src/store.js gives on
 // applyTransition:
@@ -50,6 +62,9 @@ const RUNS_SHOWN = 10;
 // The newest note a person wrote when sending a result back, from any run of the item. It
 // is a correlated read on work_runs_report inside the item's own SELECT, so a list stays one
 // query, and a card still says why the last attempt went back while the next one runs.
+//
+// C6: no predicate. `work_runs` only, correlated on `r.id` from an enclosing SELECT that carries
+// the literal, so it reads the runs of a row already established as the fleet's.
 const LAST_REVIEW_NOTE = `(SELECT n.review_note FROM work_runs n
     WHERE n.report_id = r.id AND n.review_note IS NOT NULL AND n.review_note <> ''
     ORDER BY n.claimed_at DESC LIMIT 1) AS last_review_note`;
@@ -175,13 +190,17 @@ const inFlight = () => ({
 
 export const changed = (res) => Boolean(res && res.meta && res.meta.changes > 0);
 
-/** The row and the fields of its current run that a rule reads. */
+/**
+ * The row and the fields of its current run that a rule reads. C6: THE MOST LOAD-BEARING LITERAL
+ * IN THIS FILE. Every action here and in src/store-work-runner.js begins by calling this and
+ * decides against what it returns, so a row this can see is a row an action can be attempted on.
+ * Without the term, one id is enough to have the rules run against a tenant's row. */
 export function readRow(db, id) {
   return db
     .prepare(
       `SELECT r.id, r.kind, r.status, r.filed_by, r.work_state, r.work_mode, r.work_run, r.work_attempts, r.work_lease_until,
               w.mode AS run_mode, w.needs_landing AS run_needs_landing, w.ended_at AS run_ended_at, w.end_reason AS run_end_reason
-         ${FROM_JOINED} WHERE r.id = ?`,
+         ${FROM_JOINED} WHERE r.id = ? AND r.app_id = 'fleet'`,
     )
     .bind(id)
     .first();
@@ -214,9 +233,10 @@ export async function explain(db, id, run, action, actor) {
   return holderRefusal(row, run, action, actor) || inFlight();
 }
 
+/** Every action's answer. C6: the tenant literal, invariant 4.3. */
 export async function workItem(db, id) {
   try {
-    const row = await db.prepare(`SELECT ${ITEM_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED} WHERE r.id = ?`).bind(id).first();
+    const row = await db.prepare(`SELECT ${ITEM_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED} WHERE r.id = ? AND r.app_id = 'fleet'`).bind(id).first();
     return row ? { item: toItem(row, joinedRun(row)) } : notFound();
   } catch (err) {
     return storeError('work item', err);
@@ -246,12 +266,23 @@ export async function listWork(db, { states, limit, before }) {
   try {
     const page = await db
       .prepare(
+        // C6: the tenant literal, invariant 4.3, written last so the terms before it keep the shape
+        // of reports_work_updated, whose partial predicate is repeated verbatim above. No tenant twin.
         `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED}
-          WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map(() => '?').join(',')}) ${cursor}
+          WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map(() => '?').join(',')})
+            AND r.app_id = 'fleet' ${cursor}
           ORDER BY r.work_updated_at DESC, r.id DESC LIMIT ?`,
       )
       .bind(...states, ...cursorArgs, limit)
       .run();
+    // C6: NO PREDICATE, by INVARIANT 4.3, and the one statement in section 5 that could not take
+    // the literal 5.3 assigns it. Do not add the term back: it makes an app_id-leading index a
+    // candidate, SQLite prefers it, and in a fleet-only table it matches every row, so the plan
+    // goes from COVERING INDEX reports_work_updated to reports_app_site_created plus a temp
+    // B-tree, the whole table fetched, rows_read 33 against a budget of 18 on work.test.mjs's own
+    // database. The count is right by the invariant instead: the only writes that make work_state
+    // non-null are approveWork below and CLAIMABLE in src/store-work-runner.js, both carrying the
+    // literal (A16), which tenant-scope.test.mjs counts after a full exercise and wants zero.
     const tally = await db
       .prepare('SELECT work_state, COUNT(*) AS n FROM reports WHERE work_state IS NOT NULL GROUP BY work_state')
       .run();
@@ -278,8 +309,14 @@ export async function listWork(db, { states, limit, before }) {
  */
 export async function readDetail(db, key, value) {
   try {
-    const row = await db.prepare(`SELECT ${DETAIL_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED} WHERE ${DETAIL_KEYS[key]}`).bind(value).first();
+    // C6: the tenant literal, invariant 4.3, and it matters more here because this SELECT carries
+    // DETAIL_COLUMNS: the body, the page, the source ref, all reached by a caller-supplied key.
+    const row = await db
+      .prepare(`SELECT ${DETAIL_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED} WHERE ${DETAIL_KEYS[key]} AND r.app_id = 'fleet'`)
+      .bind(value).first();
     if (!row) return { item: null };
+    // C6: no predicate. `work_runs` only, and `row.id` came from the scoped SELECT above, so
+    // these are the runs of a row already established as the fleet's.
     const history = await db
       .prepare(`SELECT ${RUN_COLUMNS} FROM work_runs WHERE report_id = ? ORDER BY claimed_at DESC LIMIT ?`)
       .bind(row.id, RUNS_SHOWN)
@@ -326,10 +363,14 @@ export async function insertDirectItem(db, { text, suggested, actor, now }) {
   try {
     const res = await db
       .prepare(
+        // C6: `app_id` is WRITTEN, as the literal 'fleet': one of the two writes that make
+        // invariant 4.3 true (the other is the import INSERT in src/store-open.js). The inner MAX
+        // carries it too, being a read over `reports`. ON CONFLICT(fingerprint) is UNCHANGED per
+        // A11, and app_id goes last so created_at stays the last BOUND column.
         `INSERT INTO reports
-           (id, filed_by, site, url, kind, body, status, public, fingerprint, source, source_ref, suggested, opened_at, created_at)
+           (id, filed_by, site, url, kind, body, status, public, fingerprint, source, source_ref, suggested, opened_at, created_at, app_id)
          VALUES (?, ?, ?, '', ?, ?, 'new', 1, ?, ?, ?, ?, ?,
-                 MAX(?, COALESCE((SELECT MAX(created_at) FROM reports WHERE kind = ?), 0) + 1))
+                 MAX(?, COALESCE((SELECT MAX(created_at) FROM reports WHERE kind = ? AND app_id = 'fleet'), 0) + 1), 'fleet')
          ON CONFLICT(fingerprint) DO NOTHING`,
       )
       .bind(id, filedBy, DIRECT_SOURCE, OPEN_KIND, text, fingerprint, DIRECT_SOURCE, ref, cleanSuggestion(suggested), now, now, OPEN_KIND)
@@ -348,7 +389,11 @@ export async function insertDirectItem(db, { text, suggested, actor, now }) {
  *  decided in the SQL from the row being written, never from the values read first: a
  *  claim and a release between the read and the write leave the row approved again, and
  *  writing the count read earlier back would erase that claim. An item C4 has closed is
- *  refused, and the write repeats that, so a close landing in between leaves it unqueued. */
+ *  refused, and the write repeats that, so a close landing in between leaves it unqueued.
+ *
+ *  C6: THIS IS THE WRITE THAT PUTS A ROW IN THE QUEUE, so its literal is what makes invariant 4.3
+ *  hold rather than merely describe the data. readRow already refused anything outside the fleet;
+ *  the term is on the write too for the reason `work_state IS ?` is, guarding what was decided. */
 export async function approveWork(db, { id, actor, mode, instruction, now }) {
   let row;
   try {
@@ -369,7 +414,7 @@ export async function approveWork(db, { id, actor, mode, instruction, now }) {
                 work_attempts = CASE WHEN work_state = 'approved' THEN work_attempts ELSE 0 END,
                 work_approved_at = CASE WHEN work_state = 'approved' THEN work_approved_at ELSE ? END,
                 work_updated_at = ?, work_lease_until = NULL
-          WHERE id = ? AND work_state IS ? AND status NOT IN ('fixed', 'rejected', 'spam', 'duplicate')`,
+          WHERE id = ? AND app_id = 'fleet' AND work_state IS ? AND status NOT IN ('fixed', 'rejected', 'spam', 'duplicate')`,
       )
       .bind(mode, instruction || null, now, now, id, from === NONE ? null : from)
       .run();
@@ -394,8 +439,12 @@ export async function withdrawWork(db, { id, actor, now }) {
 
   try {
     const [moved] = await db.batch([
-      db.prepare('UPDATE reports SET work_state = NULL, work_lease_until = NULL, work_updated_at = ? WHERE id = ? AND work_state = ?')
+      // C6: the tenant literal on the statement that moves the report, invariant 4.3.
+      db.prepare("UPDATE reports SET work_state = NULL, work_lease_until = NULL, work_updated_at = ? WHERE id = ? AND app_id = 'fleet' AND work_state = ?")
         .bind(now, id, from),
+      // C6: INHERITED, no predicate of its own. `work_runs` only, and its EXISTS is conditioned on
+      // the statement above having just written this row: same id, work_state now NULL, and that
+      // statement's stamp, bound again. One transaction, so no first write means no second write.
       db.prepare(
         `UPDATE work_runs SET ended_at = ?, end_reason = 'withdrawn'
           WHERE report_id = ? AND ended_at IS NULL
@@ -429,10 +478,13 @@ export async function reviewWork(db, { id, actor, decision, note, now }) {
 
   try {
     const [moved] = await db.batch([
+      // C6: the tenant literal on the statement that moves the report, invariant 4.3.
       db.prepare(
         `UPDATE reports SET work_state = ?, work_lease_until = NULL, work_updated_at = ?
-          WHERE id = ? AND work_state = 'review' AND work_run IS ?`,
+          WHERE id = ? AND app_id = 'fleet' AND work_state = 'review' AND work_run IS ?`,
       ).bind(to, now, id, row.work_run),
+      // C6: INHERITED, for the reason withdrawWork spells out: `work_runs` only, and the
+      // EXISTS names the row the first statement just wrote, its new state and its stamp.
       db.prepare(
         `UPDATE work_runs SET review = ?, review_note = ?, reviewed_at = ?
           WHERE id = ? AND report_id = ? AND review IS NULL

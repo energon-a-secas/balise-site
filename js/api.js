@@ -79,12 +79,17 @@ const SHAPE_FAIL = {
  * A rejected origin is deliberately indistinguishable from a network failure
  * here (C2.2: the Worker sends no CORS headers on that path, so the browser
  * refuses to let us read the body). That is the contract working, not a gap.
+ *
+ * TWO HEADERS, AND THERE IS NO THIRD. An `actor` option used to add
+ * `X-Balise-Actor`, and both are gone (A13). The Worker decides the actor from
+ * which secret matched and reads no such header; nothing here ever passed the
+ * option. Do not add a header that names a role or a tenant: a caller who can
+ * name their own role can name the more privileged one.
  */
-async function request(path, { method = 'GET', body = null, token = null, actor = null } = {}) {
+async function request(path, { method = 'GET', body = null, token = null } = {}) {
   const headers = {};
   if (body) headers['Content-Type'] = 'application/json';
   if (token) headers.Authorization = `Bearer ${token}`;
-  if (actor) headers['X-Balise-Actor'] = actor;
 
   let response;
   try {

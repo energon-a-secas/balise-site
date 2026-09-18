@@ -44,10 +44,10 @@ import {
   insertReport,
   listReports,
   applyTransition,
-  publicLog,
-  healthSites,
   rowsReadBudget,
 } from './store.js';
+import { publicLog, healthSites } from './store-public.js';
+import { FLEET_SCOPE, scopeFor } from './scope.js';
 import { verifyTurnstile } from './turnstile.js';
 import { authenticate, actorKey } from './auth.js';
 import { openImport, openSync, openBoard, openBoardSummary } from './routes-open.js';
@@ -91,6 +91,17 @@ async function readJson(request, provider, origin, env, { allowEmpty = false, ma
   }
 }
 
+/**
+ * The principal behind a matched credential, phase 1. C6.1 makes identify() in src/identity.js
+ * the only function allowed to turn a request into an identity; that file is WS-C's and does not
+ * exist yet, so this is the smallest possible stand-in for it, reading nothing from the request
+ * and only the actor authenticate() decided from which secret matched. When identify() lands,
+ * every call below becomes a call to it and this goes. Both kinds scope to 'fleet' (C6.1), which
+ * is why phase 1 changes nothing an outside caller can see; `person` and `app` are phase 2, do
+ * not add them here. And the actor is NEVER read from a request field (A13): a caller who can
+ * name their own role names the more privileged one, so X-Balise-Actor is gone for good. */
+const principalFor = (actor) => ({ kind: actor === 'ai' ? 'automation' : 'operator', actor });
+
 const tooLarge = (provider, origin, env, maxBytes, hint) =>
   fail('TOO_LARGE', {
     provider,
@@ -107,6 +118,16 @@ const ROUTES_HINT =
   'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board, GET /board/summary, the /work routes and GET /health.';
 
 // ── The router ────────────────────────────────────────────────────────────────
+// WHICH HANDLERS TAKE A SCOPE, AND WHY THE REST DO NOT. Three derive one and hand it to the
+// store: `deskList` and `deskPatch` from the credential that matched, and `ingest` from the
+// route itself (FLEET_SCOPE, reading no credential at all). The others pass none, which is a
+// statement rather than an omission, an unused scope parameter reading as a guard that is not
+// there. `importRoute` and `work` are fleet-only by invariant 4.3, open items and queued items
+// both, so src/store-open.js, src/store-work.js and src/store-work-runner.js carry the literal
+// and there is nothing to bind. `openBoard`, `openBoardSummary`, `resolvedLog` and `health`
+// carry the literal because C6.5 requires it: written that way, no tenant row CAN be published,
+// structurally, whatever a caller sends. So when a handler gains a scope argument, answer first
+// which statement binds it; if none does, it should not have one.
 
 const router = {
   async fetch(request, env) {
@@ -238,8 +259,15 @@ async function ingest(request, env, origin, ip, now) {
   const challenge = await verifyTurnstile(env, parsed.value.turnstile, ip);
   if (challenge) return fail(challenge.code, { provider: P, origin, env, message: challenge.message, hint: challenge.hint });
 
-  const fingerprint = await sha256Hex(fingerprintInput(report.site, report.target && report.target.id, report.body));
-  const result = await insertReport(env.DB, {
+  // THE SCOPE OF /report IS A FACT ABOUT THE ROUTE, NOT ABOUT THE CALLER. This handler never
+  // reads Authorization and never imports src/auth.js, which is why the Beacon works from 65
+  // origins with no credential at all, so there is no principal to derive a scope from and
+  // FLEET_SCOPE is a constant here: a stranger's report through a fleet site is the fleet's.
+  // Tenant ingest is a separate route with a key on it. Do not branch on a credential here, and
+  // do not let a body field choose an app_id.
+  const fpIn = fingerprintInput(FLEET_SCOPE.appId, report.site, report.target && report.target.id, report.body);
+  const fingerprint = await sha256Hex(fpIn);
+  const result = await insertReport(env.DB, FLEET_SCOPE, {
     ...report,
     id: crypto.randomUUID(),
     created_at: now,
@@ -271,7 +299,10 @@ async function deskList(request, env, origin, ip, now) {
   const params = validateListQuery(new URL(request.url).searchParams, STATUSES);
   if (params.code) return fail(params.code, { provider: P, origin, env, message: params.message, hint: params.hint });
 
-  const page = await listReports(env.DB, params.value);
+  // C6: the scope comes from the credential that matched, and from nothing in the request. A
+  // `?app=` is not read here and validateListQuery does not accept one, so there is no parameter
+  // for a caller to point at someone else's items.
+  const page = await listReports(env.DB, scopeFor(principalFor(auth.actor)), params.value);
   if (page.code) return fail(page.code, { provider: P, origin, env, message: page.message, hint: page.hint });
   warnRowsRead('desk', page.rowsRead, params.value.limit);
 
@@ -295,7 +326,11 @@ async function deskPatch(request, env, origin, ip, now, id) {
   const patch = validatePatch(parsed.value, STATUSES);
   if (patch.code) return fail(patch.code, { provider: P, origin, env, message: patch.message, hint: patch.hint });
 
-  const result = await applyTransition(env.DB, { id, actor: auth.actor, patch: patch.value, now });
+  // C6: the id in the path is a per-tenant handle, not a global one. The scope goes to the store
+  // so that an id belonging to someone else is simply NOT_FOUND, the honest answer, rather than a
+  // report the caller was never entitled to move.
+  const scope = scopeFor(principalFor(auth.actor));
+  const result = await applyTransition(env.DB, scope, { id, actor: auth.actor, patch: patch.value, now });
   if (result.code) return fail(result.code, { provider: P, origin, env, message: result.message, hint: result.hint });
 
   return ok(P, { report: result.report }, { origin, env });

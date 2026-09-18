@@ -17,6 +17,9 @@ import { sqliteD1 } from './sqlite-d1.mjs';
 import { originVerdict } from '../src/envelope.js';
 import { validatePatch } from '../src/validate.js';
 import { STATUSES, listReports, applyTransition } from '../src/store.js';
+// C6: the desk's read and the desk's write take a scope as their second argument now, and in
+// phase 1 the only scope is the fleet's. A path change only: no expectation below moved.
+import { FLEET_SCOPE } from '../src/scope.js';
 import { IMPORT_BATCH_MAX, upsertOpenItems, board, boardSummary, dayStamp } from '../src/store-open.js';
 import { insertDirectItem } from '../src/store-work.js';
 import { openImport, openSync } from '../src/routes-open.js';
@@ -51,7 +54,7 @@ async function reached(db, limit) {
   const ids = new Set();
   let before = null;
   for (let page = 0; page < 100; page += 1) {
-    const out = await listReports(db, { status: null, kind: 'open', before, limit });
+    const out = await listReports(db, FLEET_SCOPE, { status: null, kind: 'open', before, limit });
     assert.equal(out.code, undefined, JSON.stringify(out));
     out.reports.forEach((r) => ids.add(r.id));
     if (!out.next) break;
@@ -199,7 +202,7 @@ test('RECHECK 56: a resolution kept private is never the summary\'s latest, howe
     const { id } = db.sqlite.prepare('SELECT id FROM reports WHERE source_ref = ?').get(ref);
     const patch = validatePatch({ status: 'fixed', ...body }, STATUSES);
     assert.equal(patch.code, undefined, JSON.stringify(patch));
-    const out = await applyTransition(db, { id, actor: 'human', patch: patch.value, now });
+    const out = await applyTransition(db, FLEET_SCOPE, { id, actor: 'human', patch: patch.value, now });
     assert.equal(out.code, undefined, JSON.stringify(out));
     return out.report;
   };

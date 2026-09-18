@@ -28,19 +28,6 @@ export const TRANSITIONS = {
 };
 
 /**
- * The AI is authorised for exactly one edge: new -> triaged. Settled decision 4 of this
- * campaign ("triage and propose, never auto-apply") is enforced here rather than
- * described in a comment somewhere.
- *
- * READ THIS BEFORE TRUSTING IT. The AI job and the desk hold the SAME token today, so
- * the Worker tells them apart by the `X-Balise-Actor: ai` header, which the caller sets
- * about itself. That is an HONESTY MECHANISM, NOT A SECURITY BOUNDARY: it stops the job
- * from doing the wrong thing, and it does nothing at all against an attacker who already
- * holds the token, because that attacker simply omits the header. Do not later cite this
- * check as the reason the AI "cannot" change a report's status. If it ever needs to be a
- * boundary, the AI needs its own credential.
- */
-/**
  * What the AUTOMATION credential may do. Enforced against the token that
  * authenticated, never against a header the caller sets, so this is a real
  * boundary rather than the honesty mechanism it used to be.

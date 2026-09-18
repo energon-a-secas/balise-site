@@ -6,7 +6,7 @@
 // and /board/summary NEVER import this file: a public route that also honours a credential
 // is one refactor away from leaking the queue.
 
-import { checkLock, recordAuthResult } from './store.js';
+import { checkLock, recordAuthResult } from './store-auth.js';
 
 /** The one sentence a failed operator auth ever gets. It does not say which of the three
  *  things went wrong, because telling a prober "wrong token" rather than "no token" or
