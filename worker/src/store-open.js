@@ -34,7 +34,8 @@
 //      room to spare, and a second run of the same batch costs one, because every item is
 //      already there and nothing is written.
 //   2. rows_read counts rows SCANNED. Every query below sits on an index created in
-//      migrations/0002_open_items.sql, and tests/local-d1.test.mjs asserts the budget.
+//      migrations/0002_open_items.sql, tests/open-items.test.mjs asserts the budget, and
+//      tests/local-d1-plans.test.mjs pins the index each one is actually planned onto.
 //
 // D1 also caps BOUND PARAMETERS per query at 100, which is why the sync route resolves
 // what to close in JS from one small SELECT instead of sending the whole ref set into a
@@ -342,12 +343,25 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
         // "no tenant row can be published" in the hands of whatever called this. Written
         // as a literal, this query cannot select one.
         //
-        // The literal goes LAST, after status, so the first three terms read as exactly
-        // reports_board(kind, public, status) from migrations/0002_open_items.sql, which is
-        // the index this still seeks. There is no tenant twin of that index and 4.2 says
-        // why there should not be: every row this query can match is the fleet's already,
-        // so the added term is a per-row test on rows that all pass it and rows_read does
-        // not move. SQLite reorders WHERE terms itself, so the placement is for the reader.
+        // ONE STATEMENT, TWO PLANS, and the position of the literal decides neither.
+        // SQLite reorders WHERE terms itself, so the plan is identical with this term
+        // first, last or absent: what moves a plan is the PRESENCE of an app_id term,
+        // never where it is written. A28 corrects A18, which said "last" placement was
+        // what kept reports_board selected. Measured 2026-09-18 with make d1-query, and
+        // pinned by index name in tests/local-d1-plans.test.mjs:
+        //
+        //   accepted / opened_at   SEARCH reports USING INDEX reports_board, sought on
+        //                          (kind, public, status), then USE TEMP B-TREE FOR ORDER BY
+        //   fixed / fixed_at       SEARCH reports USING INDEX reports_public_log, sought on
+        //                          (status, public)
+        //
+        // So the open list does keep the full three-term seek on reports_board from
+        // migrations/0002_open_items.sql, and the resolved list was never on that index at
+        // all: reports_public_log serves it, which is why A29 withdrew the suggestion that
+        // that index is dead weight. There is still no tenant twin of either index and 4.2
+        // says why there should not be. Do not move this term to make a plan happen; it
+        // cannot. The one statement whose seek the term does narrow is the count in
+        // boardSummary below, and the note there has the numbers.
         `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state
            FROM reports
           WHERE kind = ? AND public = 1 AND status = ? AND app_id = 'fleet'
@@ -383,9 +397,39 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
  * busy with things nobody published, which is the side channel this endpoint must not be.
  *
  * FLEET ROWS ONLY, for the same class of reason and by the same kind of term. Both queries
- * carry `app_id = 'fleet'` as a LITERAL (C6.5), placed last so that reports_board is still
- * sought on its full key: a count that moved when a tenant's item moved would be exactly
- * the side channel above, one tenant wide, on an endpoint with no credential on it.
+ * carry `app_id = 'fleet'` as a LITERAL (C6.5): a count that moved when a tenant's item
+ * moved would be exactly the side channel above, one tenant wide, on an endpoint with no
+ * credential on it.
+ *
+ * WHAT THAT TERM COSTS THE COUNT, MEASURED. A18 said the literal's placement kept
+ * reports_board selected and DESIGN.md 4.2 line 931 says `rows_read` "does not move" here.
+ * Both are wrong for this statement, and placement is not the mechanism either way: SQLite
+ * reorders WHERE terms itself, so what moves the plan is the PRESENCE of an app_id term.
+ * Measured 2026-09-18 with make d1-query (A28). The seek keys are written as column lists
+ * rather than in EXPLAIN's own notation on purpose: tests/tenant-scope.test.mjs greps this
+ * whole file, comments included, for a BOUND app_id, and a pasted plan line would trip it.
+ *
+ *   counts, as shipped    SEARCH reports USING INDEX reports_app_status_created,
+ *                         sought on (app_id, status)
+ *   counts, no literal    SEARCH reports USING INDEX reports_board,
+ *                         sought on (kind, public, status)
+ *   latest, either way    SEARCH reports USING INDEX reports_public_log,
+ *                         sought on (status, public)
+ *
+ * So the count's seek narrows from three terms to two and `kind` and `public` become
+ * per-row tests: 208 index entries walked where the three-term seek walked 6, on the
+ * population the measurement was taken against. NO COVERING INDEX WAS LOST and nobody
+ * should go looking for one. This statement also reads `work_state` and `fixed_at` and
+ * neither is in reports_board, so the table lookup happens under both plans; a
+ * SELECT COUNT(*) proxy says otherwise and is the wrong query.
+ *
+ * THE COST IS ACCEPTED KNOWINGLY AND THE TERM STAYS (A28, the same reasoning as A17). This
+ * route carries no credential and is cacheable for five minutes, 202 extra index entries at
+ * this volume is nothing, and the term is the only thing that stops it publishing a
+ * tenant's counts if invariant 4.3 ever breaks. A fourth-term index would restore the seek
+ * and was refused: at 208 rows it does not earn an index write on every insert, so there is
+ * no 0005 to write for this. Both plans are pinned by index name in
+ * tests/local-d1-plans.test.mjs.
  */
 export async function boardSummary(db, { now, windowDays = SUMMARY_WINDOW_DAYS }) {
   const since = now - windowDays * 24 * 60 * 60 * 1000;

@@ -98,8 +98,14 @@ export async function openSync(env, payload, { origin, now }) {
  * GET /board. Public, no auth, cached for five minutes like the log.
  *
  * `rows_read` rides along for the same reason it does on /log: local D1 enforces no
- * quota, so that number and the assertion in tests/local-d1.test.mjs are the only things
- * that would notice this query starting to scan the table.
+ * quota, so that number is the only thing that would notice this query starting to scan
+ * the table. Two tests read it, and neither is on this file's side of the wire:
+ * tests/open-items.test.mjs bounds it with rowsReadBudget, and
+ * tests/local-d1-plans.test.mjs pins both board plans by index name.
+ *
+ * Unlike the desk and the log, these two routes do NOT call warnRowsRead: a page over
+ * budget is reported to the caller and never to the log. Wiring it here is a behaviour
+ * change on a cacheable public route, so it is phase 2's to make, not a comment's.
  */
 export async function openBoard(request, env) {
   const P = 'log';

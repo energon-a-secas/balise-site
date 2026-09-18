@@ -415,9 +415,9 @@ async function resolvedLog(request, env, origin) {
 
 /**
  * A4's read-back. rows_read counts rows SCANNED, and local D1 enforces no quota at all,
- * so this line plus the assertion in tests/local-d1.test.mjs is the only thing that would
- * notice a query that scans the table before it reaches production and burns the daily
- * allowance.
+ * so this line plus the budgets in tests/local-d1-rows.test.mjs is the only thing that
+ * would notice a query that scans the table before it reaches production and burns the
+ * daily allowance.
  */
 function warnRowsRead(what, rowsRead, limit) {
   const budget = rowsReadBudget(limit);

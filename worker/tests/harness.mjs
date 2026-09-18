@@ -156,3 +156,47 @@ export async function seedOpenItems(call, count, assert) {
     assert.equal(body.created, items.length);
   }
 }
+
+/** The three sentences seedPublished writes. Named so a suite can assert an answer is one of
+ *  them rather than matching on a substring it invented. */
+export const PUBLISHED = {
+  correction: 'Corrected the gloss on that entry.',
+  open: 'The fleet-wide compliance checker is being reworked and its exit codes change.',
+  resolved: 'Lockfiles are committed across the fleet now, so a fresh install is reproducible.',
+};
+
+/**
+ * One resolved CORRECTION, one open item published as OPEN, and one open item resolved, through
+ * the real PATCH route rather than planted. Call it after both seeders.
+ *
+ * It exists because /log, /board and /board/summary answer NOTHING on a table that has none of
+ * these, and a rows_read budget or a pinned plan for a query that returns nothing is worth
+ * nothing. tests/local-d1.test.mjs used to produce these as a side effect of its C4 cases, so
+ * the two suites split out of it (A31) would have inherited an empty board and an empty log.
+ */
+export async function seedPublished(call, assert) {
+  const ip = '192.0.2.200';
+  const pick = async (query) => (await call(`/reports?${query}`, { token: TOKEN, ip })).body.reports;
+  const patch = async (id, body) => {
+    const { res, body: out } = await call(`/reports/${id}`, { method: 'PATCH', body, token: TOKEN, ip });
+    assert.equal(res.status, 200, `publishing ${id} failed: ${JSON.stringify(out)}`);
+    return out.report;
+  };
+
+  // A correction takes two moves: C4 admits no shortcut from new to fixed.
+  const [correction] = await pick('kind=wrong&status=new&limit=1');
+  assert.ok(correction, 'there is no new correction to publish');
+  await patch(correction.id, { status: 'accepted' });
+  await patch(correction.id, { status: 'fixed', public_note: PUBLISHED.correction, fixed_ref: 'abc1234' });
+
+  // An open item whose tracker line is still open, and one whose line closed. The second goes
+  // straight to fixed: publishing it as open first would flash an entry already finished.
+  const drafts = await pick('kind=open&status=new&limit=50');
+  const stillOpen = drafts.find((r) => !r.source_closed_at);
+  const closed = drafts.find((r) => r.source_closed_at);
+  assert.ok(stillOpen, 'the import fixture has no open draft to publish');
+  assert.ok(closed, 'the import fixture has no closed draft to resolve');
+  await patch(stillOpen.id, { status: 'accepted', public_note: PUBLISHED.open });
+  await patch(closed.id, { status: 'fixed', public_note: PUBLISHED.resolved });
+  return PUBLISHED;
+}
