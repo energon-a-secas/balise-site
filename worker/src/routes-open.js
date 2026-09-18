@@ -109,9 +109,9 @@ export async function openSync(env, payload, { origin, now }) {
 /**
  * GET /board. Public, no auth, cached for five minutes like the log.
  *
- * `rows_read` rides along for the same reason it does on /log: local D1 enforces no
- * quota, so that number is the only thing that would notice this query starting to scan
- * the table. Three tests read it, and none is on this file's side of the wire:
+ * `rows_read` rides along for the same reason it does on /log: it counts rows SCANNED, and local
+ * D1 enforces no quota, so a query that reads the table costs nothing here and everything in
+ * production. Three tests read the number, and none is on this file's side of the wire:
  * tests/open-items.test.mjs, tests/local-d1-rows.test.mjs, which asserts the law below by
  * EQUALITY, and tests/local-d1-plans.test.mjs, which pins both board plans by index name.
  *
@@ -168,43 +168,23 @@ export async function openSync(env, payload, { origin, now }) {
  *      the summary 1, and a tenant's published resolution costs /board 1 and the summary 1.
  *      So even a per-entry ratio computed from what the route RETURNED is not a bound.
  *
- * So the detector is the equality assertion in tests/local-d1-rows.test.mjs, not a console.warn
- * against a constant. It measures all four terms from the database and asserts the law, so it is
- * red when the COST OF A ROW changes and silent when the board is merely busy.
+ * So the law above is written down as an EQUALITY in tests/local-d1-rows.test.mjs rather than as a
+ * console.warn against a constant: that test measures all four terms from the database and asserts
+ * the arithmetic. It is a build-time measurement against a fixture, and a fixture is not a
+ * production population: the law says a 500-entry board costs about 1,000 rows_read per uncached
+ * request, which is the shape of the index rather than a query regression, and an index is
+ * data-engineer's.
  *
- * Two things it is honestly not. It is a build-time check against a fixture, so it cannot see a
- * production population. And it is only PARTLY a scope test, which pass 0b measured rather than
- * assumed: deleting `app_id = 'fleet'` from each of the three board statements in turn, one at a
- * time, against this fixture.
- *
- *   summary, counts    RED     the one statement that spans every kind. Unscoped it walks the
- *                              tenant's rows too, so Af + Ff no longer bound it.
- *   /board             green   both arms filter kind = 'open'
- *   summary, latest    green   filters kind = 'open'
- *
- * The two greens are not holes in the assertion, and this is the useful part: on those statements
- * the literal is REDUNDANT TO THE COST, because no row a `kind = 'open'` seek can reach belongs to
- * a tenant. A rows_read law cannot detect the removal of a predicate that excludes nothing, and no
- * measurement will ever make it. What makes those two literals load-bearing is DESIGN.md 4.3, and
- * what holds 4.3 is a COUNT in tests/tenant-invariants.test.mjs, not this file's arithmetic.
- * (A39 reported two of three blind, which is still the count. The set is not the same set, and the
- * reason per statement is what was missing.)
- *
- * WHICH LEAVES A GAP, MEASURED IN THE SAME PASS AND NOT CLOSED IN IT. Deleting that one literal
- * from the summary's `latest` statement turns NOTHING in the suite red. The C6.5 structural
- * assertion in tests/tenant-scope.test.mjs is `literals.length >= 2` over the whole file, and this
- * file's store carries eleven, so nine of them can go while it stays green: it is COUNTED where it
- * needed to be per statement, which is the same defect A39 filed against the credential matcher
- * one test down. So do not delete a fleet literal on the strength of a green suite. Reported to
- * delivery-lead in the pass 0b report and qa-engineer's to close; not touched here, because this
- * pass was scoped to the credential matcher and widening it silently is how a gate loses its
- * meaning.
- *
- * WHAT IS STILL UNDETECTED, so nobody has to rediscover it: growth in PRODUCTION. The law says
- * a 500-entry board costs about 1,000 rows_read per uncached request, and nothing in this
- * repository would notice that. It is not a query regression, it is the shape of the index, and
- * an index is data-engineer's. Reported to delivery-lead in the phase 2 pass 0 report, not
- * fixed here.
+ * WHAT THE ARITHMETIC IS ABOUT, AND WHAT IT IS NOT ABOUT, because the two get confused. Of the
+ * three board statements that carry `app_id = 'fleet'`, two also test `kind = 'open'` (both arms of
+ * /board, and the summary's `latest`), and under DESIGN.md 4.3 every open item is the fleet's, so
+ * on those two the literal excludes no row the kind test does not exclude already: it moves none
+ * of the terms above. The summary's counts statement is the one that spans every kind, which is
+ * why Af and Ff are fleet-only counts while Ra, the population `latest` walks, is not scoped at
+ * all. A rows_read law is arithmetic about cost, so cost is the whole of what it is about, and
+ * two of those three literals cost nothing. The rule those three literals belong to is
+ * DESIGN.md 4.3 and contract C6.5, asserted per statement in tests/tenant-scope.test.mjs and as a
+ * COUNT over the database in tests/tenant-invariants.test.mjs.
  */
 export async function openBoard(request, env) {
   const P = 'log';

@@ -41,44 +41,97 @@ export const SRC = join(dirname(dirname(fileURLToPath(import.meta.url))), 'src')
 /** A Worker source file as text, for the assertions that are about an ABSENCE (C6.5). */
 export const source = (file) => readFileSync(join(SRC, file), 'utf8');
 
-/** Every `*.js` under src/, RECURSIVELY, as paths relative to src/ with forward slashes.
+/** Every JavaScript source file under src/, RECURSIVELY, as paths relative to src/ with forward
+ *  slashes.
  *
  *  Recursive because the assertions that enumerate this directory are about what no file does,
  *  and a one-level readdir answers that question for one level: A39 found that a module under
  *  src/<dir>/ was never scanned by the credential-boundary test and so was never covered by it.
  *  There is no such directory today, and this is what stops the day there is one from being the
- *  day the property quietly stops holding. */
+ *  day the property quietly stops holding.
+ *
+ *  The suffix test takes `.js`, `.mjs` and `.cjs` in ANY case, and the widening is the same hole
+ *  one level down: this list is what every rule in tests/tenant-scope.test.mjs is applied TO, so
+ *  a file the list leaves out is a file no rule looks at. `item.name.endsWith('.js')` left out
+ *  `routes-status.mjs` and `routes-status.JS`, both of which workerd loads and both of which QA-3
+ *  walked past the whole test with a credential read spelled out in full. The file list is the
+ *  test's reach, and a file's reach is decided by what the runtime will load, not by one spelling
+ *  of one suffix. */
 export function srcFiles(dir = SRC, prefix = '') {
   const out = [];
   for (const item of readdirSync(dir, { withFileTypes: true })) {
     if (item.isDirectory()) out.push(...srcFiles(join(dir, item.name), `${prefix}${item.name}/`));
-    else if (item.name.endsWith('.js')) out.push(`${prefix}${item.name}`);
+    else if (/\.[cm]?js$/i.test(item.name)) out.push(`${prefix}${item.name}`);
   }
   return out.sort();
 }
 
+/** The punctuation a `/` may follow and still open a REGEX rather than divide. */
+const PUNCT_BEFORE_REGEX = '=(,:[!&|?{};+-*%~^<>';
+/** The KEYWORDS a `/` may follow and still open a regex. `return /x/` and `typeof /x/` are regex
+ *  literals and `total / 2` is a division, and the character before the slash is a letter in both
+ *  cases, so the last complete word is what tells them apart. `return` missing from this set is
+ *  what QA-3 exploited: `return /\/*x/` was read as code, the `/*` two characters later opened a
+ *  block comment that the source never had, and everything up to the next comment terminator
+ *  was deleted with it. */
+const WORD_BEFORE_REGEX = new Set([
+  'return', 'typeof', 'case', 'throw', 'do', 'else', 'in', 'of', 'new', 'delete', 'void',
+  'await', 'yield', 'instanceof',
+]);
+/** The keywords whose `(...)` is a HEAD and not a call, which is the other position QA-3 named:
+ *  `sum(a)/2` divides, `if (a) /x/.test(s)` does not, and the character before the slash is `)`
+ *  in both. */
+const CONTROL_HEAD = new Set(['if', 'while', 'for', 'catch', 'with']);
+const CLOSER = { '(': ')', '[': ']', '{': '}' };
+
 /**
- * A Worker source file with its COMMENTS REMOVED and everything else left where it was, for the
- * assertions that are about what the code does rather than what a comment says about it.
+ * One pass over a Worker source file, giving three views of it:
+ *
+ *   code      comments removed and everything else left where it was, for the assertions that
+ *             are about what the code does rather than what a comment says about it.
+ *   bare      comments removed AND every string, template and regex literal emptied, so a name
+ *             in it is a name the CODE uses. `headers` in `{ 'Cache-Control': 'x' }` is a name
+ *             the code uses; `headers` inside a sentence a reader will see is not.
+ *   literals  the body of every string and template literal, for the assertions that are about
+ *             what a file may NAME. A specifier or a header name assembled out of pieces is a
+ *             hole in any matcher that reads the code and not the pieces.
  *
  * IT IS A SCANNER AND NOT A REGEX, and the reason is a hole A39 found by exploiting it. The
- * previous version was `text.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')`, which cannot tell a
+ * first version was `text.replace(/\/\/[^\n]*|\/\*[\s\S]*?\*\//g, '')`, which cannot tell a
  * comment from a `//` inside a string: one `https://` on a line DELETED THE REST OF THAT LINE,
  * real code included, so a credential read written after a URL literal was invisible to the test
- * that exists to find it. Strings, template literals and regex literals are tracked here for that
+ * that exists to find it. Strings, template literals and regex literals are tracked for that
  * reason, and newlines are preserved so a reported position still means something.
  *
- * What it is not: a parser. A `//` inside a template literal's ${} expression is treated as
- * string content rather than as a comment, which leaves a comment in place (a false POSITIVE, so
- * it fails loudly) and never removes code.
+ * IT REFUSES RATHER THAN RETURNS when its own reading of the file has come apart, because both
+ * of the failures this function can have are SILENT in the direction that matters. Deleting text
+ * that was never a comment hides a credential read from the matcher downstream; leaving a comment
+ * in place only makes the matcher strict, which is a red with a name on it. So it throws on a
+ * block comment that never closes and on brackets that do not balance once the comments are out,
+ * and the two bracket counts are what would have caught QA-3's exploit even in a position this
+ * function still reads wrongly.
+ *
+ * What it is not: a parser. A `${...}` expression inside a template literal is treated as literal
+ * content rather than as code, so a name used only there is in `literals` and not in `bare`; the
+ * files this matters for are asserted to contain no `${` at all.
  */
-export function stripComments(text) {
-  let out = '';
+export function scanSource(text, where = 'the text') {
+  let code = '';
+  let bare = '';
+  const literals = [];
   let i = 0;
-  // The last character that was neither whitespace nor part of a comment. It is what tells a
-  // regex literal from a division: `/` after a value divides, `/` after an operator opens one.
+  // The last character that was neither whitespace nor part of a comment, the last complete word
+  // before it, and whether the `)` we just passed closed an `if (...)` rather than a call.
   let prev = '';
-  const REGEX_MAY_START = '=(,:[!&|?{};+-*%~^<>';
+  let word = '';
+  let inWord = false;
+  let afterControlClose = false;
+  const heads = [];
+  const brackets = [];
+  const regexMayStart = () => prev === ''
+    || PUNCT_BEFORE_REGEX.includes(prev)
+    || WORD_BEFORE_REGEX.has(word)
+    || (prev === ')' && afterControlClose);
   while (i < text.length) {
     const c = text[i];
     const d = text[i + 1];
@@ -90,37 +143,92 @@ export function stripComments(text) {
       i += 2;
       while (i < text.length && !(text[i] === '*' && text[i + 1] === '/')) {
         // Newlines are kept so that nothing downstream reads a 40-line comment as one line.
-        if (text[i] === '\n') out += '\n';
+        if (text[i] === '\n') { code += '\n'; bare += '\n'; }
         i += 1;
+      }
+      if (i >= text.length) {
+        throw new Error(`scanSource: ${where} has a block comment that is never closed, so this scanner would have deleted the rest of the file and every assertion over it would have passed on nothing`);
       }
       i += 2;
       continue;
     }
-    if (c === "'" || c === '"' || c === '`' || (c === '/' && (prev === '' || REGEX_MAY_START.includes(prev)))) {
+    if (c === "'" || c === '"' || c === '`' || (c === '/' && regexMayStart())) {
       const close = c;
-      out += c;
+      let body = '';
+      // A `/` inside a regex's CHARACTER CLASS does not end the regex: `/^\/work\/([^/]+)$/`
+      // ends at the last slash and not at the one inside `[^/]`. Reading it as ending early
+      // leaves `]+)$/` behind as code, which is how the bracket count below found this.
+      let inClass = false;
+      code += c;
       i += 1;
       while (i < text.length) {
-        if (text[i] === '\\') { out += text.slice(i, i + 2); i += 2; continue; }
-        out += text[i];
+        if (text[i] === '\\') { code += text.slice(i, i + 2); body += text.slice(i, i + 2); i += 2; continue; }
+        const ch = text[i];
+        code += ch;
+        body += ch;
         i += 1;
-        if (text[i - 1] === close) break;
+        if (close === '/' && ch === '[') inClass = true;
+        else if (close === '/' && ch === ']') inClass = false;
+        else if (ch === close && !inClass) break;
         // An unterminated literal would otherwise run to the end of the file and hide
         // everything after it, which is the failure mode this whole function exists to refuse.
-        if (text[i - 1] === '\n' && close !== '`') break;
+        if (ch === '\n' && close !== '`') break;
       }
+      // The quotes stay in `bare` so that an empty string is still visibly a string, and the
+      // newlines of a multi-line template stay so that positions do not move.
+      bare += c + (body.match(/\n/g) || []).join('') + (body.endsWith(close) ? close : '');
+      if (close !== '/') literals.push({ quote: close, body: body.endsWith(close) ? body.slice(0, -1) : body });
       prev = close;
+      word = '';
+      inWord = false;
+      afterControlClose = false;
       continue;
     }
-    out += c;
+    code += c;
+    bare += c;
     i += 1;
+    if (/[A-Za-z0-9_$]/.test(c)) {
+      word = inWord ? word + c : c;
+      inWord = true;
+    } else {
+      inWord = false;
+      if (!/\s/.test(c)) word = '';
+    }
+    if (c === '(') heads.push(CONTROL_HEAD.has(prevWordAt(code)));
+    if (c === ')') afterControlClose = heads.length ? heads.pop() : false;
+    else if (!/\s/.test(c)) afterControlClose = false;
+    if (CLOSER[c]) brackets.push(c);
+    if (c === ')' || c === ']' || c === '}') {
+      const open = brackets.pop();
+      if (!open || CLOSER[open] !== c) {
+        throw new Error(`scanSource: ${where} closes a '${c}' that was never opened once the comments are out, which means this scanner deleted code rather than a comment. A credential read inside the deleted part would be invisible to every assertion built on it, so this refuses instead of handing back a file it has misread`);
+      }
+    }
     if (!/\s/.test(c)) prev = c;
   }
-  return out;
+  if (brackets.length) {
+    throw new Error(`scanSource: ${where} has ${brackets.length} unclosed '${brackets[brackets.length - 1]}' once the comments are out, which means this scanner deleted code rather than a comment. A credential read inside the deleted part would be invisible to every assertion built on it, so this refuses instead of handing back a file it has misread`);
+  }
+  return { code, bare, literals };
 }
 
+/** The word immediately before the `(` that has just been emitted, for the control-head test. */
+function prevWordAt(code) {
+  const m = code.slice(0, -1).match(/([A-Za-z0-9_$]+)\s*$/);
+  return m ? m[1] : '';
+}
+
+/** Comment removal on its own, kept as its own name because the unit test below is about it. */
+export const stripComments = (text, where) => scanSource(text, where).code;
+
 /** One Worker source file, comments removed. The pairing the assertions use. */
-export const codeOf = (file) => stripComments(source(file));
+export const codeOf = (file) => scanSource(source(file), `src/${file}`).code;
+
+/** One Worker source file, comments removed and every literal emptied. */
+export const bareOf = (file) => scanSource(source(file), `src/${file}`).bare;
+
+/** Every string and template literal in one Worker source file, bodies only. */
+export const literalsOf = (file) => scanSource(source(file), `src/${file}`).literals;
 
 export const T = 1_757_000_000_000;
 export const FLEET_MARK = 'FLEET-CANARY';

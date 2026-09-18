@@ -23,8 +23,14 @@ import {
 } from '../src/store-work-runner.js';
 import {
   T, FLEET_MARK, TENANT_MARK, TENANT, TENANT_KEY, markOf, json,
-  snapshot, plantReport, fleetOnly, source, srcFiles, codeOf, stripComments,
+  snapshot, plantReport, fleetOnly, source, srcFiles, codeOf, bareOf, literalsOf, stripComments,
 } from './tenant-fixture.mjs';
+
+/** How many SQL statements over `reports` live in each of the two files that serve a
+ *  credential-free route. Pinned so that a statement the extractor in C6.5 cannot see is a red
+ *  rather than a silent gap in what that assertion covers: the assertion is per statement, so its
+ *  reach is exactly the statements this number counts. */
+const SQL_STATEMENTS = { 'store-public.js': 2, 'store-open.js': 9 };
 
 // ── The seam ──────────────────────────────────────────────────────────────────
 
@@ -178,24 +184,81 @@ test('C6.5: the three public reads count the fleet only, and take the literal ra
   // site can ever be handed a key that makes them publish a tenant's row: a bound parameter
   // would put "no tenant row can be published" in the hands of every future caller, and these
   // routes carry no credential to stop one. An absence cannot be shown by a value, so it is
-  // asserted over the source: no file with a public read in it binds `app_id` at all.
-  for (const file of ['store-public.js', 'store-open.js']) {
-    const text = source(file);
-    const literals = text.match(/app_id = 'fleet'/g) || [];
-    assert.ok(literals.length >= 2, `src/${file} carries ${literals.length} fleet literals`);
-    assert.doesNotMatch(text, /app_id\s*=\s*\?/, `src/${file} binds app_id, which C6.5 says it must not`);
-    assert.doesNotMatch(text, /tenantKey|scopeFor/, `src/${file} reaches for a scope, which C6.5 says it must not`);
+  // asserted over the source.
+  //
+  // PER STATEMENT, AND OVER THE CODE RATHER THAN THE FILE. This counted `app_id = 'fleet'` over
+  // source(file) with the comments in it and asked for two, which src/store-public.js can satisfy
+  // with the two comment lines that DECLARE the rule and no SQL at all, and which src/store-open.js
+  // can satisfy with two of its nine statements. A count over a file cannot say which statement
+  // lost its predicate, and naming the statement is the whole job here (QA-3 finding F1).
+  for (const [file, expected] of Object.entries(SQL_STATEMENTS)) {
+    const code = codeOf(file);
+    const statements = literalsOf(file)
+      .map(({ body }) => body.replace(/\s+/g, ' ').trim())
+      .filter((sql) => /\b(SELECT|INSERT INTO|UPDATE|DELETE FROM)\b/.test(sql) && /\breports\b/.test(sql));
+    assert.equal(
+      statements.length, expected,
+      `src/${file} has ${statements.length} SQL statements over \`reports\` where this test expects ${expected}. If you added one, put the new number here and make sure it carries the literal. If you MOVED one out of a template literal, put it back: a statement this extractor cannot see is a statement no assertion below is applied to.`,
+    );
+    for (const sql of statements) {
+      assert.match(
+        sql, /app_id = 'fleet'/,
+        `a statement in src/${file} reads or writes \`reports\` without \`app_id = 'fleet'\` in it, and every statement in a file that serves a credential-free route carries the literal (C6.5): ${sql}`,
+      );
+    }
+    assert.doesNotMatch(code, /app_id\s*=\s*\?/, `src/${file} binds app_id, which C6.5 says it must not`);
+    assert.doesNotMatch(code, /tenantKey|scopeFor/, `src/${file} reaches for a scope, which C6.5 says it must not`);
   }
 });
 
-/** The two files the four credential-free routes live in. /report and /log are in the first,
- *  /board and /board/summary in the second. */
-const PUBLIC_ROUTE_FILES = ['routes-public.js', 'routes-open.js'];
+/**
+ * Every JavaScript file under src/, and what each one may do with A CALLER'S CREDENTIAL. The keys
+ * are asserted to be exactly srcFiles(), so a file added under src/ turns this test red until
+ * somebody has said which of these four it is.
+ *
+ *   'credential'  may read a credential header out of a request. src/auth.js, alone.
+ *   'desk'        may reach src/auth.js. src/routes-desk.js, alone.
+ *   'public'      holds a route that answers with NO credential at all. A file in this role may
+ *                 NAME only what MAY_NAME lists for it, which is the one rule here that does not
+ *                 depend on guessing how a credential might be spelled.
+ *   'plain'       everything else. Held to the header and specifier matches below, which are
+ *                 matches on SPELLINGS and are the weaker half of this test.
+ */
+const SRC_ROLES = {
+  'auth.js': 'credential',
+  'budget.js': 'plain',
+  'envelope.js': 'plain',
+  'index.js': 'plain',
+  'keys.js': 'plain',
+  'redact.js': 'plain',
+  'routes-desk.js': 'desk',
+  'routes-open.js': 'public',
+  'routes-public.js': 'public',
+  'routes-work.js': 'plain',
+  'scope.js': 'plain',
+  'store-auth.js': 'plain',
+  'store-open.js': 'plain',
+  'store-public.js': 'plain',
+  'store-work-runner.js': 'plain',
+  'store-work.js': 'plain',
+  'store.js': 'plain',
+  'suggestion.js': 'plain',
+  'transitions.js': 'plain',
+  'turnstile.js': 'plain',
+  'validate-work.js': 'plain',
+  'validate.js': 'plain',
+  'work.js': 'plain',
+};
+const filesInRole = (role) => Object.keys(SRC_ROLES).filter((f) => SRC_ROLES[f] === role).sort();
+
+/** The two files the four credential-free routes live in. /report, /log and /health are in the
+ *  first, /board and /board/summary in the second. */
+const PUBLIC_ROUTE_FILES = filesInRole('public');
 /** The only file in the Worker that may read a credential out of a request. */
-const MAY_READ_A_CREDENTIAL = ['auth.js'];
+const MAY_READ_A_CREDENTIAL = filesInRole('credential');
 /** The only file that may reach src/auth.js. Named rather than counted: a count passes when the
  *  importer MOVES, and where it lives is the point. */
-const MAY_IMPORT_AUTH = ['routes-desk.js'];
+const MAY_IMPORT_AUTH = filesInRole('desk');
 /** Request headers that carry who the caller is. X-Balise-Actor is gone for good (src/auth.js and
  *  src/routes-desk.js both say why) and is listed so that bringing it back is a red. */
 const CREDENTIAL_HEADERS = ['authorization', 'x-balise-actor', 'cookie', 'proxy-authorization'];
@@ -205,12 +268,105 @@ const ANY_HEADERS = /(?<!\.)\.headers\b/g;
 /** A header touched BY A NAME THAT IS WRITTEN OUT. Anchored, so it is tested against the text
  *  from one `.headers` onwards. */
 const NAMED_HEADER = /^\.headers\s*\.\s*(get|has|set|append|delete)\s*\(\s*(['"])([^'"\n]*)\2/;
-/** A module specifier that IS src/auth.js, however it is quoted and however deep the path it is
- *  reached by. `from './auth.js'`, `from "../auth.js"` and `await import('./auth.js')` all match;
- *  './store-auth.js' does not, because the optional prefix has to end at a slash. */
-const AUTH_SPECIFIER = /(['"])(?:[^'"\n]*\/)?auth\.js\1/;
+/** The text `auth.js` where it is not part of a longer file name, in any case and under any
+ *  quoting. It matches `from './auth.js'`, `from "../auth.js"`, `await import(\`./auth.js\`)`,
+ *  `import('./' + 'auth.js')` and `./Auth.js`, none of which the previous form matched except the
+ *  first two: it required a matching pair of straight quotes around the whole specifier, so a
+ *  backtick, a concatenation and a capital A each walked past it (QA-3 evasions b1, b2, b5).
+ *  `./store-auth.js` is excluded by the lookbehind rather than by a path rule. */
+const AUTH_SPECIFIER = /(?<![\w-])auth\.js/i;
 
-test('the four public routes cannot read a credential, because the file they live in cannot', () => {
+/**
+ * Every NAME the code of one file uses, which is a narrower thing than every token in it: a local
+ * variable reaches nothing by itself, and `const bearer = ...` is not interesting. Reaching a
+ * credential needs one of exactly three things, and all three are collected here.
+ *
+ *   a property read     `request.headers`, `res?.headers`, `Reflect.get(request, x)` (`get`)
+ *   a key inside braces `const { headers } = request`, `function h({ headers })`
+ *   a string literal    `request['headers']`, `'Authorization'`, `import('./' + 'auth.js')`
+ *
+ * Read off `bareOf`, which is the file with its comments removed and its literals emptied, so a
+ * sentence a reader will see cannot put a name on this list. Literals with a space in them are
+ * sentences rather than names and are left out for the same reason.
+ */
+function namesUsed(file) {
+  const bare = bareOf(file);
+  const names = new Set();
+  for (const hit of bare.match(/\.\s*[A-Za-z_$][A-Za-z0-9_$]*/g) || []) names.add(hit.replace(/^\.\s*/, ''));
+  const open = [];
+  const token = /[{}()[\]]|[A-Za-z_$][A-Za-z0-9_$]*/g;
+  let at = token.exec(bare);
+  while (at !== null) {
+    if ('{(['.includes(at[0])) open.push(at[0]);
+    else if (')]}'.includes(at[0])) open.pop();
+    else if (open[open.length - 1] === '{') {
+      const next = bare.slice(at.index + at[0].length).match(/^\s*(\S)/);
+      if (next && ',}='.includes(next[1])) names.add(at[0]);
+    }
+    at = token.exec(bare);
+  }
+  for (const { body } of literalsOf(file)) if (body !== '' && !/\s/.test(body)) names.add(body);
+  return [...names].sort();
+}
+
+/**
+ * What a file in the 'public' role may name. POSITIVE, and that is the whole point: every earlier
+ * version of this rule was a list of spellings to refuse, and each one lost to the next spelling
+ * (`.headers`, then `request['headers']`, then `const { headers } = request`, then `Reflect.get`,
+ * then a specifier built with `+`). A list of what may be named cannot be walked around by a new
+ * spelling, because a new spelling is a name that is not on it.
+ *
+ * `get`, `headers`, `Authorization`, `Reflect`, `./auth.js` and every case variant of those are
+ * absent from both lists, and the assertion is that absence rather than a rule about it.
+ */
+const MAY_NAME = {
+  'routes-open.js': [
+    '*', './envelope.js', './store-open.js', './store.js', './validate.js', 'ANY_ORIGIN',
+    'Access-Control-Allow-Origin', 'BOARD_LIMIT_MAX', 'CACHED', 'Cache-Control', 'DB',
+    'IMPORT_BATCH_MAX', 'OPEN_SOURCES', 'P', 'STATUSES', 'SUMMARY_WINDOW_DAYS', 'SYNC_REFS_MAX',
+    'board', 'boardSummary', 'checked', 'closed', 'code', 'created', 'desk', 'env', 'fail',
+    'hint', 'inProgress', 'latest', 'limit', 'log', 'message', 'min', 'now', 'ok', 'open',
+    'origin', 'params', 'read', 'reopened', 'resolved', 'result', 'rowsRead', 'searchParams',
+    'source', 'syncOpenSource', 'unchanged', 'upsertOpenItems', 'url', 'validateListQuery',
+    'validateOpenBatch', 'validateOpenSync', 'value',
+  ],
+  'routes-public.js': [
+    './budget.js', './envelope.js', './keys.js', './scope.js', './store-public.js',
+    './store.js', './turnstile.js', './validate.js', 'BALISE_AUTOMATION_TOKEN',
+    'BALISE_IP_SALT', 'BALISE_OPERATOR_TOKEN', 'BALISE_TURNSTILE_SECRET', 'Cache-Control', 'DB',
+    'DUPLICATE', 'FLEET_SCOPE', 'HEALTH_WINDOW_DAYS', 'INGEST_LIMITER', 'P', 'RATE_LIMITED',
+    'STATUSES', 'actorKey', 'appId', 'body', 'challenge', 'checked', 'code', 'duplicate',
+    'entries', 'env', 'error', 'fail', 'fingerprint', 'fingerprintInput', 'fpIn', 'function',
+    'hashed', 'healthSites', 'hint', 'id', 'ingest', 'insertReport', 'ip', 'ipHash', 'key',
+    'limit', 'log', 'message', 'new', 'next', 'now', 'ok', 'origin', 'page', 'params', 'parsed',
+    'publicLog', 'randomUUID', 'read', 'readJson', 'report', 'result', 'rowsRead',
+    'searchParams', 'sha256Hex', 'since', 'site', 'sites', 'success', 'target', 'turnstile',
+    'url', 'validateListQuery', 'validateReport', 'value', 'verifyTurnstile', 'version', 'warn',
+    'warnRowsRead',
+  ],
+};
+
+test('every file under src/ is classified, so none of them can sit outside these rules', () => {
+  // The reach of every rule below is srcFiles(), and until this assertion existed the reach was
+  // whatever that function happened to return. It returned files ending in a lower-case `.js`,
+  // so `routes-status.mjs` and `routes-status.JS` were loadable public routes that no rule looked
+  // at, each of them reading `request.headers.get('Authorization')` with nothing red (QA-3
+  // evasion b6). The suffix test is widened in tenant-fixture, and this is the other half: a file
+  // that exists and is not classified is red, so the next file cannot arrive uncovered whatever
+  // it is called.
+  assert.deepEqual(
+    srcFiles(), Object.keys(SRC_ROLES).sort(),
+    `src/ and SRC_ROLES disagree about which files exist. Classify the new one: 'public' if a route that answers WITHOUT a credential lives in it, 'plain' otherwise, and read what each role costs above. An unclassified file is a file none of the credential rules in this test are applied to.`,
+  );
+  assert.deepEqual(MAY_READ_A_CREDENTIAL, ['auth.js'], 'a second file has been given leave to read a credential header');
+  assert.deepEqual(MAY_IMPORT_AUTH, ['routes-desk.js'], 'a second file has been given leave to import src/auth.js');
+  assert.deepEqual(
+    PUBLIC_ROUTE_FILES, Object.keys(MAY_NAME).sort(),
+    `a file in the 'public' role has no list of names it may use, so the positive rule below is not applied to it at all`,
+  );
+});
+
+test('the four public routes cannot read a credential, because the files they live in may name only what this test lists', () => {
   // The other half of "structural rather than a policy", and it is new with the router split in
   // phase 2 pass 0. /report, /log, /board and /board/summary must never read the Authorization
   // header and must never import src/auth.js. That was a RULE while every route body shared
@@ -224,27 +380,45 @@ test('the four public routes cannot read a credential, because the file they liv
   // credential would not fail any other test in this repository, it would just quietly answer
   // differently to a caller holding a token.
   //
-  // IT IS WRITTEN AS A WHITELIST OVER THE WHOLE DIRECTORY, and pass 0b rewrote it that way
-  // because the version that named two files and grepped for one spelling had five ways past it
-  // and one way to fail for nothing (A39 finding F3). A matcher with holes is worse than no
-  // matcher: it reports that a boundary is held. The three rules below are each general, so a
-  // NEW public route in a NEW file is covered by all three the moment it exists:
+  // THE FIRST RULE IS POSITIVE AND THE OTHER TWO ARE NOT, and which is which is the thing to
+  // carry away. Three versions of this test refused a list of spellings, and each version lost to
+  // the next spelling: `grep Authorization`, then `.headers`, then `.headers` again with the file
+  // list widened. A39 found five ways past the first, QA-3 found seven past the second, and none
+  // of the seven needed obfuscation: `const { headers } = request` walked past it in two lines of
+  // ordinary JavaScript.
   //
-  //   1. only MAY_READ_A_CREDENTIAL may touch a credential header, in ANY file under src/,
-  //      and every other file has to name every header it touches as a plain literal. That
-  //      refuses `headers.get(['Author','ization'].join(''))` by SHAPE rather than by spelling,
-  //      which is the evasion no grep for a word can catch.
-  //   2. only MAY_IMPORT_AUTH may reach src/auth.js, by a static import in either quote or by
-  //      `await import()`, from any depth of subdirectory.
-  //   3. the two files the public routes live in may not name a credential header at all, which
-  //      is the stricter belt on the files the rule is actually about.
+  //   1. a file in the 'public' role may NAME only what MAY_NAME lists for it. Positive, so a
+  //      spelling nobody has thought of fails by not being on the list, which is the opposite of
+  //      how the previous two rules failed.
+  //   2. only MAY_READ_A_CREDENTIAL may touch a credential header, in ANY file under src/, and
+  //      every other file has to name every header it touches as a plain literal. A match on a
+  //      spelling: it holds for `.headers` and it is silent on anything reaching a header some
+  //      other way, which in a 'plain' file is a gap and not a property.
+  //   3. no file in the 'public' role may name a credential header at all. Also a match on a
+  //      spelling, and kept because it says plainly which header was named.
   //
-  // Comments are removed by tenant-fixture's codeOf(), a scanner rather than a regex, for a
-  // reason recorded there: the regex this test used to use deleted real code that followed a
-  // URL literal on the same line.
+  // Comments are removed by tenant-fixture's codeOf(), and literals are emptied by bareOf(), both
+  // from one scanner rather than a regex, for a reason recorded there: the regex this test used to
+  // use deleted real code that followed a URL literal on the same line, and the scanner that
+  // replaced it deleted real code that followed a regex literal after `return`.
   const files = srcFiles();
   for (const file of [...PUBLIC_ROUTE_FILES, ...MAY_READ_A_CREDENTIAL, ...MAY_IMPORT_AUTH]) {
     assert.ok(files.includes(file), `src/${file} is gone, so this test is asserting a rule about files that do not exist`);
+  }
+
+  for (const file of PUBLIC_ROUTE_FILES) {
+    // A `${...}` expression is literal content to the scanner, so a name used only inside one is
+    // invisible to namesUsed(). Neither of these files has one, and this is what keeps it so.
+    assert.doesNotMatch(
+      bareOf(file), /\$\{/,
+      `src/${file} has a template EXPRESSION in it, and the scanner this rule reads the file through treats one as string content, so a name used only inside it would not be on the list namesUsed() builds. Either write it without the expression or teach scanSource() to scan inside one.`,
+    );
+    for (const name of namesUsed(file)) {
+      assert.ok(
+        MAY_NAME[file].includes(name),
+        `src/${file} names \`${name}\`, and a file holding a credential-free route may name only what MAY_NAME lists for it. The list is positive on purpose: reading a credential takes a property, a key in braces or a string, so a read this test has never heard of still needs a NAME, and an unlisted name is this failure. If the file genuinely needs \`${name}\`, add it to MAY_NAME in a commit that says why, having satisfied yourself it cannot reach a caller's credential.`,
+      );
+    }
   }
 
   const importers = [];
@@ -304,6 +478,42 @@ test('the credential matcher reads the code and not a comment about it', () => {
   const code = codeOf('routes-public.js');
   assert.doesNotMatch(code, /MUST NEVER/, 'the stripper left a comment declaring the prohibition in the code it hands the matcher');
   assert.match(code, /export async function resolvedLog/, 'the stripper ate the file');
+  // 6. A REGEX LITERAL WHERE THE SCANNER USED TO SEE A DIVISION, which is QA-3's exploit and the
+  //    second stripper hole found by planting a read rather than by reading the stripper. `return`
+  //    was not in the set of positions a regex may start in, so `/\/*x/` was read as code, the
+  //    `/*` two characters into it opened a block comment the file never had, and everything up to
+  //    the next comment terminator was deleted with it. Planted inside resolvedLog with
+  //    `request.headers.get('Authorization')` on the next line, it left the whole suite green.
+  const afterReturn = 'const slashy = (s) => { return /\\/*x/.test(s); };';
+  assert.equal(stripComments(afterReturn), afterReturn, 'a regex literal after `return` was read as the start of a comment, so the code after it was deleted');
+  const afterIfHead = 'if (s) /\\/*x/.test(s);';
+  assert.equal(stripComments(afterIfHead), afterIfHead, 'a regex literal after an `if` head was read as the start of a comment, so the code after it was deleted');
+  // 7. And a division is still a division, in both of those positions, or the scanner would read
+  //    the rest of the line as a regex and any comment on it would survive into the code.
+  assert.equal(stripComments('const half = (a + b) / 2; // c'), 'const half = (a + b) / 2; ', 'the scanner read a division after `)` as a regex');
+  assert.equal(stripComments('function f(t) { return t / 2; } // c'), 'function f(t) { return t / 2; } ', 'the scanner read a division after an identifier as a regex');
+  // 8. THE GUARD, which is what 6 and 7 are not: 6 and 7 are two positions somebody thought of,
+  //    and this is for the ones nobody has. When a deletion takes a bracket with it, or a block
+  //    comment runs to the end of the file, the scanner REFUSES rather than handing back text it
+  //    has misread. That direction is deliberate: leaving a comment in makes the matcher strict,
+  //    which is a red with a name on it, while deleting code makes a planted credential read
+  //    invisible. Both inputs here are synthetic, because the point is the refusal and not the
+  //    position.
+  assert.throws(() => stripComments('const n = f(a) /\\/*{*/ } ;', 'a snippet'), /misread/, 'the scanner deleted a bracket and handed back the result anyway');
+  assert.throws(() => stripComments('function f() { /* never closed', 'a snippet'), /never closed/, 'the scanner ran a comment to the end of the file and handed back the result anyway');
+  // 9. And across every file the rules above are applied to: nothing the source EXPORTS may be
+  //    missing from the code they read. The guard that existed checked one export in one file, and
+  //    QA-3's deletion stopped one line short of it.
+  for (const file of srcFiles()) {
+    const text = source(file);
+    const stripped = codeOf(file);
+    for (const declared of text.match(/^export (?:async )?(?:function|const|class) [A-Za-z_$][A-Za-z0-9_$]*/gm) || []) {
+      assert.ok(
+        stripped.includes(declared),
+        `codeOf('${file}') has lost \`${declared}\`, so the scanner deleted code and every assertion built on that file is now reading less than the file`,
+      );
+    }
+  }
 });
 
 // ── Every read and every write that takes a handle ────────────────────────────
