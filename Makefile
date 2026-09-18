@@ -82,7 +82,7 @@ d1-query:
 
 .PHONY: d1-reset
 d1-reset:
-	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS work_runs; DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters; DROP TABLE IF EXISTS d1_migrations;"
+	@$(WRANGLER) d1 execute balise --local --command="DROP TABLE IF EXISTS work_runs; DROP TABLE IF EXISTS app_keys; DROP TABLE IF EXISTS apps; DROP TABLE IF EXISTS reports; DROP TABLE IF EXISTS auth_attempts; DROP TABLE IF EXISTS submit_counters; DROP TABLE IF EXISTS d1_migrations;"
 	@$(MAKE) d1-migrate
 
 # ── Worker ────────────────────────────────────────────────────────────────────
