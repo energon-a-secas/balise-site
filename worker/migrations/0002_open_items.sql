@@ -36,7 +36,9 @@ ALTER TABLE reports ADD COLUMN source_closed_at INTEGER;
 -- ── Indexes ───────────────────────────────────────────────────────────────────
 --
 -- D1 bills rows_read as rows SCANNED, so every list shape in this service has an index
--- that matches its predicate, and tests/local-d1.test.mjs asserts the budget. Mixing two
+-- that matches its predicate, and tests/local-d1-rows.test.mjs asserts the budget (it was
+-- tests/local-d1.test.mjs until A31 split that file; tests/local-d1-plans.test.mjs is where
+-- the index each query actually gets is pinned by name). Mixing two
 -- kinds in one table means the desk's two lists and the public log all gained a `kind`
 -- term, and without the indexes below each of those degrades to stepping over every row
 -- of the OTHER kind before it can fill a page.
