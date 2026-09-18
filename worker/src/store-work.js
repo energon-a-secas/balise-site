@@ -266,8 +266,11 @@ export async function listWork(db, { states, limit, before }) {
   try {
     const page = await db
       .prepare(
-        // C6: the tenant literal, invariant 4.3, written last so the terms before it keep the shape
-        // of reports_work_updated, whose partial predicate is repeated verbatim above. No tenant twin.
+        // C6: the tenant literal, invariant 4.3. `r.work_state IS NOT NULL` repeats the partial
+        // predicate of reports_work_updated verbatim, which is what keeps that index usable at all.
+        // WHERE the tenant term is written changes nothing: SQLite reorders WHERE terms itself, so
+        // what moves a plan is the PRESENCE of an app_id term, never its position (A28 corrects
+        // A18, which said "last" placement was the mechanism). No tenant twin.
         `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED}
           WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map(() => '?').join(',')})
             AND r.app_id = 'fleet' ${cursor}

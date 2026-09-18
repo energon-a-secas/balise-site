@@ -33,9 +33,37 @@
 //      costs one SELECT plus at most one write per item, so 25 items is 26 queries with
 //      room to spare, and a second run of the same batch costs one, because every item is
 //      already there and nothing is written.
-//   2. rows_read counts rows SCANNED. Every query below sits on an index created in
-//      migrations/0002_open_items.sql, tests/open-items.test.mjs asserts the budget, and
-//      tests/local-d1-plans.test.mjs pins the index each one is actually planned onto.
+//   2. rows_read counts rows SCANNED, and the indexes these queries sit on come from THREE
+//      migrations rather than one. This note used to say every query here sits on an index from
+//      migrations/0002_open_items.sql, which stopped being true when 0004 added the
+//      app_id-leading indexes. What is true, by the plans pinned in
+//      tests/local-d1-plans.test.mjs: the board's open list seeks reports_board from 0002, the
+//      resolved list and the summary's newest resolution are both served by reports_public_log
+//      from 0001_baseline.sql, and the summary's count is on reports_app_status_created from
+//      0004_tenants.sql (A28 has the numbers and why that cost is accepted knowingly).
+//      tests/open-items.test.mjs asserts the desk and board budgets.
+//
+//      THE IMPORT AND SYNC STATEMENTS ARE NOT PINNED, AND THE FLEET TERM MOVED THREE OF THEM.
+//      Measured 2026-09-18 with make d1-query, each against the same statement without the
+//      term. The two UPDATEs keyed by fingerprint and the sync's chunked write are unmoved: all
+//      three still seek the UNIQUE reports_fp from 0001 on (fingerprint). The three reads did
+//      move, and only the first of them costs anything worth writing down:
+//
+//        the dedupe read below    reports_app_site_created on (app_id), where it sought
+//                                 reports_fp on (fingerprint) before the term. It now walks the
+//                                 fleet's rows instead of taking one index entry per
+//                                 fingerprint, which is the widest change this file took.
+//        the sync's read          reports_app_site_created on (app_id), where it took
+//                                 reports_open_status_created on (kind): one prefix seek for
+//                                 another, on terms that both match nearly every row.
+//        the INSERT's inner MAX   reports_app_created on (app_id), where it had a covering seek
+//                                 on reports_open_created. Still one indexed MAX per row.
+//
+//      No test pins any of those three and neither import route has a rows_read budget, so
+//      nothing would tell you if they moved again: this paragraph is the whole record, which is
+//      a gap rather than a plan. Also note that reports_app_site_created is what serves the
+//      first two, so it is not the dead weight A21 took it for. And do not move a term to
+//      change any of this: A28 settled that position is not the mechanism, presence is.
 //
 // D1 also caps BOUND PARAMETERS per query at 100, which is why the sync route resolves
 // what to close in JS from one small SELECT instead of sending the whole ref set into a
@@ -212,14 +240,20 @@ export async function upsertOpenItems(db, { source, items, now }) {
 
     if (item.closed_at && !row.source_closed_at) {
       try {
-        await db
+        const res = await db
           // C6: keyed by fingerprint, so the tenant literal is what stops a collision from
           // aiming this write at a row outside the fleet. Same reason as the read above.
           .prepare(`UPDATE reports SET source_closed_at = ?
                      WHERE app_id = 'fleet' AND fingerprint = ? AND source_closed_at IS NULL`)
           .bind(item.closed_at, fingerprint)
           .run();
-        closed += 1;
+        // COUNTED FROM `changes`, NOT FROM THE BRANCH, the same as the create above and the
+        // reopen below. This used to be an unconditional `closed += 1`, which reported a close
+        // the database had declined: the tenant literal is a third way for this UPDATE to match
+        // no row, so a row handed to a tenant between the read and this write answered
+        // `closed: 1` while its mark stayed where it was.
+        if (res.meta && res.meta.changes > 0) closed += 1;
+        else unchanged += 1;
       } catch (err) {
         return storeError('open items close', err);
       }

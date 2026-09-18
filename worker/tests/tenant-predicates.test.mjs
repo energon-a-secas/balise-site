@@ -210,9 +210,11 @@ test("C6: the import's CLOSE marks a fleet row and refuses one handed to a tenan
   reassignBefore(db, match, id);
   const out = await upsertOpenItems(db, { source: 'queue', items: [item], now: T });
   assert.equal(closedMark(db, id), null, "the close marked a row that is no longer the fleet's");
-  // The count is reported from the branch taken rather than from `changes`, so it says 1
-  // either way. That is a real gap in what the route reports and the row is the assertion.
-  assert.equal(out.closed, 1, json(out));
+  // And the COUNT says so too. This asserted `closed: 1` until 2026-09-18, because the branch
+  // incremented unconditionally and reported a close the database had declined; the close now
+  // counts `changes` like the reopen below, so a write the tenant literal refused is reported as
+  // `unchanged`. A route answering `closed: 1` over a row it did not touch was the gap.
+  assert.deepEqual({ closed: out.closed, unchanged: out.unchanged }, { closed: 0, unchanged: 1 }, json(out));
   assert.ok(ran(db, match), 'the close UPDATE never ran, so this case proves nothing about its predicate');
 });
 

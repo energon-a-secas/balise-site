@@ -99,8 +99,31 @@ async function readJson(request, provider, origin, env, { allowEmpty = false, ma
  * every call below becomes a call to it and this goes. Both kinds scope to 'fleet' (C6.1), which
  * is why phase 1 changes nothing an outside caller can see; `person` and `app` are phase 2, do
  * not add them here. And the actor is NEVER read from a request field (A13): a caller who can
- * name their own role names the more privileged one, so X-Balise-Actor is gone for good. */
-const principalFor = (actor) => ({ kind: actor === 'ai' ? 'automation' : 'operator', actor });
+ * name their own role names the more privileged one, so X-Balise-Actor is gone for good.
+ *
+ * IT IS A LOOKUP AND IT THROWS, for the same reason scopeFor() in src/scope.js throws: a
+ * default arm here is that file's guard defeated one layer up. This used to read
+ * `actor === 'ai' ? 'automation' : 'operator'`, so every actor value that was not 'ai' became
+ * an operator, and an operator is fleet-scoped. Nothing could have caught that: the throw in
+ * scopeFor was unreachable from production, because this function never handed it an unknown
+ * kind. WS-C ADDS THE `person` AND `app` KINDS, and that is when it would have cost something.
+ * So when a new actor value appears in authenticate() (src/auth.js:97 returns 'human' or 'ai'
+ * and nothing else today), it gets an entry here and a scope arm there, or the request fails
+ * closed as a STORE_ERROR through the never-500 wrapper at the bottom of this file. A Map
+ * rather than an object literal, so no inherited property name can answer the lookup.
+ *
+ * Exported for tests/tenant-scope.test.mjs, which is what proves the throw fires. No other
+ * module calls it, and none should: the router is where an actor becomes a principal. */
+const PRINCIPAL_KINDS = new Map([
+  ['human', 'operator'],
+  ['ai', 'automation'],
+]);
+
+export const principalFor = (actor) => {
+  const kind = PRINCIPAL_KINDS.get(actor);
+  if (!kind) throw new Error(`principalFor: no principal kind is defined for actor ${JSON.stringify(actor)}`);
+  return { kind, actor };
+};
 
 const tooLarge = (provider, origin, env, maxBytes, hint) =>
   fail('TOO_LARGE', {

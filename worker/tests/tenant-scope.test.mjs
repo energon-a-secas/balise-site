@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 
 import { sqliteD1 } from './sqlite-d1.mjs';
 import { FLEET, FLEET_SCOPE, scopeFor } from '../src/scope.js';
+import { principalFor } from '../src/index.js';
 import {
   fingerprintInput, listReports, getReport, applyTransition,
 } from '../src/store.js';
@@ -43,6 +44,28 @@ test('C6: the scope seam has one answer per principal kind and refuses to invent
   // silently, and the symptom is an empty page rather than an error.
   assert.equal(FLEET, 'fleet');
   assert.equal(typeof FLEET_SCOPE.appId, 'string');
+});
+
+test('C6: the actor seam above scopeFor has one answer per actor and refuses to invent one', () => {
+  // The seam above the seam. scopeFor throws on a kind it does not know, but principalFor in
+  // src/index.js is what decides the kind, and while it read
+  // `actor === 'ai' ? 'automation' : 'operator'` every unknown actor arrived as an OPERATOR:
+  // fleet-scoped, silent, and the throw above unreachable from any route. That is the failure
+  // this test exists to keep red. It costs nothing in phase 1, where authenticate() returns
+  // 'human' or 'ai' and nothing else; it is WS-C's `person` and `app` kinds that would pay.
+  assert.deepEqual(principalFor('human'), { kind: 'operator', actor: 'human' });
+  assert.deepEqual(principalFor('ai'), { kind: 'automation', actor: 'ai' });
+  // And both still reach the fleet, so phase 1 behaves exactly as it did.
+  assert.equal(scopeFor(principalFor('human')).appId, FLEET);
+  assert.equal(scopeFor(principalFor('ai')).appId, FLEET);
+  // Anything else throws by name. 'operator' and 'automation' are in this list on purpose: the
+  // lookup is keyed by ACTOR, so passing a principal KIND to it is a caller's mistake and not a
+  // second spelling. 'constructor' and '__proto__' are here because an object literal would
+  // have answered both of them.
+  const refused = ['person', 'app', 'operator', 'automation', 'Human', 'ai ', '', null, undefined, 0, 'constructor', '__proto__'];
+  for (const actor of refused) {
+    assert.throws(() => principalFor(actor), /principalFor: no principal kind is defined/, `principalFor accepted ${json(actor)}`);
+  }
 });
 
 test('A11: the fingerprint takes the app id first, and only a tenant is inside the hash', () => {
