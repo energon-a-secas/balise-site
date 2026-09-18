@@ -7,27 +7,16 @@
 //
 // C3 happens in src/index.js, which owns authentication, and the parsed body arrives
 // here already read under the 8 KB cap. What is left in this file is the shape check and
-// the call into src/store-open.js, so the reasoning that matters is easy to find:
+// the call into src/store-open.js.
 //
-// THE IMPORT ROUTES CANNOT PUBLISH. They write `status = 'new'`, which is private on both
-// feeds, and the transition table gives the automation credential NO edge at all on
-// kind = 'open'. That is not the same as harmless. The importer holds the automation token
-// only because the separate import credential that would narrow these routes is not built,
-// and whoever else holds that token can do more than write drafts:
+// The import routes write `status = 'new'`, which is private on both feeds, and the transition
+// table gives the automation credential no edge on kind = 'open'. The importer nonetheless holds
+// the automation token, because the narrower import credential is not built; the resulting
+// exposure is stated as open in docs/DESIGN-WORK-QUEUE.md section 10 and in the monorepo's
+// docs/architecture/balise.md. Which fix to build is the owner's decision.
 //
-//   - read every report through GET /reports, a correction's contact included;
-//   - plant an open-item draft under a tracker ref. It has no filed_by, so it is trusted
-//     like the fleet's own (trustOf('open', null) is 'fleet'): the operator can hand it to
-//     an agent in ship mode with no instruction, and a later import of the real line
-//     reports it unchanged and leaves the planted text in place;
-//   - mark items closed at their source, one at a time with `closed_at` on an import or
-//     every row a sync leaves out, and clear that mark again with an import.
-//
-// docs/DESIGN-WORK-QUEUE.md section 10 and the monorepo's docs/architecture/balise.md state
-// this as open. Which fix to build is the owner's decision.
-//
-// The board is the other half of the same rule: it reads six columns and returns three
-// fields, and the only string on it is a sentence a person typed on purpose.
+// The board reads six columns and returns three fields, and the only string on it is a sentence
+// a person typed on purpose.
 
 import { fail, ok } from './envelope.js';
 import { validateOpenBatch, validateOpenSync, validateListQuery } from './validate.js';
@@ -58,12 +47,10 @@ const CACHED = { 'Cache-Control': 'public, max-age=300', ...ANY_ORIGIN };
 /**
  * POST /open-items. Returns { source, created, unchanged, closed, reopened, rows_read }.
  *
- * `rows_read` is new in phase 2 pass 0 and it is additive: no caller loses a field. It is here
- * because this was the last read in the Worker with no cost read-back on it, and it is the one
- * whose cost is NOT the size of what the caller sent. See upsertOpenItems in src/store-open.js:
- * the dedupe read seeks on `app_id` alone once the batch reaches three items, so a 25-item import
- * scans the fleet's half of the table. tests/local-d1-rows.test.mjs pins that as a law and
- * tests/local-d1-plans.test.mjs pins the plan it comes from.
+ * `rows_read` is additive: no caller loses a field. It is here because this is the one import
+ * read whose cost is NOT the size of what the caller sent. See upsertOpenItems in
+ * src/store-open.js; the cost law is pinned in tests/local-d1-rows.test.mjs and the plan it
+ * comes from in tests/local-d1-plans.test.mjs.
  *
  * docs/DESIGN-OPEN-ITEMS.md section 7 still lists the four counters without this field.
  */
@@ -111,80 +98,18 @@ export async function openSync(env, payload, { origin, now }) {
  *
  * `rows_read` rides along for the same reason it does on /log: it counts rows SCANNED, and local
  * D1 enforces no quota, so a query that reads the table costs nothing here and everything in
- * production. Three tests read the number, and none is on this file's side of the wire:
- * tests/open-items.test.mjs, tests/local-d1-rows.test.mjs, which asserts the law below by
- * EQUALITY, and tests/local-d1-plans.test.mjs, which pins both board plans by index name.
+ * production.
  *
- * NEITHER BOARD ROUTE CALLS warnRowsRead, AND THAT IS NOW A DECISION RATHER THAN A DEFERRAL.
- * Phase 1's review condition C2 asked for the call on both, on the reading that /board has a
- * `limit` so `rowsReadBudget(limit)` applies to it. Measured through these two routes, it does
- * not. FOUR populations of `reports` move these numbers, not two, and naming all four is the
- * whole point of writing them down (re-measured 2026-09-18, pass 0b, ten populations with each
- * term moved on its own through the real PATCH route):
+ * Neither board read calls warnRowsRead. `rowsReadBudget` takes a page size and neither of these
+ * reads is bounded by one. What they cost instead, as an equality over the populations that move
+ * it, is written down and asserted in tests/local-d1-rows.test.mjs (section 'what the two board
+ * reads cost'); the plan behind each of the four board statements is pinned by index name in
+ * tests/local-d1-plans.test.mjs. Those two tests are where the numbers live, deliberately: the
+ * copies that used to sit in this comment drifted from the measurement twice.
  *
- *   O     published entries: fleet rows at kind='open', public=1, status='accepted'
- *   Ra    ALL published resolutions: every row at status='fixed' AND public=1, any tenant,
- *         either kind. Unscoped, and that is the finding rather than a detail; see below.
- *   Af    fleet rows at status='accepted', WHATEVER their kind and visibility
- *   Ff    fleet rows at status='fixed', WHATEVER their kind and visibility
- *   rank  how far down the published resolutions the newest FLEET entry's resolution sits,
- *         counted over Ra in fixed_at DESC order. A RANK AND NOT A COUNT: one tenant
- *         resolution newer than the fleet's costs this term 1, and 300 of them cost it 300.
- *
- *   GET /board            rows_read = 2 x O + Ra + 2      independent of `limit`
- *   GET /board/summary    rows_read = Af + Ff + rank + 4  it has no `limit`
- *
- * Exact at all ten. The trailing constant is one per statement whose seek range is NOT empty, so
- * a board with nothing published of some kind pays less: measured 7 rather than 8 for /board at
- * O=3 with Ra=0, and 6 rather than 7 for the summary at Af=3, Ff=0, rank=0. Read both constants
- * as the upper bound they are at a board that has published anything at all.
- *
- * WHAT THE SUMMARY'S LAW USED TO SAY HERE, and how it was got wrong, because the shape repeats.
- * This block said `rows_read = O + 2 x R + 3`, from four populations that only ever moved O and
- * R together. Both statements behind the summary seek on terms that EXCLUDE kind and public
- * (counts on (app_id, status), latest on (status, public)), so a private draft at `accepted` and
- * a resolved CORRECTION each cost rows while moving neither O nor R: holding O and R fixed and
- * adding seven such rows moved the number from 14 to 21 while the old law predicted 15 at all
- * three populations. A curve fitted to a fixture is not a law, and four points that move two
- * variables in step cannot tell the two apart. The four terms above were derived from the SQL
- * first and then measured against populations built to move one term at a time.
- *
- * Three things follow and all three are why a runtime threshold is the wrong instrument here:
- *
- *   1. /board SCANS THE SAME NUMBER OF ROWS AT limit=5 AS AT limit=50. Its open half is on
- *      reports_board, whose trailing column is created_at while the sort is on opened_at, so
- *      SQLite walks every matching entry into a temp b-tree before LIMIT applies. A budget
- *      keyed on `limit` is not a budget for this query in either direction.
- *   2. EVERY TERM GROWS WITH THE BOARD EXISTING, without bound and without any query getting
- *      worse. At the two published resolutions this Worker's fixture has, /board crosses
- *      rowsReadBudget(50) = 110 at O = 54: 2 x 53 + 2 + 2 is exactly 110 and O = 54 is the
- *      first count over it. Fifty-four entries is an ordinary working board. A threshold that
- *      logs there is a warning whoever meets it will delete, and one set past it detects
- *      nothing. (This said 61, which is not reachable under the law at all: 2 x 60 + 2 is
- *      already 122. The 61 came from a mixed population and was read back as a property of
- *      the route.)
- *   3. Both numbers move with rows on NO board at all, which is what Af, Ff and rank say: a
- *      resolved CORRECTION costs /board 1 and the summary 2, a PRIVATE accepted draft costs
- *      the summary 1, and a tenant's published resolution costs /board 1 and the summary 1.
- *      So even a per-entry ratio computed from what the route RETURNED is not a bound.
- *
- * So the law above is written down as an EQUALITY in tests/local-d1-rows.test.mjs rather than as a
- * console.warn against a constant: that test measures all four terms from the database and asserts
- * the arithmetic. It is a build-time measurement against a fixture, and a fixture is not a
- * production population: the law says a 500-entry board costs about 1,000 rows_read per uncached
- * request, which is the shape of the index rather than a query regression, and an index is
- * data-engineer's.
- *
- * WHAT THE ARITHMETIC IS ABOUT, AND WHAT IT IS NOT ABOUT, because the two get confused. Of the
- * three board statements that carry `app_id = 'fleet'`, two also test `kind = 'open'` (both arms of
- * /board, and the summary's `latest`), and under DESIGN.md 4.3 every open item is the fleet's, so
- * on those two the literal excludes no row the kind test does not exclude already: it moves none
- * of the terms above. The summary's counts statement is the one that spans every kind, which is
- * why Af and Ff are fleet-only counts while Ra, the population `latest` walks, is not scoped at
- * all. A rows_read law is arithmetic about cost, so cost is the whole of what it is about, and
- * two of those three literals cost nothing. The rule those three literals belong to is
- * DESIGN.md 4.3 and contract C6.5, asserted per statement in tests/tenant-scope.test.mjs and as a
- * COUNT over the database in tests/tenant-invariants.test.mjs.
+ * The `app_id = 'fleet'` literals on the board statements belong to DESIGN.md 4.3 and contract
+ * C6.5, asserted per statement in tests/tenant-scope.test.mjs and as a count over the database in
+ * tests/tenant-invariants.test.mjs.
  */
 export async function openBoard(request, env) {
   const P = 'log';

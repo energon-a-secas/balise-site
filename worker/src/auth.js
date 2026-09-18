@@ -6,13 +6,12 @@
 // and /board/summary NEVER import this file: a public route that also honours a credential
 // is one refactor away from leaking the queue.
 //
-// THAT SENTENCE IS NOW TRUE OF THE FILES AND NOT ONLY OF THE FUNCTIONS. It used to be a claim
-// about four handlers inside src/index.js, which imported this module for the desk, so nothing
-// could check it. src/routes-public.js and src/routes-open.js hold the credential-free route
-// bodies and neither imports this file; src/routes-desk.js is the only file in the Worker that
-// does, and src/index.js no longer does either. `actorKey` moved to src/keys.js to make that
-// so: it is the key the ingest rate limit and the C3 lockout share, so a credential-free route
-// needing it was the one thing forcing /report to import the authentication module.
+// THAT SENTENCE IS TRUE OF THE FILES AND NOT ONLY OF THE FUNCTIONS, which is what makes it
+// checkable. src/routes-public.js and src/routes-open.js hold the credential-free route bodies
+// and neither imports this file; src/routes-desk.js is the only file in the Worker that does.
+// Asserted per file, by credential role, in tests/tenant-scope.test.mjs. `actorKey` lives in
+// src/keys.js so that it can be shared: it is the key the ingest rate limit and the C3 lockout
+// both need, and a credential-free route needing it would otherwise import this module.
 
 import { checkLock, recordAuthResult } from './store-auth.js';
 

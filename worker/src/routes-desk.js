@@ -50,15 +50,12 @@ async function gate(request, env, ip, now) {
  * name their own role names the more privileged one, so X-Balise-Actor is gone for good.
  *
  * IT IS A LOOKUP AND IT THROWS, for the same reason scopeFor() in src/scope.js throws: a
- * default arm here is that file's guard defeated one layer up. This used to read
- * `actor === 'ai' ? 'automation' : 'operator'`, so every actor value that was not 'ai' became
- * an operator, and an operator is fleet-scoped. Nothing could have caught that: the throw in
- * scopeFor was unreachable from production, because this function never handed it an unknown
- * kind. WS-C ADDS THE `person` AND `app` KINDS, and that is when it would have cost something.
- * So when a new actor value appears in authenticate() (src/auth.js returns 'human' or 'ai' and
- * nothing else today), it gets an entry here and a scope arm there, or the request fails closed
- * as a STORE_ERROR through the never-500 wrapper at the bottom of src/index.js. A Map rather
- * than an object literal, so no inherited property name can answer the lookup.
+ * default arm here is that file's guard defeated one layer up. A ternary in its place would
+ * turn every unrecognised actor into an operator, and an operator is fleet-scoped. So when a
+ * new actor value appears in authenticate() (src/auth.js returns 'human' or 'ai' and nothing
+ * else today), it gets an entry here and a scope arm there, or the request fails closed as a
+ * STORE_ERROR through the never-500 wrapper at the bottom of src/index.js. A Map rather than
+ * an object literal, so no inherited property name can answer the lookup.
  *
  * It lives beside the handlers that call it, which is why it moved here with them and not into
  * src/index.js: the router no longer knows what an actor is, and this is now the only file that

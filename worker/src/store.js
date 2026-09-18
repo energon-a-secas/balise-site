@@ -139,11 +139,10 @@ const DESK_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_
  * The private queue. ONE query returning many rows, never a query per row.
  *
  * The SQL is built from a handful of CONSTANT fragments and is deliberately not one
- * string with `(?1 IS NULL OR status = ?1)`. That form is shorter and it defeats the
- * index: SQLite cannot use reports_status_created for a predicate whose column may not
- * participate, so the filtered list would silently become a full scan and only rows_read
- * would show it. Nothing below is ever interpolated from a request; the fragments are
- * chosen, and every value is bound.
+ * string with `(?1 IS NULL OR status = ?1)`. That form is shorter and it cannot seek an
+ * index, because a column that may not participate in the predicate cannot be a seek key.
+ * Nothing below is ever interpolated from a request; the fragments are chosen, and every
+ * value is bound.
  *
  * THE DEFAULT LIST IS CORRECTIONS, not everything. Two feeds share this table now, and
  * an operator who has never opened the Open items tab must not find sixty imported drafts
@@ -153,25 +152,18 @@ const DESK_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_
  *   'open'            -> the imported drafts
  *   a correction kind -> that one kind
  *
- * Each of the four combinations lands on an index created for it. The two `kind <> 'open'`
- * shapes need PARTIAL indexes, because an inequality cannot seek an index prefix: the
- * term is written here exactly as it is written in migrations/0002_open_items.sql, since
- * SQLite matches a partial index by implication and a reworded predicate silently loses
- * the index while returning identical rows.
+ * Each of the four combinations lands on an index created for it, and all four plans are
+ * pinned by index name and seek shape in tests/local-d1-plans.test.mjs. The two
+ * `kind <> 'open'` shapes need PARTIAL indexes, because an inequality cannot seek an index
+ * prefix: the term is written here exactly as it is written in
+ * migrations/0002_open_items.sql, since SQLite matches a partial index by implication and a
+ * reworded predicate silently loses the index while returning identical rows. No partial
+ * predicate mentions `app_id`, so that implication is unaffected by the tenant term.
  *
- * C6: the tenant term is bound, and it is written FIRST because `app_id` is the LEADING
- * column of all four indexes this query now seeks (reports_app_created,
- * reports_app_status_created, reports_app_fix_created, reports_app_fix_status_created, from
- * migrations/0004_tenants.sql). The ORDER of the terms in this string is for the reader:
- * SQLite reorders WHERE terms itself, so it is the term's PRESENCE that matters, and
- * Cloudflare's rule is what makes presence non-optional. A multi-column index is used only
- * if the query names every column to the left of the ones it needs, so a page that did not
- * mention `app_id` at all would seek none of these four, be perfectly correct, and become a
- * scan that only rows_read would report. Writing it first keeps the string in the shape of
- * the index it is meant to land on, which is how the next person checks that it still does.
- *
- * No partial predicate mentions `app_id`, so the implication that matches `kind <> 'open'`
- * against the two partial indexes is unaffected.
+ * C6: the tenant term is BOUND here, this being the desk rather than a public feed, and
+ * `app_id` is the leading column of the four indexes above, so the term's presence is what
+ * makes them reachable at all. Its position in the string is for the reader only: SQLite
+ * reorders WHERE terms itself (A28).
  */
 export async function listReports(db, scope, { status, kind, before, limit }) {
   const cursor = before === null || before === undefined ? Number.MAX_SAFE_INTEGER : before;

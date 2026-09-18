@@ -50,13 +50,11 @@
 // would break it after a full exercise of this file and requires zero. If that count is ever
 // non-zero, the comments above stop being true and every guard here becomes a hole.
 //
-// And the four new literals are asserted the same way, not trusted: RUNNER_WRITES in
+// And the four literals here are asserted the same way, not trusted: RUNNER_WRITES in
 // tests/tenant-predicates.test.mjs hands each of these three actions a queued row that is NOT
 // the fleet's and requires the write to decline, with the same call on the same row shape in the
 // fleet's tenancy as the control. It needs no reassignment hook, unlike every other case in that
-// file, and that is the whole finding: there is no read here to race. Neutering any one of the
-// four to `AND 1 = 1` turns exactly one of those tests red, proved by hand on 2026-09-18. A term
-// nobody has watched go red is not known to be load bearing.
+// file, because there is no read here to race.
 
 import { storeError } from './store.js';
 import { OPEN_KIND } from './store-open.js';
@@ -88,8 +86,9 @@ const CLAIMABLE = `work_state IS NOT NULL
 //
 // C6: no predicate, by INVARIANT 4.3. It opens with `work_state IS NOT NULL`, which the
 // invariant says implies `app_id = 'fleet'`, and it names 'claimed' besides, so a row it can
-// match has been through the claim above and carries the fleet's key. The term is also what
-// lets SQLite use reports_work_updated, whose partial predicate is this same text.
+// match has been through the claim above and carries the fleet's key. Keep the leading term
+// written exactly as reports_work_updated's partial predicate is written: SQLite matches a
+// partial index by implication, and a reworded predicate loses it while returning the same rows.
 const LAPSED_AT_CAP = `work_state IS NOT NULL AND work_state = 'claimed' AND work_lease_until < ?
   AND work_attempts >= ? AND work_mode IS NOT 'ship'`;
 

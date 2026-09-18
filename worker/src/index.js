@@ -49,26 +49,14 @@
 //                                                         which is where their C3 gate is
 //   src/routes-desk.js    deskList, deskPatch, importRoute, work, principalFor         C3
 //
-// The paragraph above about the four credential-free routes used to be a claim about which
-// functions inside THIS file called authenticate(), in a file that imported src/auth.js for
-// the desk, so nothing could check it: a handler that started reading Authorization would have
-// been a two-line diff in an already-imported module. Now src/routes-desk.js is the only file
-// in the Worker that imports src/auth.js, this file does not import it either, and the rule is
-// one grep. Four smaller moves were needed to get there and each is recorded where it landed:
-// `actorKey` went from src/auth.js to src/keys.js (it is the key the credential-free ingest
-// limiter and the C3 lockout share, and it was the one thing making /report import C3's own
-// file); readJson/tooLarge went to src/envelope.js (every outcome either one has is a C2
-// envelope); and src/store.js gave up its two SQL-free sections, the budgets to src/budget.js
-// and the derived keys to src/keys.js, because moving `warnRowsRead` INTO it would have pushed
-// that file over the same 500 line cap this split exists to respect. src/store.js re-exports
-// all seven, so no existing caller of any of them changed. No route's behaviour changed: the
-// handler bodies moved verbatim, and the only signature change is that they take the
-// per-request values as one object rather than as four positional arguments, plus `health`
-// receiving VERSION as an argument so the constant below stays in the file the release checks.
+// src/routes-desk.js is the ONLY file in the Worker that imports src/auth.js, and this file does
+// not import it either, which is what makes the credential rule above checkable rather than a
+// claim about which functions call authenticate(). Every file under src/ is assigned one of four
+// credential roles in tests/tenant-scope.test.mjs, whose role table is asserted to list exactly
+// the files present, so a new file is classified deliberately or the suite is red.
 //
-// src/store-open.js (520) and src/store-work.js (502) are ALSO over the convention and are
-// deliberately left that way: an accepted deviation recorded by delivery-lead at A31, not an
-// oversight. Do not split them as a side effect of touching this one.
+// src/store.js re-exports what moved out of it to src/budget.js and src/keys.js, so no existing
+// caller of any of them changed.
 
 import { ERROR_CODES, fail, corsHeaders, originVerdict } from './envelope.js';
 import { ingest, resolvedLog, health } from './routes-public.js';

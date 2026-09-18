@@ -4,16 +4,14 @@
 //   GET  /log       the public corrections log   (no auth, cacheable)
 //   GET  /health    which secrets are bound, and the per-site read-back
 //
-// THIS FILE MUST NEVER IMPORT ./auth.js AND MUST NEVER READ THE Authorization HEADER, and
-// that is the reason it exists rather than a rule written on top of it. src/index.js says
-// "/report, /log, /board and /board/summary NEVER read the Authorization header. A public
-// route that also honours an operator credential is one refactor away from leaking the queue",
-// and src/auth.js says the same thing about being imported. Until phase 2 both were claims
-// about four functions inside a file that DID authenticate, so nothing could check either.
-// Split out, the claim is a property of a file: `grep auth.js src/routes-public.js` is empty,
-// and so is the same grep over src/routes-open.js, which holds the other two.
+// THIS FILE MUST NEVER IMPORT ./auth.js AND MUST NEVER READ THE Authorization HEADER. That
+// prohibition is the reason this file exists rather than a rule written on top of it, and it is
+// enforced positively: tests/tenant-scope.test.mjs puts this file in the 'public' credential
+// role, where it may NAME only the identifiers MAY_NAME lists for it, and no spelling of a
+// header read is on that list. An unlisted name is a red test, so the rule does not depend on
+// anyone guessing in advance how a credential might be written.
 //
-// The three that are left here are the credential-free ones. src/routes-desk.js holds the four
+// The three routes left here are the credential-free ones. src/routes-desk.js holds the four
 // that take C3 and is the only file in the Worker that imports src/auth.js.
 //
 // NOTHING HERE PUBLISHES AND NOTHING HERE DECIDES. /report writes a row at status 'new', which

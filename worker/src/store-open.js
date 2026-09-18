@@ -33,52 +33,21 @@
 //      costs one SELECT plus at most one write per item, so 25 items is 26 queries with
 //      room to spare, and a second run of the same batch costs one, because every item is
 //      already there and nothing is written.
-//   2. rows_read counts rows SCANNED, and the indexes these queries sit on come from THREE
-//      migrations rather than one. This note used to say every query here sits on an index from
-//      migrations/0002_open_items.sql, which stopped being true when 0004 added the
-//      app_id-leading indexes. What is true, by the plans pinned in
-//      tests/local-d1-plans.test.mjs: the board's open list seeks reports_board from 0002, the
-//      resolved list and the summary's newest resolution are both served by reports_public_log
-//      from 0001_baseline.sql, and the summary's count is on reports_app_status_created from
-//      0004_tenants.sql (A28 has the numbers and why that cost is accepted knowingly).
+//   2. rows_read counts rows SCANNED. Which index each statement here actually takes is
+//      pinned in tests/local-d1-plans.test.mjs, which carries the measurement and the
+//      argument for pinning the board's plans by index name and the batch statements by
+//      seek shape; the cost through the route is pinned in tests/local-d1-rows.test.mjs,
+//      which is why upsertOpenItems returns rowsRead and POST /open-items reports it.
 //      tests/open-items.test.mjs asserts the desk and board budgets.
 //
-//      THE FLEET TERM MOVED FOUR OF THESE STATEMENTS, AND WHICH FOUR DEPENDS ON THE BATCH SIZE.
-//      Re-measured 2026-09-18 with make d1-query, each statement against itself without the term,
-//      and at IN-list sizes 1, 2, 3 and 50. The threshold is the part that matters: a statement
-//      whose fingerprint term is `= ?` keeps the UNIQUE reports_fp, and so does an IN list of one
-//      or two entries, but AT THREE ENTRIES SQLITE ABANDONS reports_fp AND SEEKS ON app_id ALONE.
-//
-//        the dedupe read below    IN 1 or 2: reports_fp on (fingerprint). IN 3 or more:
-//                                 reports_app_site_created on (app_id), walking the fleet's half
-//                                 of the table and testing the fingerprint per row. The real
-//                                 batches are 25, so this is the plan production runs.
-//        the sync's chunked write  the same threshold and the same pair of plans. The chunks are
-//                                 50, so again the wide plan is the one that runs. An earlier
-//                                 reading of this file said this write was unmoved; that was
-//                                 measured with a short IN list and it is wrong.
-//        the sync's read          reports_app_site_created on (app_id), where it took
-//                                 reports_open_status_created on (kind): one prefix seek for
-//                                 another, on terms that both match nearly every row.
-//        the INSERT's inner MAX   reports_app_created on (app_id), where it had a covering seek
-//                                 on reports_open_created. Still one indexed MAX per row.
-//
-//      The two single-fingerprint UPDATEs (close and reopen) are genuinely unmoved: `= ?` on a
-//      UNIQUE index, reports_fp, at any batch size.
-//
-//      ALL THREE WIDE PLANS ARE NOW PINNED, by SEEK SHAPE rather than by index name, in
-//      tests/local-d1-plans.test.mjs, which carries the argument for that choice and the reason
-//      every IN list there is three long; the cost is pinned through the route in
-//      tests/local-d1-rows.test.mjs, which is why upsertOpenItems returns rowsRead and
-//      POST /open-items reports it. This paragraph is no longer the whole record.
-//
-//      Note also that reports_app_site_created is what serves the wide plans, so it is not the
-//      dead weight A21 took it for. And do not move a term to change any of this: A28 settled
-//      that position is not the mechanism, presence is.
-//
-//      WHAT WOULD FIX IT IS AN INDEX, AND AN INDEX IS NOT THIS FILE'S TO ADD. Reported to
-//      delivery-lead in the phase 2 pass 0 report for data-engineer. Do not "fix" the dedupe read
-//      by dropping the tenant term: the comment on the statement says what the term is for.
+//      Three of these statements are wide, and the batch size is what makes them wide: a
+//      short IN list keeps the UNIQUE reports_fp and a real batch does not. Read the plans
+//      test for which statement is which rather than trusting a list here, because the list
+//      that used to be here went stale twice. What would narrow them is an index, and an
+//      index is data-engineer's rather than this file's. Do not narrow the dedupe read by
+//      dropping the tenant term: the comment on the statement says what the term is for, and
+//      do not move a term to change a plan, because A28 settled that presence is the
+//      mechanism and position is not.
 //
 // D1 also caps BOUND PARAMETERS per query at 100, which is why the sync route resolves
 // what to close in JS from one small SELECT instead of sending the whole ref set into a
@@ -155,16 +124,12 @@ export async function upsertOpenItems(db, { source, items, now }) {
 
   const prints = await Promise.all(items.map((item) => sha256Hex(openFingerprintInput(source, item.ref))));
 
-  /* WHAT THIS BATCH COSTS IN ROWS SCANNED, and why the number leaves the store (phase 2 pass 0).
-   *
-   * Summed across every statement this function runs and returned, so POST /open-items reports it
-   * the way /reports, /log, /board and /work already do. It is not a nicety here: the dedupe read
-   * below plans onto `app_id` alone as soon as the IN list reaches three entries, so its cost is
-   * the size of the FLEET's half of the table and not the size of the batch. Nothing in this
-   * repository could see that before, because the importer's route was the one read with no
-   * rows_read on it. Measured and pinned in tests/local-d1-rows.test.mjs; the plans are pinned in
-   * tests/local-d1-plans.test.mjs. A4's warnRowsRead is deliberately NOT called on it: a batch has
-   * a size but not a `limit`, and rowsReadBudget is a budget for a page. */
+  /* What this batch costs in rows SCANNED, summed across every statement this function runs and
+   * returned, so POST /open-items reports it the way /reports, /log, /board and /work already do.
+   * The dedupe read below goes wide at a real batch size, so its cost tracks the fleet's half of
+   * the table rather than the size of the batch: pinned in tests/local-d1-rows.test.mjs, plans in
+   * tests/local-d1-plans.test.mjs. warnRowsRead is deliberately NOT called on it, because a batch
+   * has a size but not a `limit` and rowsReadBudget is a budget for a page. */
   let rowsRead = 0;
   const spent = (res) => {
     if (res && res.meta && typeof res.meta.rows_read === 'number') rowsRead += res.meta.rows_read;
@@ -281,10 +246,8 @@ export async function upsertOpenItems(db, { source, items, now }) {
           .bind(item.closed_at, fingerprint)
           .run();
         // COUNTED FROM `changes`, NOT FROM THE BRANCH, the same as the create above and the
-        // reopen below. This used to be an unconditional `closed += 1`, which reported a close
-        // the database had declined: the tenant literal is a third way for this UPDATE to match
-        // no row, so a row handed to a tenant between the read and this write answered
-        // `closed: 1` while its mark stayed where it was.
+        // reopen below. The tenant literal is a third way for this UPDATE to match no row, so
+        // an unconditional `closed += 1` here would report a close the database declined.
         spent(res);
         if (res.meta && res.meta.changes > 0) closed += 1;
         else unchanged += 1;
@@ -413,24 +376,11 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
         // as a literal, this query cannot select one.
         //
         // ONE STATEMENT, TWO PLANS, and the position of the literal decides neither.
-        // SQLite reorders WHERE terms itself, so the plan is identical with this term
-        // first, last or absent: what moves a plan is the PRESENCE of an app_id term,
-        // never where it is written. A28 corrects A18, which said "last" placement was
-        // what kept reports_board selected. Measured 2026-09-18 with make d1-query, and
-        // pinned by index name in tests/local-d1-plans.test.mjs:
-        //
-        //   accepted / opened_at   SEARCH reports USING INDEX reports_board, sought on
-        //                          (kind, public, status), then USE TEMP B-TREE FOR ORDER BY
-        //   fixed / fixed_at       SEARCH reports USING INDEX reports_public_log, sought on
-        //                          (status, public)
-        //
-        // So the open list does keep the full three-term seek on reports_board from
-        // migrations/0002_open_items.sql, and the resolved list was never on that index at
-        // all: reports_public_log serves it, which is why A29 withdrew the suggestion that
-        // that index is dead weight. There is still no tenant twin of either index and 4.2
-        // says why there should not be. Do not move this term to make a plan happen; it
-        // cannot. The one statement whose seek the term does narrow is the count in
-        // boardSummary below, and the note there has the numbers.
+        // SQLite reorders WHERE terms itself, so what moves a plan is the PRESENCE of an
+        // app_id term and never where it is written (A28, correcting A18). Both plans are
+        // pinned by index name in tests/local-d1-plans.test.mjs. Do not move this term to
+        // make a plan happen; it cannot. There is no tenant twin of either index and
+        // DESIGN.md 4.2 says why there should not be.
         `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state
            FROM reports
           WHERE kind = ? AND public = 1 AND status = ? AND app_id = 'fleet'
@@ -460,20 +410,8 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
  * GET /board/summary: how many published open entries, how many of those are moving, how
  * many resolutions in the window, and the newest resolution's sentence. Two queries, on two
  * DIFFERENT indexes, and neither of them is the index that serves the open half of the board.
- *
- * That opening line read "Two queries, both on the index that serves the board" until phase 2,
- * and A28's own measurement fifteen lines below it had already refuted it (A36 finding C). The
- * four board plans, all pinned in tests/local-d1-plans.test.mjs:
- *
- *   /board, open list      reports_board                 three-term seek, plus a temp b-tree
- *   /board, resolved list  reports_public_log
- *   summary, counts        reports_app_status_created    the literal's cost, below
- *   summary, latest        reports_public_log            the one index the two routes share
- *
- * So "both" was wrong, "the index" was wrong, and one of the two is an index no board query
- * touches. The sentence was true when it was written and the measurement that made it false was
- * added UNDERNEATH it rather than over it. A docstring's first line is what a reader believes,
- * so a measurement that contradicts one is an edit to it and not a paragraph after it.
+ * All four board plans are pinned by index name in tests/local-d1-plans.test.mjs, which is
+ * where to read which statement takes which index rather than from a list here.
  *
  * PUBLISHED ROWS ONLY. Every term carries `public = 1` and a published status. A number
  * that moved when a private draft moved would let anyone watching it learn when the desk is
@@ -484,35 +422,16 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
  * moved would be exactly the side channel above, one tenant wide, on an endpoint with no
  * credential on it.
  *
- * WHAT THAT TERM COSTS THE COUNT, MEASURED. A18 said the literal's placement kept
- * reports_board selected and DESIGN.md 4.2 line 931 says `rows_read` "does not move" here.
- * Both are wrong for this statement, and placement is not the mechanism either way: SQLite
- * reorders WHERE terms itself, so what moves the plan is the PRESENCE of an app_id term.
- * Measured 2026-09-18 with make d1-query (A28). The seek keys are written as column lists
- * rather than in EXPLAIN's own notation on purpose: tests/tenant-scope.test.mjs greps this
- * whole file, comments included, for a BOUND app_id, and a pasted plan line would trip it.
- *
- *   counts, as shipped    SEARCH reports USING INDEX reports_app_status_created,
- *                         sought on (app_id, status)
- *   counts, no literal    SEARCH reports USING INDEX reports_board,
- *                         sought on (kind, public, status)
- *   latest, either way    SEARCH reports USING INDEX reports_public_log,
- *                         sought on (status, public)
- *
- * So the count's seek narrows from three terms to two and `kind` and `public` become
- * per-row tests: 208 index entries walked where the three-term seek walked 6, on the
- * population the measurement was taken against. NO COVERING INDEX WAS LOST and nobody
- * should go looking for one. This statement also reads `work_state` and `fixed_at` and
- * neither is in reports_board, so the table lookup happens under both plans; a
+ * THE TERM COSTS THE COUNT ITS THIRD SEEK TERM, and the cost is accepted knowingly (A28, the
+ * same reasoning as A17). With the literal the count seeks on two terms and tests `kind` and
+ * `public` per row; the measured gap, and both plans, are in tests/local-d1-plans.test.mjs.
+ * This route carries no credential and is cacheable for five minutes, the extra index entries
+ * at this volume are nothing, and the term is the only thing that stops it publishing a
+ * tenant's counts if invariant 4.3 ever breaks. A fourth-term index would restore the seek and
+ * was refused: it does not earn an index write on every insert, so there is no 0005 for this.
+ * No covering index is lost either way, because the statement reads `work_state` and `fixed_at`
+ * and neither is in reports_board, so the table lookup happens under both plans; a
  * SELECT COUNT(*) proxy says otherwise and is the wrong query.
- *
- * THE COST IS ACCEPTED KNOWINGLY AND THE TERM STAYS (A28, the same reasoning as A17). This
- * route carries no credential and is cacheable for five minutes, 202 extra index entries at
- * this volume is nothing, and the term is the only thing that stops it publishing a
- * tenant's counts if invariant 4.3 ever breaks. A fourth-term index would restore the seek
- * and was refused: at 208 rows it does not earn an index write on every insert, so there is
- * no 0005 to write for this. Both plans are pinned by index name in
- * tests/local-d1-plans.test.mjs.
  */
 export async function boardSummary(db, { now, windowDays = SUMMARY_WINDOW_DAYS }) {
   const since = now - windowDays * 24 * 60 * 60 * 1000;

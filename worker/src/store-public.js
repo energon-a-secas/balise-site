@@ -38,11 +38,12 @@ import { storeError } from './store.js';
  * would land in the corrections log as a line about nothing. The term is written the same
  * way in migrations/0002_open_items.sql, which is what lets its partial index serve this.
  *
- * `app_id = 'fleet'` is written FIRST because it is the leading column of
- * reports_app_fix_public_log (migrations/0004_tenants.sql): with the literal in front, the
- * whole WHERE is a prefix of that index and the ORDER BY is its order, which is what keeps
- * a page of `limit` at `limit` rows read. The partial predicate is still copied verbatim,
- * since SQLite matches a partial index by implication.
+ * `app_id = 'fleet'` is the leading column of reports_app_fix_public_log
+ * (migrations/0004_tenants.sql), so this whole WHERE is a prefix of that index and the
+ * ORDER BY is its order, which is what keeps a page of `limit` at `limit` rows read. Pinned
+ * by index name and seek shape in tests/local-d1-plans.test.mjs. The partial predicate is
+ * copied verbatim, since SQLite matches a partial index by implication. Term ORDER here is
+ * cosmetic: SQLite reorders WHERE terms itself (A28).
  *
  * `url` is TRIMMED on the way out, by `publicUrl` below, for the same reason `body` is
  * absent: a page address the reporter was looking at is not neutral. /log is the only
@@ -106,9 +107,8 @@ function publicUrl(url) {
 // ── The per-site read-back ────────────────────────────────────────────────────
 
 /**
- * One GROUP BY, and the only thing in the whole system that would ever notice a Beacon
- * that silently stopped working. Every other check this campaign builds is a static check
- * on files: they prove the widget was copied, not that a report ever arrived.
+ * One GROUP BY: reports per site over a window, newest first. It reads what actually arrived,
+ * where a static check over files can only prove the widget was copied.
  *
  * A site absent from this list either has no visitors or has a broken widget, and the
  * operator can tell which in one click by opening the site.
@@ -123,16 +123,11 @@ function publicUrl(url) {
  * readout answers "is the fleet's Beacon alive", so a busy tenant would drown it exactly
  * as an import does.
  *
- * AND THE GROUP BY DOES SORT (A21). This used to claim the fleet term leads
- * reports_app_site_created, so the grouping walks the index. Measured, neither half is true:
- * the statement seeks reports_app_fix_created on (app_id, created_at), the smaller partial
- * index whose own predicate is the `kind <> 'open'` term in the WHERE below, and then takes a
- * temp B-tree for the GROUP BY and a second for the ORDER BY. The site-leading index is not
- * chosen. Both B-trees and the index name are pinned in tests/local-d1-plans.test.mjs, so a
- * planner that starts choosing differently is a red test rather than a comment nobody
- * rechecked. The seek keys are written as column lists rather than in EXPLAIN's own notation
- * on purpose: tests/tenant-scope.test.mjs greps this whole file, comments included, for a
- * bound app_id, and a pasted plan line would trip it.
+ * AND THE GROUP BY DOES SORT (A21). The statement seeks reports_app_fix_created, the smaller
+ * partial index whose own predicate is the `kind <> 'open'` term in the WHERE below, and then
+ * takes a temp B-tree for the GROUP BY and a second for the ORDER BY. Both B-trees and the
+ * index name are pinned in tests/local-d1-plans.test.mjs, so a planner that starts choosing
+ * differently is a red test rather than a comment nobody rechecked.
  */
 export async function healthSites(db, since) {
   try {

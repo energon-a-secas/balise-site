@@ -267,10 +267,9 @@ export async function listWork(db, { states, limit, before }) {
     const page = await db
       .prepare(
         // C6: the tenant literal, invariant 4.3. `r.work_state IS NOT NULL` repeats the partial
-        // predicate of reports_work_updated verbatim, which is what keeps that index usable at all.
-        // WHERE the tenant term is written changes nothing: SQLite reorders WHERE terms itself, so
-        // what moves a plan is the PRESENCE of an app_id term, never its position (A28 corrects
-        // A18, which said "last" placement was the mechanism). No tenant twin.
+        // predicate of reports_work_updated verbatim, since SQLite matches a partial index by
+        // implication. Where the tenant term is written changes nothing: SQLite reorders WHERE
+        // terms itself, so presence is the mechanism and position is not (A28). No tenant twin.
         `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED} ${FROM_JOINED}
           WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map(() => '?').join(',')})
             AND r.app_id = 'fleet' ${cursor}
@@ -279,13 +278,12 @@ export async function listWork(db, { states, limit, before }) {
       .bind(...states, ...cursorArgs, limit)
       .run();
     // C6: NO PREDICATE, by INVARIANT 4.3, and the one statement in section 5 that could not take
-    // the literal 5.3 assigns it. Do not add the term back: it makes an app_id-leading index a
-    // candidate, SQLite prefers it, and in a fleet-only table it matches every row, so the plan
-    // goes from COVERING INDEX reports_work_updated to reports_app_site_created plus a temp
-    // B-tree, the whole table fetched, rows_read 33 against a budget of 18 on work.test.mjs's own
-    // database. The count is right by the invariant instead: the only writes that make work_state
-    // non-null are approveWork below and CLAIMABLE in src/store-work-runner.js, both carrying the
-    // literal (A16), which tenant-scope.test.mjs counts after a full exercise and wants zero.
+    // the literal 5.3 assigns it. In a fleet-only table the term would match every row while
+    // making an app_id-leading index a candidate, so it is left off deliberately rather than
+    // forgotten. The count is right by the invariant instead: the only writes that make
+    // work_state non-null are approveWork below and CLAIMABLE in src/store-work-runner.js, both
+    // carrying the literal (A16), which tenant-scope.test.mjs counts after a full exercise and
+    // requires zero unscoped.
     const tally = await db
       .prepare('SELECT work_state, COUNT(*) AS n FROM reports WHERE work_state IS NOT NULL GROUP BY work_state')
       .run();
