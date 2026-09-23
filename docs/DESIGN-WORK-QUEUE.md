@@ -571,7 +571,7 @@ task from the claim: `balise-work <id8>: <title>`.
 
 Per-site tags on board entries and a markdown snapshot (offered, declined 2026-09-14);
 docket reading `/work`; a notification when a result reaches review beyond the scheduled
-task's own completion notice; Dispatch drafts from resolutions; any automated publish, ever.
+task's own completion notice; Antenne drafts from resolutions; any automated publish, ever.
 
 ## 10. Open, stated rather than hidden
 
