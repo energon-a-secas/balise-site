@@ -129,8 +129,8 @@ projects/balise-site/
     ├── src/validate.js         C1 validation
     ├── src/validate-work.js    work route shapes
     ├── src/envelope.js         ERROR_CODES and the five-key envelope
-    ├── migrations/             the store's real shape: 0001 baseline, 0002 open items, 0003 work queue
-    └── schema.sql              the baseline alone, byte for byte 0001; nothing from 0002 or 0003
+    ├── migrations/             the store's real shape: 0001 baseline, 0002 open items, 0003 work queue, 0004 tenants, 0005 indexes
+    └── schema.sql              the baseline alone, byte for byte 0001; nothing from 0002 onward
 ```
 
 **The widget is not in this repo.** It is a shared kit at

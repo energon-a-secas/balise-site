@@ -5,13 +5,21 @@
 // asserts HOW the database answers. Its sibling tests/local-d1-rows.test.mjs asserts how MUCH
 // the database reads, and tests/local-d1.test.mjs keeps the routes and the contract envelopes.
 //
-// WHY A PLAN CAN BE PINNED AT ALL (A20). `PRAGMA optimize` at the end of 0004 analyses nothing,
-// because a migration runs against an empty table: `sqlite_stat1` holds one row and it is
-// d1_migrations. So every plan below is chosen STRUCTURALLY, from the shape of the WHERE against
-// the shape of the index, by the leftmost-prefix rule and nothing else. That is what makes them
-// stable enough to assert, and asserting them is the mitigation the pragma was mistakenly
-// credited with: a planner change, a dropped index or a rewritten WHERE becomes a red test here
-// instead of a bill in production.
+// WHY A PLAN CAN BE PINNED AT ALL (A20). The `PRAGMA optimize` at the end of 0004 and of 0005
+// analyses nothing HERE, because a migration run by this suite runs against an empty table:
+// `sqlite_stat1` holds one row and it is d1_migrations. So every plan below is chosen
+// STRUCTURALLY, from the shape of the WHERE against the shape of the index, by the leftmost-prefix
+// rule and nothing else. That is what makes them stable enough to assert, and asserting them is
+// the mitigation the pragma was mistakenly credited with: a planner change, a dropped index or a
+// rewritten WHERE becomes a red test here instead of a bill in production.
+//
+// AND THAT IS A PROPERTY OF THIS SUITE'S DATABASE, NOT OF THE WORKER'S. Applied to a database that
+// already holds rows, which is what 0005 meets on a desk or on the remote, the same pragma does
+// gather statistics: measured over node:sqlite, no sqlite_stat1 at all before the apply and 24
+// rows of it after, on a 3000-row copy. So a plan pinned here is the unanalysed one, and where the
+// analysed plan differs the migration comment says so. 0005's work-queue paragraph is the one that
+// does: the pre-0005 schema already seeks reports_work_updated for the four-state page once the
+// database has been analysed, and walks the fleet when it has not.
 //
 // WHY THE STATEMENTS ARE TRANSCRIBED. `EXPLAIN QUERY PLAN` needs a statement, and this file
 // cannot ask the store for one: the store's text is built inside a function, with bound
@@ -24,6 +32,12 @@
 // It runs the Worker under workerd because the answers have to come from the routes, and it
 // plants the tenant fixture because 'the route's answer equals the scoped statement's answer' is
 // only a statement about scoping if there is a second tenancy in the table to leave out.
+//
+// WHAT IS PINNED SOMEWHERE ELSE, so nobody reads this file as the whole inventory. The work
+// queue's reads (listWork's two page shapes, its tally and the runner's claim pick) are pinned in
+// tests/work.test.mjs, by the same rules, because they need a queue with rows in it and this
+// suite's queue is empty. A transcription proved against an empty answer proves nothing, which
+// is the one thing both files refuse to do.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -98,6 +112,12 @@ const BOARD_COLUMNS = 'public_note, status, opened_at, fixed_at, source_closed_a
 const STATEMENTS = {
   'listReports, kind given': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind = 'wrong' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
   'listReports, kind and status': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind = 'wrong' AND status = 'new' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
+  // The same two statements with kind = 'open', which is the desk's DEFAULT tab and the read
+  // 0004's six indexes regressed. They were unpinned until 0005, which is how a page of `limit`
+  // became a walk of every fleet row newer than the cursor with nothing going red. `kind` is
+  // bound, so these are not a second statement in src/: they are the other value.
+  'listReports, kind=open': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
+  'listReports, kind=open and status': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND status = 'new' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
   'listReports, corrections': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind <> 'open' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
   'listReports, corrections and status': `SELECT id FROM reports WHERE app_id = 'fleet' AND kind <> 'open' AND status = 'new' AND created_at < ${CURSOR} ORDER BY created_at DESC LIMIT 5`,
   'publicLog': `SELECT id, public_note FROM reports WHERE app_id = 'fleet' AND kind <> 'open' AND status = 'fixed' AND public = 1 AND fixed_at < ${CURSOR} ORDER BY fixed_at DESC LIMIT 5`,
@@ -120,8 +140,13 @@ const STATEMENTS = {
 // design intention: where the two disagree the design document is what is wrong (A21 for
 // healthSites, A28 for the board), and the fix is an amendment rather than an edit here.
 const PLANS = {
-  'listReports, kind given': 'SEARCH reports USING INDEX reports_app_created (app_id=? AND created_at<?)',
-  'listReports, kind and status': 'SEARCH reports USING INDEX reports_app_status_created (app_id=? AND status=? AND created_at<?)',
+  // AMENDED with the four indexes 0005_indexes.sql adds for the regression 0004's six caused. All
+  // four `listReports` lines now seek on `kind` as well, which is the fix: before it, the kind term
+  // was a per-row test and a page of the smaller kind walked the other one.
+  'listReports, kind given': 'SEARCH reports USING INDEX reports_app_kind_created (app_id=? AND kind=? AND created_at<?)',
+  'listReports, kind and status': 'SEARCH reports USING INDEX reports_app_kind_status_created (app_id=? AND kind=? AND status=? AND created_at<?)',
+  'listReports, kind=open': 'SEARCH reports USING INDEX reports_app_kind_created (app_id=? AND kind=? AND created_at<?)',
+  'listReports, kind=open and status': 'SEARCH reports USING INDEX reports_app_kind_status_created (app_id=? AND kind=? AND status=? AND created_at<?)',
   'listReports, corrections': 'SEARCH reports USING INDEX reports_app_fix_created (app_id=? AND created_at<?)',
   'listReports, corrections and status': 'SEARCH reports USING INDEX reports_app_fix_status_created (app_id=? AND status=? AND created_at<?)',
   publicLog: 'SEARCH reports USING INDEX reports_app_fix_public_log (app_id=? AND status=? AND public=? AND fixed_at<?)',
@@ -132,24 +157,42 @@ const PLANS = {
   // A28, and these four are the amendment's evidence. Three things they say that A18 and
   // DESIGN.md 4.2 said otherwise:
   //
-  //   1. The open list DOES keep the full three-term seek on reports_board. It pays for it with
-  //      a temp b-tree, because reports_board's trailing column is created_at and the sort is
-  //      on opened_at.
+  //   1. The open list DOES keep a full seek on every equality term it carries, and it pays for
+  //      it with a temp b-tree, because neither index that can serve it ends on the sort column:
+  //      the sort is opened_at and the trailing column is status. That b-tree is about the sort
+  //      column and not about which index wins.
   //   2. The resolved list and the summary's latest were NEVER on reports_board: both are
   //      served by reports_public_log, which is why A29 withdrew the suggestion that that index
-  //      is dead weight, and why no drop list may contain it.
-  //   3. The counts query is the one the `app_id = 'fleet'` literal moves, and it moves it to a
-  //      NARROWER seek: two terms on reports_app_status_created instead of three on
-  //      reports_board, which cost 208 index entries against 6 on the measured population. The
-  //      cost is accepted knowingly (A28) and the term stays. See boardSummary() for why, and
-  //      do not "fix" this line by removing the term or adding a fourth-column index.
+  //      is dead weight, and why no drop list may contain it. Both are still on it with 0005
+  //      applied, measured, so nothing in this campaign has touched the resolved half of the
+  //      board and the finding that nothing covers it still stands.
+  //   3. The counts query is the one the `app_id = 'fleet'` literal moves. A28 measured it onto a
+  //      NARROWER seek than reports_board's three terms and accepted that knowingly. 0005 gives
+  //      it a four-term seek instead, on the same index as the open list. The term stays either
+  //      way. See boardSummary() for why, and do not "fix" this line by removing it.
   //
   // The position of the literal in the WHERE changes NONE of these. SQLite reorders WHERE terms
   // itself; what moves a plan is whether an app_id term is present.
-  'board, open list': 'SEARCH reports USING INDEX reports_board (kind=? AND public=? AND status=?)'
+  //
+  // WHAT THE FIRST ATTEMPT AT THE INDEX FIX DID TO THESE TWO LINES, because this comment said the
+  // opposite for a day and the correction is the point. With only 0005's three non-board indexes,
+  // the open list left reports_board, which SEEKS `public`, for reports_app_kind_status_created,
+  // which TESTS it per row: same answer, and every fleet open item the desk accepted without
+  // publishing added to the row set. This comment recorded that as "measured cost-neutral on this
+  // fixture", and it was, because this fixture holds no such row and neither did the other one.
+  // It was a property of two fixtures written in the voice of a measurement. On a fixture with 12
+  // of them, GET /board read 318 rows instead of 306. reports_app_board is the tenant twin of
+  // reports_board and restores the four-term seek; the case that proves it lives in
+  // tests/local-d1-rows.test.mjs, whose fixture now carries those rows.
+  //
+  // THIS IS NOT PERMISSION TO DROP reports_board: the two indexes cover different row sets,
+  // nothing here measured a drop, Worker 1.1.0's unscoped board query has no app_id term to seek
+  // the twin with, and the board's own coverage is among the findings the owner has not
+  // authorised anyone to touch.
+  'board, open list': 'SEARCH reports USING INDEX reports_app_board (app_id=? AND kind=? AND public=? AND status=?)'
     + ' | USE TEMP B-TREE FOR ORDER BY',
   'board, resolved list': 'SEARCH reports USING INDEX reports_public_log (status=? AND public=?)',
-  'boardSummary, counts': 'SEARCH reports USING INDEX reports_app_status_created (app_id=? AND status=?)',
+  'boardSummary, counts': 'SEARCH reports USING INDEX reports_app_board (app_id=? AND kind=? AND public=? AND status=?)',
   'boardSummary, latest': 'SEARCH reports USING INDEX reports_public_log (status=? AND public=?)',
 };
 
@@ -163,18 +206,21 @@ test('A20 and A28: every statement plans onto a named index, and the name is ass
   }
 });
 
-test('A20: the six desk and log transcriptions are the store\'s own statements, proved against the routes', async () => {
-  const names = ['listReports, kind given', 'listReports, kind and status', 'listReports, corrections', 'listReports, corrections and status', 'publicLog', 'healthSites'];
+test('A20: the eight desk and log transcriptions are the store\'s own statements, proved against the routes', async () => {
+  const names = ['listReports, kind given', 'listReports, kind and status', 'listReports, kind=open', 'listReports, kind=open and status', 'listReports, corrections', 'listReports, corrections and status', 'publicLog', 'healthSites'];
   const sets = await d1(...names.map((name) => STATEMENTS[name]));
   const answer = Object.fromEntries(names.map((name, i) => [name, sets[i]]));
 
   const desk = async (query, ip) => (await call(`/reports?limit=5${query}`, { token: TOKEN, ip })).body.reports.map((r) => r.id);
   assert.deepEqual(answer['listReports, kind given'].map((r) => r.id), await desk('&kind=wrong', '192.0.2.110'));
   assert.deepEqual(answer['listReports, kind and status'].map((r) => r.id), await desk('&kind=wrong&status=new', '192.0.2.111'));
+  assert.deepEqual(answer['listReports, kind=open'].map((r) => r.id), await desk('&kind=open', '192.0.2.115'));
+  assert.deepEqual(answer['listReports, kind=open and status'].map((r) => r.id), await desk('&kind=open&status=new', '192.0.2.116'));
   assert.deepEqual(answer['listReports, corrections'].map((r) => r.id), await desk('', '192.0.2.112'));
   assert.deepEqual(answer['listReports, corrections and status'].map((r) => r.id), await desk('&status=new', '192.0.2.113'));
-  // Five rows on both sides of each of those four, so none of them is two empty lists agreeing.
-  for (const name of names.slice(0, 4)) {
+  // Five rows on both sides of each of those six, so none of them is two empty lists agreeing.
+  // OPEN_SEEDED is 8, so the two open pages fill as the four corrections pages do.
+  for (const name of names.slice(0, 6)) {
     assert.equal(answer[name].length, 5, `${name} returned ${answer[name].length} rows, so the page is not full and the comparison is weak`);
   }
 
@@ -279,8 +325,17 @@ test('the tenant fixture reaches neither the board nor the summary', async () =>
 // WHAT THIS DOES NOT PIN. The `rows_read` these plans cost: that is through the route, in
 // tests/local-d1-rows.test.mjs, which is why POST /open-items reports rows_read at all.
 
-/** The three indexes that tie for a bare `app_id` seek: app_id leading, no partial predicate. */
-const APP_LEADING = ['reports_app_created', 'reports_app_status_created', 'reports_app_site_created'];
+/** The indexes that tie for a bare `app_id` seek: app_id leading, no partial predicate. The last
+ *  three arrived with 0005 and joined the tie rather than changing anyone's cost: measured,
+ *  POST /open-items scanned the same rows before and after they existed. */
+const APP_LEADING = ['reports_app_created', 'reports_app_status_created', 'reports_app_site_created',
+  'reports_app_kind_created', 'reports_app_kind_status_created', 'reports_app_board'];
+/** The three that can serve an (app_id, kind) seek, which is a NARROWER seek than the above and so
+ *  a different assertion, not a wider tie list. Which of the three wins is a tie SQLite breaks for
+ *  itself: with 0005 applied the sync read takes reports_app_board, and it took
+ *  reports_app_kind_status_created when that was the only one of the three that existed. Same two
+ *  seek terms, same cost, measured both ways. */
+const APP_KIND_LEADING = ['reports_app_kind_created', 'reports_app_kind_status_created', 'reports_app_board'];
 /** The UNIQUE index on the fingerprint. A28's rule applies here too: this is a measurement. */
 const FP_UNIQUE = ['reports_fp'];
 
@@ -322,9 +377,13 @@ test('A36 finding A: the import and sync statements seek where they are pinned t
       sql: `UPDATE reports SET source_closed_at = 1 WHERE app_id = 'fleet' AND fingerprint = '${absent[0]}' AND source_closed_at IS NULL`,
     },
     {
+      // 0005 narrowed this one from (app_id=?) to (app_id=? AND kind=?): the statement carries
+      // `kind = 'open'` and there is now an index that can seek it. Measured, not hoped for, and a
+      // cost improvement rather than a tie broken differently, which is why the hard assertion
+      // moved with it instead of being loosened. WHICH index answers it is the tie above.
       name: 'openSync, the open items of one source',
-      seek: '(app_id=?)',
-      anyOf: APP_LEADING,
+      seek: '(app_id=? AND kind=?)',
+      anyOf: APP_KIND_LEADING,
       sql: `SELECT fingerprint, source_ref FROM reports WHERE app_id = 'fleet' AND kind = 'open' AND source = 'queue' AND source_closed_at IS NULL`,
     },
     {

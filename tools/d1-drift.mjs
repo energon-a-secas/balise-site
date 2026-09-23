@@ -23,7 +23,10 @@
 //
 // TABLES AND COLUMNS ONLY. D1's authorizer answers SQLITE_AUTH for pragma_index_list, and
 // for pragma_table_info on its own bookkeeping tables, so one authorized statement cannot
-// also ask about indexes. Every index in the migrations is CREATE INDEX IF NOT EXISTS, so
+// also ask about indexes. That reasoning has one exception, and migrations/0005_indexes.sql
+// exists because of it: an index added to a migration a database has ALREADY recorded is never
+// re-applied, and nothing here reports the gap. A new migration file is self-healing; an edit
+// to a recorded one is not. Every index in the migrations is CREATE INDEX IF NOT EXISTS, so
 // re-applying a migration restores a missing one; a column added by an ALTER never comes
 // back that way, and a missing column is the one that answers 502.
 

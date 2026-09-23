@@ -61,7 +61,7 @@ after(async () => {
 test('the migration file IS the schema file, so the two cannot drift', () => {
   // schema.sql is the baseline alone and the migrations are the store's shape: 0001 is
   // schema.sql, and every migration after it adds to that (0002 open items, 0003 work, 0004
-  // tenants; the list is migrations/ and not this line). The two files are the same bytes, and this is
+  // tenants, 0005 indexes; the list is migrations/ and not this line). The two files are the same bytes, and this is
   // the only thing that would notice one of them being edited alone.
   const schema = readFileSync(join(WORKER_DIR, 'schema.sql'), 'utf8');
   const baseline = readFileSync(join(WORKER_DIR, 'migrations/0001_baseline.sql'), 'utf8');

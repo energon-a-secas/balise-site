@@ -14,6 +14,7 @@ import {
   migrate, run, startWorker, stopWorker, requester, report, seedReports, seedOpenItems,
 } from './harness.mjs';
 import { rowsReadBudget } from '../src/store.js';
+import { MAX_ATTEMPTS } from '../src/work.js';
 
 const STATE = join(WORKER_DIR, '.wrangler/work-state');
 const PORT = 8893;
@@ -413,6 +414,119 @@ test('the queue lists by state, counts every state, pages without loss, and stay
     const { body } = await op(`/reports?limit=${limit}`);
     assert.ok(body.rows_read <= rowsReadBudget(limit), `the corrections page scanned ${body.rows_read} rows once the work queue existed`);
   }
+});
+
+// ── The queue's query plans, pinned where a queue exists ──────────────────────
+//
+// listWork's reads had NO pinned plan until 0005_indexes.sql, and that gap is how GET /work came
+// to seek `app_id` alone and walk the fleet's half of the table at every page size, on an empty
+// queue, with nothing going red. tests/local-d1-plans.test.mjs is where a plan
+// is normally pinned, and these are not there for one reason: its work queue is empty, and that
+// file's discipline, which this one now borrows, is that a transcribed statement is worth nothing
+// until its answer has been compared with the route's. Two empty lists agree under any plan.
+//
+// The statements are COPIES of what src/store-work.js and src/store-work-runner.js build, with
+// the bound parameters rendered as literals because `wrangler d1 execute` takes none. The copies
+// rot; the answer comparison below is what stops a pin describing a statement nobody runs.
+const LAST_REVIEW_NOTE = `(SELECT n.review_note FROM work_runs n
+    WHERE n.report_id = r.id AND n.review_note IS NOT NULL AND n.review_note <> ''
+    ORDER BY n.claimed_at DESC LIMIT 1) AS last_review_note`;
+const ITEM_COLUMNS = `r.id, r.kind, r.status, r.site, r.source, r.source_ref, r.public_note, r.suggested,
+  r.body, r.filed_by, r.work_state, r.work_mode, r.work_instruction, r.work_run, r.work_attempts,
+  r.work_lease_until, r.work_approved_at, r.work_updated_at, ${LAST_REVIEW_NOTE}`;
+const RUN_JOINED = ['id', 'attempt', 'runner', 'mode', 'instruction', 'claimed_at', 'heartbeat_at', 'lease_until',
+  'ended_at', 'end_reason', 'outcome', 'summary', 'evidence', 'refs', 'needs_landing', 'suggested_note', 'review',
+  'review_note', 'reviewed_at', 'landed_at', 'land_note'].map((f) => `w.${f} AS run_${f}`).join(', ');
+
+/** The page, for a set of states rendered as literals. IN_PROGRESS plus approved is what
+ *  GET /work answers with no `state`, and the four-element list is what moved the plan: at one
+ *  state the read stayed on reports_work_updated even before the fix. */
+const workPage = (states, limit) => `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED}
+  FROM reports r LEFT JOIN work_runs w ON w.id = r.work_run
+  WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map((s) => `'${s}'`).join(',')})
+    AND r.app_id = 'fleet'
+  ORDER BY r.work_updated_at DESC, r.id DESC LIMIT ${limit}`;
+
+/** CLAIMABLE from src/store-work-runner.js, with the lease instant and the attempt cap rendered.
+ *  MAX_ATTEMPTS is imported rather than typed, so a change to the cap cannot leave this pinning
+ *  a statement the runner has stopped making. */
+const claimPick = `SELECT id FROM reports WHERE work_state IS NOT NULL
+  AND (work_state = 'approved' OR (work_state = 'claimed' AND work_lease_until < 1 AND work_mode IS NOT 'ship'))
+  AND work_attempts < ${MAX_ATTEMPTS}
+  AND app_id = 'fleet' ORDER BY work_approved_at LIMIT 1`;
+
+const WORK_STATEMENTS = {
+  'listWork, the active four': workPage(['approved', 'claimed', 'review', 'accepted'], 50),
+  'listWork, one state': workPage(['done'], 1),
+  'listWork, the tally': 'SELECT work_state, COUNT(*) AS n FROM reports WHERE work_state IS NOT NULL GROUP BY work_state',
+  'claimWork, the pick': claimPick,
+};
+
+// Measured, not intended. The four-state page keeps its temp b-tree because the IN list makes the
+// sort span four seeks; the single-state page loses the one it used to take for the LAST TERM of
+// the ORDER BY, which is what the trailing `id DESC` on the index is for.
+//
+// WHAT THESE PINS ARE MEASURED ON, and it is not every database. This suite migrates a fresh
+// local D1, so its `reports` table has NO statistics: the PRAGMA optimize each migration ends
+// with analyses an empty table and gathers nothing. Every plan below is therefore the structural
+// one. On a database that HAS been analysed the four-state page is different in one way worth
+// writing down: measured over node:sqlite on the pre-0005 schema, populated and ANALYZEd at two
+// queue sizes, it already seeks reports_work_updated (work_state=?) rather than walking the fleet
+// on a bare (app_id=?). So the campaign's headline number for GET /work, 92 rows at every page
+// size on an empty queue, is a fact about an UNANALYSED database, which is what this suite and a
+// fresh desk are. reports_app_work_updated still earns its place on either: with it the plan is
+// (app_id=? AND work_state=?) analysed or not, and the single-state page has no temp b-tree
+// either way. 0005_indexes.sql carries the full version of this. The same measurement also says
+// the last pin below is the fragile one: ANALYZE the database and claimWork's pick becomes a
+// MULTI-INDEX OR, taking reports_app_work_updated once per arm of the OR on (app_id=? AND
+// work_state=?), which is a BETTER plan than the one pinned and a different string. Nothing
+// analyses a test database today. If something starts, that pin is the first thing it will break,
+// and the plan is not what will have gone wrong.
+//
+// THE TALLY IS THE LOAD-BEARING LINE HERE. It takes reports_work_updated, 0003's unscoped index,
+// and it always will: it carries no tenant term at all, deliberately and by invariant 4.3, so an
+// app_id-leading index is not a candidate for it. That is the measurement that says 0005's
+// reports_app_work_updated does not supersede it and no drop list may hold it.
+const WORK_PLANS = {
+  'listWork, the active four': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=?)'
+    + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
+    + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)'
+    + ' | USE TEMP B-TREE FOR ORDER BY',
+  'listWork, one state': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=?)'
+    + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
+    + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)',
+  'listWork, the tally': 'SEARCH reports USING COVERING INDEX reports_work_updated (work_state>?)',
+  'claimWork, the pick': 'SEARCH reports USING INDEX reports_app_work_updated (app_id=? AND work_state>?)'
+    + ' | USE TEMP B-TREE FOR ORDER BY',
+};
+
+/** One or more statements against the same local D1 the Worker is bound to, one result set each. */
+const d1 = async (...commands) => {
+  const out = await run(['d1', 'execute', 'balise', '--local', '--persist-to', STATE, '--json', '--command', commands.join('; ')]);
+  return JSON.parse(out.slice(out.indexOf('['))).map((set) => set.results);
+};
+
+test('the queue\'s reads seek their own index, the tally keeps the unscoped one, and the page transcription is the store\'s', async () => {
+  const names = Object.keys(WORK_STATEMENTS);
+  assert.deepEqual([...names].sort(), Object.keys(WORK_PLANS).sort(), 'a work statement has no pinned plan, or a plan has no statement');
+  const sets = await d1(...names.map((n) => `EXPLAIN QUERY PLAN ${WORK_STATEMENTS[n]}`));
+  for (const [i, name] of names.entries()) {
+    assert.equal(sets[i].map((r) => r.detail).join(' | '), WORK_PLANS[name], `the plan for ${name} has changed`);
+  }
+
+  // And the transcription is the statement GET /work runs: same ids, same order, on a queue that
+  // by now holds items in several states.
+  const [rows] = await d1(WORK_STATEMENTS['listWork, the active four']);
+  const { body } = await op('/work?limit=50');
+  assert.ok(rows.length > 0, 'the active queue is empty, so this comparison is two empty lists agreeing');
+  assert.deepEqual(rows.map((r) => r.id), body.items.map((i) => i.id), 'the transcribed page is not the page the route answers');
+
+  // WHAT IS DELIBERATELY NOT ASSERTED HERE: a number. This fleet is about twenty reports, and the
+  // regressed plan cost the fleet's whole slice plus the tally, so a ceiling separating it from
+  // the fixed plan would be a handful of rows wide and would be measuring the LEFT JOIN's own
+  // reads as much as the seek. The page's cost is bounded where the fixture can carry it, against
+  // a fleet of ninety rows and an empty queue, in tests/local-d1-rows.test.mjs. The single-state
+  // page already has a budget in the test above. What this test owns is the plan.
 });
 
 test('the board says a published item is moving and nothing more, both board routes answer any origin, and automation still cannot publish', async () => {

@@ -1,0 +1,213 @@
+-- 0005: the four tenant-first indexes 0004 left out.
+--
+-- 0004_tenants.sql created six indexes leading on `app_id` and dropped nothing. That handed the
+-- planner an app_id-leading index to prefer for every statement on `reports`, and TWO reads that
+-- were already covered lost the term they used to seek on: `kind` for the desk's open tab and
+-- `work_state` for the work queue. Each became a per-row test on a walk of the fleet's half of
+-- the table. This migration gives those reads an index that leads on `app_id` AND carries their
+-- term.
+--
+-- A THIRD READ IS HERE FOR A DIFFERENT REASON, and the difference matters to anyone reading this
+-- file to learn what went wrong. GET /board's open list did NOT regress against 0004: measured,
+-- it kept its three-term seek on reports_board throughout. It regressed against the first attempt
+-- at this file, which shipped the two indexes above plus the work one and no board twin, and gave
+-- the planner an app_id-leading index that seeks three of the board's four terms and tests
+-- `public` per row. reports_app_board is the repair. The order is the lesson: an index added for
+-- one statement is a new candidate for every statement that shares a prefix with it.
+--
+-- WHY 0004 THOUGHT IT DID NOT NEED THEM. Its own taxonomy says six indexes are "deliberately left
+-- alone (reports_board, reports_open_created, reports_open_status_created, reports_work_updated,
+-- reports_work_run, work_runs_report) because every query that uses them is fleet-only by
+-- invariant". That reasoning is about CORRECTNESS and it holds: a seek through one of those
+-- cannot reach a tenant's correction. It says nothing about whether the planner will keep
+-- choosing them once an app_id-leading index exists, and it did not. Four of those six get their
+-- tenant twin here. The other two do not, and the reason is at the foot of this file.
+--
+-- ── WHY THIS IS A MIGRATION OF ITS OWN AND NOT AN EDIT TO 0004 ────────────────
+--
+-- An index added to 0004 would reach no database that has already recorded 0004, and nothing in
+-- this repository would report it. That is not an argument from the documentation. Measured on
+-- 2026-09-23, on a scratch local D1 built by `wrangler d1 migrations apply`, one step at a time:
+--
+--   1. Applied 0001 through 0004 (0004 exactly as committed).   23 named indexes.
+--   2. Appended these four CREATE INDEX statements to 0004 and re-ran the apply.
+--      Wrangler answered "No migrations to apply!".             23 named indexes, unchanged.
+--   3. Ran the repository's own drift check against that same database, unmodified:
+--      `node tools/d1-drift.mjs --query` into `wrangler d1 execute --local --json` into
+--      `node tools/d1-drift.mjs`. It printed "the local D1 matches worker/migrations" and
+--      exited 0, against a database holding 23 named indexes while the migration files declared
+--      more: 26 at the moment of that measurement, when these four were still an edit to 0004,
+--      and 27 as this tree now stands. The count it disagreed by is not what the check reads.
+--   4. Restored 0004 and added this file instead. The apply took it.  27 named indexes,
+--      including all four below.
+--
+-- Step 2 is the mechanism: d1_migrations records a migration BY NAME with no content hash, so an
+-- applied migration is never re-run. Step 3 is why nobody would notice: tools/d1-drift.mjs
+-- compares TABLES AND COLUMNS ONLY, so a missing index is invisible to `make d1-check` forever.
+-- Its header explains the omission by saying that "every index in the migrations is
+-- CREATE INDEX IF NOT EXISTS, so re-applying a migration restores a missing one", and step 2 is
+-- the case where that sentence cannot fire: the migration is never re-applied at all. Step 4 is
+-- the asymmetry that decides the question. A new file is self-healing under `make d1-migrate`;
+-- an edit to an old one is not.
+--
+-- THE FROZEN-MIGRATION RULE PERMITS EITHER, and that is why it does not settle this. Queue #82's
+-- rule (docs/DESIGN-WORK-QUEUE.md section 4) is that a migration is frozen once the REMOTE
+-- records it, and it was settled over a missing COLUMN, where an edit and a new file are equally
+-- silent on an already-migrated database. For an INDEX they are not. A new file is also legal
+-- whatever production's d1_migrations turns out to hold, which removes a precondition that
+-- cannot be checked without the network and that every local measurement has to take on trust.
+--
+-- WHAT THIS FILE DOES NOT ANSWER. The last paragraph of 0004 calls the import dedupe read's
+-- missing (app_id, fingerprint) index "a 0005 question". This 0005 is not that answer: it carries
+-- no fingerprint index, because the dedupe read is one of the findings the owner has not
+-- authorised anyone to act on and nothing here measured a candidate for it. The import still
+-- scans the fleet's slice per batch and tests/local-d1-rows.test.mjs still records the number.
+--
+-- ── THE FIXTURE EVERY NUMBER BELOW WAS MEASURED ON ────────────────────────────
+--
+-- tests/local-d1-rows.test.mjs's fixture, which is where these numbers are asserted so that they
+-- go red rather than stale: 40 fleet corrections, 30 imported open items, 20 later corrections
+-- filed after them, one published open entry, one published resolution, 12 accepted open items
+-- with `public` cleared, 600 planted tenant rows, and an EMPTY work queue. Measured through the
+-- routes under workerd against a real local D1, by creating and dropping these four indexes on
+-- one database, so "before" is the pre-0005 schema and not a different build:
+--
+--                                          before      with 0005
+--   GET /reports?kind=open   limit 1/5/25   21, 25, 45  ->  1, 5, 25
+--   GET /reports?kind=wrong  limit 1/5/25    1,  5, 55  ->  1, 5, 25
+--   GET /work                limit 1/5/25   92, 92, 92  ->  3, 3,  3
+--   GET /board               limit 50          306      ->    306
+--   GET /board/summary                         320      ->    307
+--
+-- rowsReadBudget is 12, 20 and 60 at those three limits, so the open tab was over budget at a
+-- page of 1 and of 5, and /work at every page size on an empty queue. The corrections tab was
+-- over nothing and is included because it moved: the two feeds step over each other, whichever
+-- one is newest.
+--
+-- THE TWO BOARD LINES NEED THE THIRD COLUMN THIS TABLE CANNOT HOLD, which is the state the first
+-- attempt at this file left them in: the three non-board indexes created and reports_app_board
+-- not. On the same fixture that is /board 318 and /board/summary 319. So the board ends where it
+-- started and the summary ends 13 rows cheaper, and neither number was the point of the change.
+--
+-- ── THE FOUR ─────────────────────────────────────────────────────────────────
+
+-- listReports() in src/store.js, the `kind = ?` branch: the desk's open-items tab, which is the
+-- shipped desk's DEFAULT view. The tenant twin of 0002's reports_open_created (kind, created_at
+-- DESC), which leads on `kind`: a scoped query taking that one seeks the kind and tests app_id
+-- per row, which is every other tenant's items of that kind walked one at a time. Two equalities
+-- then the cursor, in the sort's own order, so a page costs a page.
+CREATE INDEX IF NOT EXISTS reports_app_kind_created ON reports(app_id, kind, created_at DESC);
+
+-- listReports() again, the `kind = ? AND status = ?` branch. The tenant twin of 0002's
+-- reports_open_status_created. NOT redundant beside the index above, and the measurement is what
+-- says so. Six configurations on the fixture above, creating and dropping these four on one
+-- database. With the kind index alone and not this one, `kind` wins the seek and the status term
+-- is the one demoted: GET /reports?kind=open&status=new&limit=5 reads 19 rows instead of 5,
+-- &status=fixed reads 31 instead of 2, and GET /board/summary goes to 332, which is WORSE than
+-- the 320 it cost before either index existed. With this one alone and not that one, the
+-- unfiltered open page is not fixed at all: 25 rows at a page of 5 and 45 at a page of 25, the
+-- same as with neither. Neither index holds every shape by itself; the pair does.
+CREATE INDEX IF NOT EXISTS reports_app_kind_status_created ON reports(app_id, kind, status, created_at DESC);
+
+-- board() in src/store-open.js, the open list: the tenant twin of 0002's reports_board
+-- (kind, public, status), same three columns in the same order behind the tenant one.
+--
+-- THIS ONE REPAIRS A REGRESSION THE OTHER THREE CAUSED, and it is the reason this file exists
+-- rather than the three that were asked for. reports_board SEEKS `public`. With only the three
+-- indexes above, the open list moved to reports_app_kind_status_created, which seeks
+-- (app_id, kind, status) and TESTS `public` per row, so its row set became the old one plus
+-- every fleet open item the desk accepted and did not publish. Measured on the fixture above,
+-- which carries 12 such rows: GET /board read 306 rows before the campaign, 318 with the three
+-- indexes and no twin, and 306 with this one. The delta is exactly the count of unpublished
+-- accepted items, so it grows with the operator's private drafts and is unbounded in them.
+--
+-- MEASURED WITHOUT TABLE STATISTICS, which is what the suite builds and what a fresh desk is,
+-- and the qualifier belongs here for the same reason it belongs on the work number below. With
+-- statistics gathered, a skeptic measured 800 rows carrying 40 such items and the three indexes
+-- cost the board nothing: the planner did not choose the regressing plan at all. So this index
+-- removes a regression that appears when statistics are absent, and is never worse when they
+-- are present. The
+-- suite pins the cost as a law over the fixture's own counts, in tests/local-d1-rows.test.mjs,
+-- and the two fixtures that held no such row are why the first attempt at this was recorded as
+-- cost-neutral.
+--
+-- THE SUMMARY'S COUNTS MOVE WITH IT, and this was not the reason for the index. boardSummary()'s
+-- counts query carries the same four terms, so it gains the same seek: measured 320 rows before
+-- the campaign, 319 with the three, 307 with this one, on the fixture above and again without
+-- statistics. With them gathered the pre-campaign baseline already reads 307, so on an analysed
+-- database the summary gains nothing from this index. boardSummary()'s own
+-- comment in src/store-open.js says a fourth-term index "was refused: it does not earn an index
+-- write on every insert, so there is no 0005 for this", and that judgement was about buying an
+-- index FOR the summary. The index is here for the open list; the summary's seek arrives with it.
+-- That prose is now one round behind, and correcting it is outside what this pass may touch.
+--
+-- reports_board IS NOT SUPERSEDED BY THIS and must not reach a drop list. It holds every row of
+-- every tenancy at (kind, public, status), and Worker 1.1.0's unscoped board query, which is what
+-- a rollback goes back to, has no app_id term to seek this one with.
+CREATE INDEX IF NOT EXISTS reports_app_board ON reports(app_id, kind, public, status);
+
+-- listWork() in src/store-work.js, whose page carries `app_id = 'fleet'` as a literal, and
+-- CLAIMABLE's pick in claimWork() in src/store-work-runner.js. The tenant twin of 0003's
+-- reports_work_updated, plus the cursor's second key. The partial predicate is copied VERBATIM
+-- from that index and from the leading term of both statements, per the implication rule, and it
+-- does not mention app_id (DESIGN.md section 4.1).
+--
+-- THE TRAILING `id DESC` IS THE CURSOR'S SECOND KEY, not decoration. Measured over node:sqlite
+-- on this schema populated with 500 unqueued rows and 230 queued ones, the same index built at
+-- three columns leaves USE TEMP B-TREE FOR LAST TERM OF ORDER BY on the single-state page, with
+-- statistics and without; at four columns the sort is the index order and the b-tree is gone.
+-- The first round measured what that costs in rows on the work suite's own fixture, a page of 1
+-- reading 6 rows against 4 and a page of 5 reading 9 against 6; this round re-measured the plan
+-- and not those two numbers.
+--
+-- WHAT IS TRUE OF AN UNANALYSED DATABASE AND WEAKER ON AN ANALYSED ONE, said plainly because the
+-- first telling of this left it out. The "92 rows at every page size on an empty queue" above is
+-- measured on a database with NO table statistics, which is what every test database and a fresh
+-- desk is: `PRAGMA optimize` at the foot of 0004 runs against an empty table and gathers nothing
+-- (measured over node:sqlite: no sqlite_stat1 at all after all five migrations on an empty
+-- database). Run ANALYZE on a populated copy of the PRE-0005 schema and the four-state work page
+-- already seeks reports_work_updated (work_state=?) instead of walking the fleet, at every queue
+-- size tried (0 and 400 finished rows, 3 active per state, over node:sqlite on the before and
+-- after migration trees). So on an analysed database this index is not what rescues that page.
+--
+-- IT STILL EARNS ITSELF, on the same measurement: with this index the plan is
+-- (app_id=? AND work_state=?) analysed and unanalysed alike, and the single-state page loses its
+-- temp b-tree in both. What the index buys on an analysed database is a plan that does not depend
+-- on whether anything ever analysed the database; what it buys on an unanalysed one is the page
+-- itself. Note also that applying THIS file to a database that already holds rows gathers the
+-- statistics that a migration against an empty table cannot: measured, 3000 rows, no sqlite_stat1
+-- before the apply and 24 rows of it after, from the PRAGMA at the foot of this file.
+--
+-- reports_work_updated IS NOT SUPERSEDED BY THIS and must not reach a drop list. listWork's tally
+-- and the LAPSED_AT_CAP sweep in src/store-work-runner.js carry no tenant term at all,
+-- deliberately and by invariant 4.3, so an app_id-leading index is not a candidate for either of
+-- them. Measured over node:sqlite on the before and after trees: the tally takes it as a COVERING
+-- INDEX scan either way, and both of the sweep's statements seek it on (work_state=?) either way,
+-- unchanged by this file. The tally's plan is pinned by name in tests/work.test.mjs; the sweep's
+-- is not pinned anywhere, which is worth knowing before anyone proposes a drop.
+CREATE INDEX IF NOT EXISTS reports_app_work_updated ON reports(app_id, work_state, work_updated_at DESC, id DESC) WHERE work_state IS NOT NULL;
+
+-- ── The two of the six that get no twin here ──────────────────────────────────
+--
+-- work_runs_report sits on work_runs, which has no app_id column at all, so there is nothing to
+-- put in front of it.
+--
+-- reports_work_run is a different matter and is left undone rather than judged unnecessary.
+-- readDetail(db, 'run', runId) in src/store-work.js, which runs on every successful POST
+-- /work/claim, reads `WHERE r.work_run = ? AND r.app_id = 'fleet'`, and measured on the fixture
+-- above it seeks app_id ALONE and tests the run per row: reports_app_site_created before this
+-- campaign, reports_app_kind_status_created with the three indexes, reports_app_board with this
+-- file. The cost is the fleet's slice of the table per claim, it predates this file, and none of
+-- the four above makes it worse or better. Adding (app_id, work_run) is not authorised here and
+-- nothing in this round measured it, so it is an open item and not an omission.
+
+-- ── Statistics ────────────────────────────────────────────────────────────────
+--
+-- PRAGMA optimize runs ANALYZE where it would help. On the empty table a fresh migration builds
+-- it gathers nothing, which is why the plans this file's comments quote are STRUCTURAL ones,
+-- chosen by the leftmost-prefix rule, and why tests/local-d1-plans.test.mjs can pin them at all.
+-- On a database that already holds rows, which is what this file meets when it is applied to a
+-- desk or to the remote, it does gather them: measured, 24 rows of sqlite_stat1 on a 3000-row
+-- copy that had none before. Both cases are stated because the difference decides which plan a
+-- reader is looking at, and the work-queue comment above says which of its numbers is which.
+PRAGMA optimize;

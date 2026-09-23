@@ -32,6 +32,16 @@
 // hint would be: the Worker's own statement is left exactly as it is and SQLite is left to
 // choose freely among the indexes a rollback to 1.1.0 would leave behind.
 //
+// AMENDED. The left-hand column above is the SCOPED cost as it was on 2026-09-18, and two of its
+// five lines have since improved: `0005_indexes.sql` added an index carrying `kind`, so the two
+// `kind=wrong` pages stopped stepping over the open items and read a page instead of 55. The
+// right-hand column, which is what this fixture exists to make impossible, is unchanged and is
+// still what `UNSCOPED_FLOOR` is about. The fleet half of the fixture also grew, by the later
+// corrections tests/local-d1-rows.test.mjs now seeds so that its open-tab case has rows of the
+// other kind above it, and twelve of its imported open items are now accepted without being
+// published, so that the board's cost law can tell a plan that seeks `public` from one that
+// tests it. The tenant half is untouched, and none of those changes moves a number on the right.
+//
 // Two groups because the queries filter on different things: an unscoped plan for a
 // `status = 'new'` query walks only the tenant's `new` rows, and one for the public log walks
 // only its `fixed` ones. Each group on its own is therefore the floor an unscoped plan cannot
@@ -48,7 +58,8 @@ export const TENANT_NEW = 300;
 export const TENANT_FIXED = 300;
 export const TENANT_ROWS = TENANT_NEW + TENANT_FIXED;
 /** The fewest tenant rows ANY unscoped plan among the six must read. Under a scoped plan the
- *  worst of the five cases reads 55, so the gap is wide in both directions. */
+ *  worst of the cases reads a page, so the gap is wide in both directions. It was 55 until 0005
+ *  took the two kind-filtered pages down to `limit`; see the amendment above. */
 export const UNSCOPED_FLOOR = Math.min(TENANT_NEW, TENANT_FIXED);
 /** An hour ahead, so every tenant row is newer than every fleet row a suite seeds however long
  *  the seeding takes. The test 'the fixture is positioned' asserts that it worked, because a

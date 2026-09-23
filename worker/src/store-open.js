@@ -379,8 +379,11 @@ export async function board(db, { limit = BOARD_LIMIT_MAX } = {}) {
         // SQLite reorders WHERE terms itself, so what moves a plan is the PRESENCE of an
         // app_id term and never where it is written (A28, correcting A18). Both plans are
         // pinned by index name in tests/local-d1-plans.test.mjs. Do not move this term to
-        // make a plan happen; it cannot. There is no tenant twin of either index and
-        // DESIGN.md 4.2 says why there should not be.
+        // make a plan happen; it cannot. The open list now HAS a tenant twin,
+        // reports_app_board in migrations/0005_indexes.sql, added because 0005's other
+        // indexes moved this statement onto a plan that tested `public` per row. The
+        // resolved list still has none and keeps its unscoped seek on reports_public_log,
+        // which is one of the open findings against this schema rather than a settled no.
         `SELECT public_note, status, opened_at, fixed_at, source_closed_at, work_state
            FROM reports
           WHERE kind = ? AND public = 1 AND status = ? AND app_id = 'fleet'

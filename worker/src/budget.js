@@ -27,10 +27,17 @@ export function rowsReadBudget(limit) {
  * tests/api.test.mjs holds that: it captures console.warn and requires undefined from both arms
  * and from a rows_read that is not a number.
  *
- * The over-budget arm is reachable through GET /reports?kind=open, the shipped desk's default
- * view. Under budget on the other /reports shapes and on GET /log, asserted in
- * tests/local-d1-rows.test.mjs. GET /work and the two board routes are not callers: their reads
- * are not bounded by a `limit`, so a page-size budget has nothing to say about them.
+ * The over-budget arm was reachable through GET /reports?kind=open, the shipped desk's default
+ * view, until migrations/0005_indexes.sql gave that shape an index it can seek. What stays
+ * reachable is any read whose index is missing or not chosen, which is the thing this arm is
+ * for. Under budget on the other /reports shapes and on GET /log, asserted in
+ * tests/local-d1-rows.test.mjs.
+ *
+ * The two board routes are not callers: their reads are bounded by the board's own population
+ * and not by a page size. GET /work is not one either, for a reason this comment used to state
+ * wrongly: listWork DOES page on a caller-supplied `limit`, so a page-size budget could speak
+ * to it, and what stops it is the LEFT JOIN onto work_runs, whose own reads land in the same
+ * rows_read this budget would be reading.
  */
 export function warnRowsRead(what, rowsRead, limit) {
   const budget = rowsReadBudget(limit);
