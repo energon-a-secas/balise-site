@@ -172,7 +172,9 @@ finish() {
 # builds on, from a clean committed tree to production. Every irreversible step waits for a
 # yes, and the secret steps need a person at the keyboard. Nothing here echoes a token.
 
-ROOT="/Users/lucianoadonisvillarroel/dev/Personal"
+# The monorepo root, from this script's own location (<root>/projects/balise-site/scripts),
+# so no operator's home path is written into a public repository. BALISE_ROOT overrides it.
+ROOT="${BALISE_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 SITE="$ROOT/projects/balise-site"
 API="https://balise-api.neorgon.workers.dev"
 BRANCH="main"                   # the branch GitHub Pages serves
@@ -847,11 +849,11 @@ say "The simplest way: tell Claude \"create the Balise work runner schedule\"."
 printf '\n'
 say "Or add it yourself, hourly on weekdays, with this prompt:"
 printf '\n'
-cat <<'PROMPT'
+cat <<PROMPT
     Run the Balise work runner once, against production.
-    Working directory: /Users/lucianoadonisvillarroel/dev/Personal
-    Environment for every command: BALISE_API=https://balise-api.neorgon.workers.dev BALISE_RUNNER=mac
-    Read /Users/lucianoadonisvillarroel/dev/Personal/.claude/commands/work.md and follow it
+    Working directory: $ROOT
+    Environment for every command: BALISE_API=$API BALISE_RUNNER=mac
+    Read $ROOT/.claude/commands/work.md and follow it
     exactly with no arguments: land accepted work, claim at most one approved item, work it
     by its mode, submit the result, and end with its one-line report. Never publish,
     approve or review anything.

@@ -212,6 +212,17 @@ export function initBoard() {
   Object.entries(ids).forEach(([key, id]) => { el[key] = document.getElementById(id); });
 
   if (!el.boardTabs) return;
+
+  // index.html hides the tablist until production serves GET /board. While it is hidden
+  // the log is the whole page: nothing below is wired, and `#open` cannot open a panel
+  // whose fetch would answer a reader with an API error. Deleting the attribute in the
+  // markup restores every path here, with no change to this file.
+  if (el.boardTabs.hidden) {
+    el.panelBoard.hidden = true;
+    el.panelLog.hidden = false;
+    return;
+  }
+
   tabs.push(...el.boardTabs.querySelectorAll('[data-tab]'));
 
   el.boardTabs.addEventListener('click', (event) => {

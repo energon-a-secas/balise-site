@@ -99,8 +99,14 @@
 
     <!-- Two lists, two questions. The log is what a reader reported and what got
          fixed because of it; the board is what the fleet is working on and what
-         it has closed. #open selects the board, so the board is linkable. -->
-    <div class="board-tabs" id="boardTabs" role="tablist" aria-label="What to show">
+         it has closed. #open selects the board, so the board is linkable.
+
+         HIDDEN until production serves GET /board, which arrives with the 1.1.0 Worker.
+         The deployed 1.0.0 build answers NOT_A_ROUTE, so a reader who clicked this tab
+         got the Worker's own error text on a public page. js/board.js reads this
+         attribute and wires nothing while it is set, so deleting the attribute is the
+         whole of turning the board back on. -->
+    <div class="board-tabs" id="boardTabs" role="tablist" aria-label="What to show" hidden>
       <button type="button" class="board-tab is-active" id="tabLog" data-tab="log"
               role="tab" aria-selected="true" aria-controls="panelLog">Corrections</button>
       <button type="button" class="board-tab" id="tabBoard" data-tab="open" tabindex="-1"

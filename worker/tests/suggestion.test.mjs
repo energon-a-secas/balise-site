@@ -6,8 +6,11 @@
 // A remnant is worse than an empty box for the reason src/suggestion.js states: it invites
 // an edit where the operator needs to write the line themselves.
 //
-// So the corpus below is real. Every input is a line the 2026-09-15 import actually read,
-// and the expectations are what a person would want prefilled in the desk field. The last
+// The corpus below is shaped from what that import read, with the fleet's own lines
+// replaced by invented ones. This repository is public, and a real corpus would publish the
+// map of soft spots that the private queue, the redaction floor and the operator-writes-the
+// -sentence rule all exist to keep off a page. Every assertion here is about shape, so an
+// invented line in the same shape tests exactly what a real one did. The last
 // test is the one that matters most: whatever comes out, its words are a leading run of the
 // words that went in, so no output can ever be a sentence the machine assembled.
 
@@ -17,16 +20,16 @@ import assert from 'node:assert/strict';
 import { cleanSuggestion } from '../src/suggestion.js';
 import { redactionFindings } from '../src/redact.js';
 
-/** Real tracker lines from the 2026-09-15 import, longest first in each pair. */
+/** Tracker lines in the shapes the import reads, invented, longest first in each pair. */
 const CORPUS = [
-  'Balise importer suggestions are mostly unreadable after redaction: tools/import-open-items.mjs strips each tracker sentence with the floor, and on the 2026-09-15 import 89 of 92 drafts read like `(closeMenu in)`.',
-  'Header kit a11y, three measured findings from the Sash and Enamel verification (2026-09-10): Escape closes the mobile overflow menu but drops focus to body instead of returning it to the More actions button (closeMenu in js/neorgon-header.js:412).',
-  'See packages/neorgon-ui/beacon for the widget.',
-  'The checker at enforce.py:612 is being reworked.',
-  'scripts/prompt.sh done and reopen move only an item first line, so an item written across several lines leaves its body behind.',
-  'the template ships og:image uncommented (lines 26-30) while the rule says they stay commented.',
-  'fitprofile-site share links: every public share link and QR code opens the 404 page.',
-  'Finish publishing Sash and Enamel from the DNS stage.',
+  'Draft suggestions come out unreadable after the floor runs: tools/sample-import.mjs strips each tracker sentence, and on the last import 80 of 90 drafts read like `(openMenu in)`.',
+  'Widget a11y, two measured findings from the sample verification (2026-01-07): Escape closes the menu but drops focus to body instead of returning it to the button that opened it (openMenu in js/sample-widget.js:118).',
+  'See packages/sample-kit/widget for the control.',
+  'The checker at sample_rules.py:120 is being reworked.',
+  'scripts/sample.sh done and reopen move only an item first line, so an item written across several lines leaves its body behind.',
+  'the sample page ships its preview tag uncommented (lines 12-18) while the rule says it stays commented.',
+  'sample-site share links: every public share link and QR code opens the 404 page.',
+  'Finish publishing the sample section from the DNS stage.',
 ];
 
 /** Words, punctuation discarded. Two texts with the same word list say the same thing. */
@@ -37,13 +40,13 @@ test('#81: a suggestion stops at the clause that would have needed a cut', () =>
   // follows it, so the path's whole clause goes and the direction stays.
   assert.equal(
     cleanSuggestion(CORPUS[0]),
-    'Balise importer suggestions are mostly unreadable after redaction.',
+    'Draft suggestions come out unreadable after the floor runs.',
   );
   // The line that produced "(closeMenu in)". Two clauses survive, and the bare date in the
   // middle of them is not a finding, so the reader keeps the date the finding was measured.
   assert.equal(
     cleanSuggestion(CORPUS[1]),
-    'Header kit a11y, three measured findings from the Sash and Enamel verification (2026-09-10).',
+    'Widget a11y, two measured findings from the sample verification (2026-01-07).',
   );
 });
 
@@ -56,25 +59,25 @@ test('#81: a sentence whose only clause carries a finding suggests nothing at al
 });
 
 test('#81: a clean sentence is prefilled whole, whatever its punctuation', () => {
-  assert.equal(cleanSuggestion(CORPUS[6]), 'fitprofile-site share links: every public share link and QR code opens the 404 page.');
-  assert.equal(cleanSuggestion(CORPUS[7]), 'Finish publishing Sash and Enamel from the DNS stage.');
-  assert.equal(cleanSuggestion('Carnet has an address and is not served there yet.'), 'Carnet has an address and is not served there yet.');
+  assert.equal(cleanSuggestion(CORPUS[6]), 'sample-site share links: every public share link and QR code opens the 404 page.');
+  assert.equal(cleanSuggestion(CORPUS[7]), 'Finish publishing the sample section from the DNS stage.');
+  assert.equal(cleanSuggestion('The sample section has an address and is not served there yet.'), 'The sample section has an address and is not served there yet.');
 });
 
 test('#81: a surviving prefix too short to be a direction is dropped', () => {
-  // "vitrina-site CSP" names a subject and says nothing about it. A label is not a
+  // "sample-site CSP" names a subject and says nothing about it. A label is not a
   // direction, and prefilling one reads as though the machine had an opinion.
-  assert.equal(cleanSuggestion('vitrina-site CSP: no page sets one at packages/neorgon-ui/header/header.js.'), '');
-  assert.equal(cleanSuggestion('floorplan-site: js/plan.js draws the room twice.'), '');
+  assert.equal(cleanSuggestion('sample-site CSP: no page sets one at packages/sample-kit/header.js.'), '');
+  assert.equal(cleanSuggestion('other-site: js/plan.js draws the room twice.'), '');
   // Three words is enough when they are the item.
-  assert.equal(cleanSuggestion('Auth Kit follow-ups, none blocking (docs/architecture/auth-flow.md).'), 'Auth Kit follow-ups.');
+  assert.equal(cleanSuggestion('Sample kit follow-ups, none blocking (docs/architecture/sample.md).'), 'Sample kit follow-ups.');
 });
 
 test('#81: markdown, an em dash and stray whitespace are normalised, not carried', () => {
   // The trackers are Markdown and the board is not, so a backtick would arrive in the desk
   // field as a character to delete by hand. The dash is written as an escape because the
   // fleet's own writing rule covers a sentence a machine drafted for a person.
-  assert.equal(cleanSuggestion('**Publish** the `sash-site` DNS stage.'), 'Publish the sash-site DNS stage.');
+  assert.equal(cleanSuggestion('**Publish** the `sample-site` DNS stage.'), 'Publish the sample-site DNS stage.');
   assert.equal(cleanSuggestion('Ship the board\u2014then the queue.'), 'Ship the board, then the queue.');
   assert.equal(cleanSuggestion('  A clean\n\nsentence.  '), 'A clean sentence.');
 });
@@ -101,8 +104,8 @@ test('#81: whatever comes out is a leading run of the words that went in, and cl
     if (!out) continue;
     const before = words(source);
     const after = words(out);
-    // The invariant the old rule broke. "See packages/neorgon-ui/beacon for the widget."
-    // came out as "See for the widget.", whose second word is not the source's second word.
+    // The invariant the old rule broke. "See packages/sample-kit/widget for the control."
+    // came out as "See for the control.", whose second word is not the source's second word.
     assert.deepEqual(before.slice(0, after.length), after, source);
     assert.deepEqual(redactionFindings(out), [], out);
   }
