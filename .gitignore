@@ -36,3 +36,8 @@ __pycache__/
 
 # ── Archived skills (scripts/prune-skills.sh) ─────────────────────────────────
 skills-archived/
+
+# ── Cloudflare Worker ────────────────────────────────────────────────────────
+# wrangler's local state and the Worker's dev secrets.
+.wrangler/
+.dev.vars*
