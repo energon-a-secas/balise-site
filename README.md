@@ -34,8 +34,8 @@ Fleet-wide correction reporting: a beacon on every page, one private queue, one 
 ## Overview
 
 A reader spots something wrong on a Neorgon site. Today their only recourse is a
-pull request, and effectively nobody opens one. Balise gives them a beacon in
-the corner of the page instead: one click, one sentence, no account.
+pull request, and effectively nobody opens one. Balise gives them a ladybug at
+the bottom of the page instead: one click, one sentence, no account.
 
 Reports land in a private queue, because they arrive as raw text from strangers.
 An operator triages them. Only what the operator decides to publish reaches the

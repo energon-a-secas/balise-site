@@ -13,7 +13,7 @@ launch.
 
 **The scene:** Someone is reading Parla on a phone, sees their own country's
 slang described wrongly, and feels the small specific irritation of knowing
-better. The beacon is already dimmed in the corner. One thumb, one sentence, and
+better. The ladybug sits quietly in the footer. One thumb, one sentence, and
 they are back to reading. The other half happens later at a desk: the operator
 opens the desk over coffee, reads six reports, spikes two, and writes the note
 that will appear on the log.
