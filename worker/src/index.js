@@ -48,7 +48,7 @@ import { ingest, resolvedLog, health } from './routes-public.js';
 import { deskList, deskPatch, importRoute, work } from './routes-desk.js';
 import { openBoard, openBoardSummary } from './routes-open.js';
 import { parseWorkPath } from './routes-work.js';
-import { ingestAppId, parseAppsPath, appPreflight, appIngest, appRegister, appRead } from './routes-apps.js';
+import { ingestAppId, parseAppsPath, appPreflight, appIngest, appRegister, appPerson } from './routes-apps.js';
 
 export { ERROR_CODES };
 
@@ -153,7 +153,7 @@ const router = {
       const target = parseAppsPath(path, method);
       if (target.hint) return notARoute(origin, env, target.hint);
       if (target.route === 'register') return await appRegister(request, env, { origin, ip, now });
-      return await appRead(request, env, { origin, ip, now, target });
+      return await appPerson(request, env, { origin, ip, now, target });
     }
     if (path === '/health') {
       if (method !== 'GET') return notARoute(origin, env, 'Health is read with GET /health.');

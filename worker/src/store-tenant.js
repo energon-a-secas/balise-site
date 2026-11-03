@@ -11,7 +11,16 @@
 
 import { storeError } from './store.js';
 import { FLEET, tenantKey } from './scope.js';
+import { PERSON_TRANSITIONS, canTransition } from './transitions.js';
 import { TENANT_STATUSES } from './validate-apps.js';
+
+/** Another tenant's id and no id answer with this one object (C6.4). */
+export const NO_ITEM = {
+  code: 'NOT_FOUND',
+  message: 'Nothing at this address belongs to an app you own.',
+  hint: 'Open your apps at balise.neorgon.com/apps and pick the item from there.',
+};
+const DECIDED = ['fixed', 'rejected', 'duplicate'];
 
 const TENANT_COLUMNS = `id, created_at, site, url, target_kind, target_id, target_label,
                         kind, body, status, decided_at, app_key_id`;
@@ -57,6 +66,38 @@ export async function listItems(db, scope, { status, before, limit }) {
   } catch (err) {
     return storeError('tenant list', err);
   }
+}
+
+/** C6.4: one owner's status move, read then guarded write as in applyTransition(). Both statements
+ *  bind the tenant and the write repeats the status read; `fixed_at`, the log's, is never written. */
+export async function moveItem(db, scope, { id, to, now }) {
+  let current;
+  try {
+    current = await db.prepare('SELECT id, status, kind FROM reports WHERE id = ? AND app_id = ?').bind(id, appIdOf(scope)).first();
+  } catch (err) {
+    return storeError('tenant move read', err);
+  }
+  if (!current) return NO_ITEM;
+  if (!canTransition(current.status, to, 'person', current.kind)) {
+    const legal = PERSON_TRANSITIONS[current.status];
+    return {
+      code: 'BAD_TRANSITION',
+      message: `An item at "${current.status}" cannot move to "${to}".`,
+      hint: legal ? `From "${current.status}" it can move to ${legal.join(', ')}.` : `An item at "${current.status}" stays there.`,
+    };
+  }
+  try {
+    const res = await db
+      .prepare('UPDATE reports SET status = ?, decided_at = ? WHERE id = ? AND app_id = ? AND status = ?')
+      .bind(to, DECIDED.includes(to) ? now : null, id, appIdOf(scope), current.status)
+      .run();
+    if (!res.meta || res.meta.changes === 0) {
+      return { code: 'BAD_TRANSITION', message: 'That item moved while this change was in flight.', hint: 'Reload the list and look at where it is now.' };
+    }
+  } catch (err) {
+    return storeError('tenant move write', err);
+  }
+  return getItem(db, scope, id);
 }
 
 /** One item, by primary key and tenant. Another tenant's id answers exactly as no id does. */

@@ -14,13 +14,13 @@ import { FLEET, FLEET_SCOPE, scopeFor } from '../src/scope.js';
 import { mintAppKey, appKeyKind, sha256Hex } from '../src/keys.js';
 import { PERSON_TRANSITIONS, STATUSES, canTransition } from '../src/transitions.js';
 import {
-  validateRegistration, validateOrigin, validateTenantItem, validateItemQuery, isAppId, TENANT_STATUSES,
+  validateRegistration, validateOrigin, validateTenantItem, validateItemQuery, validateItemMove, isAppId, TENANT_STATUSES,
 } from '../src/validate-apps.js';
 import {
   APP_CAP, registerApp, getApp, listApps, listKeys, resolveKey, mintKey, revokeKey, disableApp,
   countAppItem, tenantTally, newAppId,
 } from '../src/store-apps.js';
-import { listItems, getItem } from '../src/store-tenant.js';
+import { listItems, getItem, moveItem, NO_ITEM } from '../src/store-tenant.js';
 import { identify, KEY_REFUSED } from '../src/identity.js';
 
 const register = (db, owner = 'owner-a', over = {}) =>
@@ -269,6 +269,64 @@ test('C6.4 and C6.5: no tenant statement names a public, published or work colum
   const byStatus = 'SELECT id FROM reports WHERE app_id = ? AND status = ? AND created_at < ? ORDER BY created_at DESC LIMIT ?';
   assert.equal(plan(list), 'SEARCH reports USING INDEX reports_app_created (app_id=? AND created_at<?)');
   assert.equal(plan(byStatus), 'SEARCH reports USING INDEX reports_app_status_created (app_id=? AND status=? AND created_at<?)');
+});
+
+test('C6.4: every legal person move lands and every illegal one is BAD_TRANSITION, from every status', async () => {
+  const app = 'apaaaaaaaaaaaaaa';
+  const scope = scopeFor({ kind: 'person', person_id: 'owner-a' }, { id: app, owner: 'owner-a' });
+  for (const from of STATUSES) {
+    for (const to of STATUSES) {
+      const db = sqliteD1();
+      plantReport(db, app, { id: 'item', over: { status: from, kind: 'wrong', fixed_at: null, decided_at: null } });
+      const out = await moveItem(db, scope, { id: 'item', to, now: T + 9 });
+      const row = db.sqlite.prepare('SELECT status, decided_at, fixed_at, public FROM reports WHERE id = ?').get('item');
+      if ((PERSON_TRANSITIONS[from] || []).includes(to)) {
+        assert.equal(out.item && out.item.status, to, `${from} -> ${to} was refused: ${json(out)}`);
+        assert.equal(row.decided_at, ['fixed', 'rejected', 'duplicate'].includes(to) ? T + 9 : null, `${from} -> ${to} decided_at`);
+      } else {
+        assert.equal(out.code, 'BAD_TRANSITION', `${from} -> ${to} was allowed`);
+        assert.equal(row.status, from, `a refused ${from} -> ${to} wrote the row`);
+      }
+      assert.equal(row.fixed_at, null, 'a person move wrote fixed_at, which the public log reads');
+    }
+  }
+});
+
+test('C6.4: a move on another tenant\'s item is NO_ITEM, an open row is refused, and a move that raced another loses', async () => {
+  const db = sqliteD1();
+  const a = 'apaaaaaaaaaaaaaa';
+  plantReport(db, a, { id: 'item-a', over: { kind: 'wrong', status: 'new', fingerprint: 'fp-a' } });
+  plantReport(db, a, { id: 'open-a', over: { kind: 'open', status: 'new', fingerprint: 'fp-o' } });
+  plantReport(db, FLEET, { id: 'item-f', over: { kind: 'wrong', status: 'new', fingerprint: 'fp-f' } });
+  const scopeA = scopeFor({ kind: 'app', app_id: a });
+  const scopeB = scopeFor({ kind: 'app', app_id: 'apbbbbbbbbbbbbbb' });
+  assert.deepEqual(await moveItem(db, scopeB, { id: 'item-a', to: 'fixed', now: T }), NO_ITEM);
+  assert.deepEqual(await moveItem(db, scopeB, { id: 'never', to: 'fixed', now: T }), NO_ITEM);
+  assert.equal((await moveItem(db, FLEET_SCOPE, { id: 'item-f', to: 'fixed', now: T })).code, 'STORE_ERROR', 'a tenant move reached the fleet');
+  assert.equal((await moveItem(db, scopeA, { id: 'open-a', to: 'fixed', now: T })).code, 'BAD_TRANSITION', 'a person moved an open row');
+
+  db.beforeStatement(/^UPDATE reports SET status = \?, decided_at/, async () => {
+    db.sqlite.prepare("UPDATE reports SET status = 'rejected' WHERE id = 'item-a'").run();
+  });
+  const raced = await moveItem(db, scopeA, { id: 'item-a', to: 'fixed', now: T });
+  assert.equal(raced.code, 'BAD_TRANSITION');
+  assert.match(raced.message, /in flight/);
+  assert.equal(db.sqlite.prepare('SELECT status FROM reports WHERE id = ?').get('item-a').status, 'rejected');
+
+  // The write's own tenant term, seen apart from the read's (the A30 technique): the row changes
+  // tenant between the two statements, and the write must then match nothing.
+  plantReport(db, a, { id: 'item-moving', over: { kind: 'wrong', status: 'new', fingerprint: 'fp-m' } });
+  db.beforeStatement(/^UPDATE reports SET status = \?, decided_at/, async () => {
+    db.sqlite.prepare("UPDATE reports SET app_id = 'apbbbbbbbbbbbbbb' WHERE id = 'item-moving'").run();
+  });
+  assert.equal((await moveItem(db, scopeA, { id: 'item-moving', to: 'fixed', now: T })).code, 'BAD_TRANSITION');
+  assert.equal(db.sqlite.prepare('SELECT status FROM reports WHERE id = ?').get('item-moving').status, 'new', "the write landed on another tenant's row");
+
+  assert.deepEqual(validateItemMove({ status: 'fixed' }).value, { status: 'fixed' });
+  assert.equal(validateItemMove({ status: 'spam' }).value.status, 'spam', 'the table, not the validator, refuses spam');
+  for (const body of [{ status: 'fixed', public: false }, { status: 'fixed', work_state: 'approved' }, { status: 'nope' }, {}, [], null]) {
+    assert.ok(validateItemMove(body).code, `${json(body)} passed`);
+  }
 });
 
 // ── identify(), the seam ──────────────────────────────────────────────────────

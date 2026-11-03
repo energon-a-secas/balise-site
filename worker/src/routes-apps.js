@@ -5,6 +5,7 @@
 //   POST    /apps/:app/items         one item           the app's bpk_ or bsk_ key (C6.2, C6.3)
 //   GET     /apps                    my apps            a signed-in person: NOT_CONFIGURED until phase 3
 //   GET     /apps/:app/items[/:id]   my app's items     a signed-in person: NOT_CONFIGURED until phase 3
+//   PATCH   /apps/:app/items/:id     one status move    the same person, along C6.4's table
 //
 // POST /apps/:app/items and its preflight are the ONE place in the Worker governed by an app's
 // origin list instead of BALISE_ALLOWED_ORIGINS, so src/index.js sends them here before its own
@@ -16,8 +17,8 @@ import { scopeFor } from './scope.js';
 import { insertReport } from './store.js';
 import { fingerprintInput, sha256Hex, ipHash, actorKey } from './keys.js';
 import { registerApp, getApp, listApps, touchKey, countAppItem, dayOf, DAILY_ITEM_CAP } from './store-apps.js';
-import { listItems, getItem } from './store-tenant.js';
-import { validateRegistration, validateTenantItem, validateItemQuery, isAppId } from './validate-apps.js';
+import { listItems, getItem, moveItem, NO_ITEM } from './store-tenant.js';
+import { validateRegistration, validateTenantItem, validateItemQuery, validateItemMove, isAppId } from './validate-apps.js';
 
 const P = 'apps';
 const ITEMS_PATH = /^\/apps\/([^/]+)\/items$/;
@@ -28,11 +29,6 @@ const ID_MAX = 64;
 const NO_SUCH_APP = {
   message: 'No app at this address takes items from here.',
   hint: 'Check the app id in the address, and that this page\'s web address is on the app\'s list.',
-};
-// Another person's app, another app's item, no such item: one answer (C6.4).
-const NOTHING_HERE = {
-  message: 'Nothing at this address belongs to an app you own.',
-  hint: 'Open your apps at balise.neorgon.com/apps and pick the item from there.',
 };
 
 /** The app id in POST|OPTIONS /apps/:app/items, or null for any other path. */
@@ -58,8 +54,11 @@ export function parseAppsPath(path, method) {
   const items = ITEMS_PATH.exec(path);
   if (items) return method === 'GET' ? { route: 'items', appId: safeDecode(items[1]) } : { hint: 'Items are sent with POST /apps/:app/items and read with GET.' };
   const item = ITEM_PATH.exec(path);
-  if (item) return method === 'GET' ? { route: 'item', appId: safeDecode(item[1]), id: safeDecode(item[2]) } : { hint: 'One item is read with GET /apps/:app/items/:id.' };
-  return { hint: 'The app routes are POST and GET /apps, and POST and GET /apps/:app/items.' };
+  if (item) {
+    const route = method === 'GET' ? 'item' : method === 'PATCH' ? 'move' : null;
+    return route ? { route, appId: safeDecode(item[1]), id: safeDecode(item[2]) } : { hint: 'One item is read with GET and moved with PATCH /apps/:app/items/:id.' };
+  }
+  return { hint: 'The app routes are POST and GET /apps, POST and GET /apps/:app/items, and GET and PATCH /apps/:app/items/:id.' };
 }
 
 /** CORS for an origin on an app's own list. POST only, and a ten-minute preflight cache. */
@@ -172,28 +171,49 @@ export async function appRegister(request, env, { origin, ip, now }) {
   return ok(P, { app: { ...made.app, endpoint }, keys: made.keys }, { origin, env });
 }
 
-// ── GET /apps, GET /apps/:app/items[/:id] ─────────────────────────────────────
+// ── GET /apps, GET and PATCH /apps/:app/items[/:id] ───────────────────────────
 
-export async function appRead(request, env, { origin, ip, now, target }) {
+export async function appPerson(request, env, { origin, ip, now, target }) {
   const who = await identify(request, env, env.DB, { now, ip, accept: ['person'] });
   if (who.error) return fail(who.error.code, { provider: P, origin, env, message: who.error.message, hint: who.error.hint });
-  return await readAs(env, who.principal, target, { url: new URL(request.url), origin });
+  if (target.route !== 'move') return await readAs(env, who.principal, target, { url: new URL(request.url), origin });
+  const parsed = await readJson(request, P, origin, env);
+  if (parsed.error) return parsed.error;
+  return await moveAs(env, who.principal, target, { body: parsed.value, origin, now });
 }
 
-/**
- * One read for a person identify() has already proved. The app comes from the path and the owner
- * check comes second (DESIGN.md 5.5), so another person's app and no app answer alike.
- */
+/** The app from the path, then the owner (DESIGN.md 5.5): the scope, or null for "nothing here". */
+async function ownedScope(env, principal, target) {
+  const found = isAppId(target.appId) ? await getApp(env.DB, target.appId) : { app: null };
+  if (found.code) return found;
+  return { scope: found.app ? scopeFor(principal, found.app) : null };
+}
+
+/** One status move for a person identify() has already proved. */
+export async function moveAs(env, principal, target, { body, origin, now }) {
+  const reply = (r) => (r.code
+    ? fail(r.code, { provider: P, origin, env, message: r.message, hint: r.hint })
+    : ok(P, { item: r.item }, { origin, env }));
+  const owned = await ownedScope(env, principal, target);
+  if (owned.code) return reply(owned);
+  if (!owned.scope || !target.id || target.id.length > ID_MAX) return reply(NO_ITEM);
+  const checked = validateItemMove(body);
+  if (checked.code) return reply(checked);
+  return reply(await moveItem(env.DB, owned.scope, { id: target.id, to: checked.value.status, now }));
+}
+
+/** One read for a person identify() has already proved. Another person's app and no app answer
+ *  alike, and so do another app's item and no item. */
 export async function readAs(env, principal, target, { url, origin }) {
   const reply = (r) => (r.code
     ? fail(r.code, { provider: P, origin, env, message: r.message, hint: r.hint })
     : ok(P, r, { origin, env }));
   if (target.route === 'apps') return reply(await listApps(env.DB, principal.person_id));
 
-  const nothing = () => fail('NOT_FOUND', { provider: P, origin, env, ...NOTHING_HERE });
-  const found = isAppId(target.appId) ? await getApp(env.DB, target.appId) : { app: null };
-  if (found.code) return reply(found);
-  const scope = found.app ? scopeFor(principal, found.app) : null;
+  const nothing = () => reply(NO_ITEM);
+  const owned = await ownedScope(env, principal, target);
+  if (owned.code) return reply(owned);
+  const { scope } = owned;
   if (!scope) return nothing();
 
   if (target.route === 'item') {

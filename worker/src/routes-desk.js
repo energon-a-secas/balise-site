@@ -72,17 +72,9 @@ export async function deskPatch(request, env, { origin, ip, now, id }) {
 // ── POST /open-items and /open-items/sync ─────────────────────────────────────
 
 /**
- * C3 first, then the body, then src/routes-open.js. Both import routes take EITHER
- * credential: the importer is a script the operator runs, and it holds the automation token
- * because neither route can move a report toward a reader. That is not the same as
- * harmless: the token also reads every report, contact included, and through these routes
- * it can plant a draft trusted like the fleet's own, which the operator can hand to an agent
- * in ship mode with no instruction, and mark items closed at their source or clear that mark.
- * The separate import credential that would narrow this is not built. src/routes-open.js
- * lists the reach, and docs/architecture/balise.md lists what the token cannot do.
- *
- * The lockout counts these the same way it counts the desk, so a script pointed at the
- * wrong deployment with the wrong token does not get unlimited tries.
+ * C3 first, then the body. Either credential: the importer holds the automation token, which is
+ * not harmless (it reads every report and can plant a draft trusted like the fleet's own); the
+ * narrower import credential is not built, and docs/architecture/balise.md lists the reach.
  */
 export async function importRoute(request, env, { origin, ip, now, isSync }) {
   const P = 'desk';
@@ -100,11 +92,8 @@ export async function importRoute(request, env, { origin, ip, now, isSync }) {
 // ── /work ─────────────────────────────────────────────────────────────────────
 
 /**
- * C3 first, then the body, then src/routes-work.js, in the same order as the import routes
- * and under the same lockout. Every work route takes either credential at this layer: WHICH
- * actions a credential may take is decided against src/work.js inside src/store-work.js, so
- * the role rule has exactly one home. The body is read under WORK_REQUEST_MAX_BYTES, and
- * only after authentication, so nobody without a token gets 64 KB read on their behalf.
+ * C3 first, then the body, read under WORK_REQUEST_MAX_BYTES only after authentication. WHICH
+ * actions a credential may take is decided against src/work.js inside src/store-work.js.
  */
 export async function work(request, env, { origin, ip, now, target }) {
   const P = 'desk';

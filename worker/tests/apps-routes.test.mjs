@@ -14,7 +14,7 @@ import { insertReport } from '../src/store.js';
 import { fingerprintInput, sha256Hex } from '../src/keys.js';
 import { registerApp, disableApp, revokeKey, listApps, DAILY_ITEM_CAP } from '../src/store-apps.js';
 import { listItems } from '../src/store-tenant.js';
-import { readAs } from '../src/routes-apps.js';
+import { readAs, moveAs } from '../src/routes-apps.js';
 
 const NOW = Date.UTC(2026, 10, 3, 12);
 const BALISE = 'https://balise.neorgon.com';
@@ -271,7 +271,8 @@ test('a bpk_ key cannot read, list, patch or register, and nothing it reaches an
     }
   }
   assert.equal((await call(env, `/apps/${a.app.id}/items`, { key: a.keys.public.key })).body.code, 'NOT_CONFIGURED');
-  assert.equal((await call(env, `/apps/${a.app.id}/items/x`, { method: 'PATCH' })).body.code, 'NOT_A_ROUTE');
+  assert.equal((await call(env, `/apps/${a.app.id}/items/x`, { method: 'PATCH', body: { status: 'fixed' } })).body.code, 'NOT_CONFIGURED');
+  assert.equal((await call(env, `/apps/${a.app.id}/items/x`, { method: 'DELETE' })).body.code, 'NOT_A_ROUTE');
 });
 
 test('7.1 at the route: a person reads their own app, and another person\'s app or another app\'s item answers exactly as nothing', async () => {
@@ -310,4 +311,47 @@ test('7.1 at the route: a person reads their own app, and another person\'s app 
   const apps = JSON.parse((await read(ownerA, { route: 'apps' })).text).apps;
   assert.deepEqual(apps.map((x) => x.id), [a.app.id]);
   assert.equal(JSON.parse((await read(ownerA, { route: 'items', appId: a.app.id }, '?status=accepted')).text).code, 'BAD_FIELD');
+});
+
+test("C6.4 at the route: an owner moves their own item, and another person's item or app answers exactly as nothing", async () => {
+  const { db, env, a, b } = await world();
+  await post(env, a, a.keys.secret.key, null, item(1));
+  const [itemA] = rows(db, a.app.id);
+  const ownerA = { kind: 'person', person_id: 'owner-a' };
+  const ownerB = { kind: 'person', person_id: 'owner-b' };
+  const move = async (principal, appId, id, body) => {
+    const res = await moveAs(env, principal, { route: 'move', appId, id }, { body, origin: null, now: NOW + 5 });
+    return { status: res.status, text: await res.text() };
+  };
+  const columns = () => db.sqlite.prepare('SELECT public, public_note, fixed_ref, fixed_at, work_state, work_mode, work_run FROM reports WHERE id = ?').get(itemA.id);
+  const before = { ...columns() };
+
+  const nothing = await move(ownerB, b.app.id, 'never-existed', { status: 'fixed' });
+  assert.equal(nothing.status, 404);
+  for (const [name, appId, id, body] of [
+    ["another person's item on their path", a.app.id, itemA.id, { status: 'fixed' }],
+    ["another app's item on my path", b.app.id, itemA.id, { status: 'fixed' }],
+    ["another person's item, with a body that would be refused", a.app.id, itemA.id, { status: 'fixed', public: true }],
+    ['no such app', 'apzzzzzzzzzzzzzz', itemA.id, { status: 'fixed' }],
+  ]) {
+    assert.deepEqual(await move(ownerB, appId, id, body), nothing, `${name} answered differently from nothing`);
+  }
+  assert.equal(rows(db, a.app.id)[0].id, itemA.id);
+  assert.equal(db.sqlite.prepare('SELECT status FROM reports WHERE id = ?').get(itemA.id).status, 'new', 'a cross-tenant PATCH moved the item');
+
+  for (const field of ['public', 'public_note', 'fixed_ref', 'work_state', 'duplicate_of']) {
+    const refused = JSON.parse((await move(ownerA, a.app.id, itemA.id, { status: 'fixed', [field]: 'x' })).text);
+    assert.equal(refused.code, 'BAD_FIELD', `${field} was not refused`);
+  }
+  for (const to of ['accepted', 'spam']) {
+    assert.equal(JSON.parse((await move(ownerA, a.app.id, itemA.id, { status: to })).text).code, 'BAD_TRANSITION', `a person moved to ${to}`);
+  }
+  const moved = JSON.parse((await move(ownerA, a.app.id, itemA.id, { status: 'fixed' })).text);
+  assert.equal(moved.item.status, 'fixed');
+  assert.equal(moved.item.decided_at, NOW + 5);
+  assert.deepEqual({ ...columns() }, before, 'a tenant move wrote a public, published or work column');
+  assert.equal(JSON.parse((await move(ownerA, a.app.id, itemA.id, { status: 'new' })).text).item.decided_at, null);
+  for (const path of ['/log?limit=50', '/board?limit=50', '/board/summary']) {
+    assert.ok(!(await call(env, path)).text.includes(itemA.id), `${path} published a tenant item after a move`);
+  }
 });

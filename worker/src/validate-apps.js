@@ -5,7 +5,7 @@ import {
   KINDS, SITE_RE, TARGET_KIND_RE, URL_MAX, BODY_MIN, BODY_MAX, TARGET_ID_MAX, TARGET_LABEL_MAX,
   validateListQuery,
 } from './validate.js';
-import { PERSON_TRANSITIONS } from './transitions.js';
+import { PERSON_TRANSITIONS, STATUSES } from './transitions.js';
 
 export const APP_NAME_MAX = 60;
 export const OWNER_MAX = 200;
@@ -133,6 +133,18 @@ export function validateTenantItem(body, appId) {
   const aimed = target(body.target);
   if (aimed.code) return aimed;
   return { value: { site, url: isStr(body.url) ? body.url.trim().slice(0, URL_MAX) : '', target: aimed.value, kind, body: text } };
+}
+
+/** PATCH /apps/:app/items/:id: { status } and nothing else, any other field refused by name
+ *  (C6.4). Whether the move is legal is the store's question, answered with BAD_TRANSITION. */
+export function validateItemMove(body) {
+  if (!isObject(body)) return bad('The change was not a JSON object.', 'Send { "status": "fixed" }.');
+  const extra = Object.keys(body).filter((key) => key !== 'status');
+  if (extra.length) return bad(`An app's owner can change the status and nothing else, so ${extra.join(', ')} was refused.`, 'Send only { "status": ... }.');
+  const status = isStr(body.status) ? body.status.trim() : '';
+  if (!status) return missing('No new status was sent.', `Send one of ${TENANT_STATUSES.join(', ')}.`);
+  if (!STATUSES.includes(status)) return bad(`"${status}" is not a status.`, `Send one of ${TENANT_STATUSES.join(', ')}.`);
+  return { value: { status } };
 }
 
 /** GET /apps/:app/items: the desk's keyset parameters, over the statuses a tenant item has. */
