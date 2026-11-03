@@ -1,17 +1,8 @@
-// C3: operator and automation authentication. Lifted out of src/index.js when the work
-// queue's routes arrived and that file reached the fleet's 500 line cap; nothing about how
-// a token is checked changed in the move.
+// C3: operator and automation authentication, and the one place a credential header is read.
 //
-// Every authenticated route calls authenticate() and nothing else. /report, /log, /board
-// and /board/summary NEVER import this file: a public route that also honours a credential
-// is one refactor away from leaking the queue.
-//
-// THAT SENTENCE IS TRUE OF THE FILES AND NOT ONLY OF THE FUNCTIONS, which is what makes it
-// checkable. src/routes-public.js and src/routes-open.js hold the credential-free route bodies
-// and neither imports this file; src/routes-desk.js is the only file in the Worker that does.
-// Asserted per file, by credential role, in tests/tenant-scope.test.mjs. `actorKey` lives in
-// src/keys.js so that it can be shared: it is the key the ingest rate limit and the C3 lockout
-// both need, and a credential-free route needing it would otherwise import this module.
+// /report, /log, /board and /board/summary NEVER import this file: a public route that also
+// honours a credential is one refactor away from leaking the queue. src/identity.js is the only
+// importer, asserted per file by credential role in tests/tenant-scope.test.mjs.
 
 import { checkLock, recordAuthResult } from './store-auth.js';
 
@@ -48,6 +39,13 @@ async function matches(presentedHash, candidate) {
     : !crypto.subtle.timingSafeEqual(presentedHash, presentedHash);
 }
 
+/** The bearer credential a request presents, or null. src/identity.js reads an app key through
+ *  this, so the header is still read in this file and nowhere else. */
+export function bearerOf(request) {
+  const match = /^Bearer\s+(.+)$/.exec((request.headers.get('Authorization') || '').trim());
+  return match ? match[1] : null;
+}
+
 /** Returns { actor } on success, or { error } ready for the envelope. Every failure returns
  *  the same sentence, whichever of the three things went wrong. */
 export async function authenticate(request, env, db, key, now) {
@@ -61,17 +59,16 @@ export async function authenticate(request, env, db, key, now) {
     };
   }
 
-  const header = request.headers.get('Authorization') || '';
-  const match = /^Bearer\s+(.+)$/.exec(header.trim());
+  const bearer = bearerOf(request);
   // An absent or malformed header is not counted against the lockout. It costs no D1
   // write, it tells a prober nothing the generic sentence does not, and counting it would
   // let one bug in the desk lock the operator out of their own queue.
-  if (!match) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
+  if (!bearer) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
 
   const lock = await checkLock(db, key, now);
   if (lock.locked) return { error: { code: 'UNAUTHORIZED', ...AUTH_GENERIC } };
 
-  const presented = await sha256Bytes(match[1]);
+  const presented = await sha256Bytes(bearer);
 
   /* The actor is decided by WHICH credential matched, never by a header. It used to
      be `X-Balise-Actor: ai`, self declared, which meant anything holding the operator

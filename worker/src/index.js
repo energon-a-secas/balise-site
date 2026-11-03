@@ -1,11 +1,8 @@
 // Balise: the fleet's correction-reporting Worker, the fleet's open-items board, and the
 // work queue that lets an agent pick those items up.
 //
-// THIS FILE IS THE ROUTER AND NOTHING ELSE. It decides which handler a path and method reach,
-// applies the two gates every route shares (origin, then a bound database), holds the version
-// constant and the never-500 wrapper, and hands everything else away. No route body lives here.
-// It was 522 lines with every handler inline, over the fleet's 500 line convention in
-// CLAUDE.md, and the split that fixed that is recorded at the foot of this header.
+// THIS FILE IS THE ROUTER AND NOTHING ELSE: which handler a path and method reach, the two
+// shared gates (origin, then a bound database), the version constant and the never-500 wrapper.
 //
 // The routes:
 //   POST   /report            public ingest, Turnstile gated, rate limited
@@ -19,12 +16,10 @@
 //   GET    /work, /work/:id   the work queue               (Authorization: Bearer, C3)
 //   POST   /work/...          one work action              (Authorization: Bearer, C3 + src/work.js)
 //   GET    /health            which secrets are bound, and the per-site read-back
+//   /apps, /apps/:app/items    registered apps and their items      (src/routes-apps.js)
 //
-// The feeds share one table, one desk and one rule: text arrives in PRIVATE, a person
-// decides, and only a sentence that person typed reaches a public page. Corrections arrive
-// from strangers and open items from the fleet's own trackers; the work queue lets an agent
-// do the work behind either and hands the result back to a person. NOTHING ON ANY FEED
-// PUBLISHES ITSELF.
+// The feeds share one table and one rule: text arrives PRIVATE, a person decides, and only a
+// sentence that person typed reaches a public page. NOTHING ON ANY FEED PUBLISHES ITSELF.
 //
 // Contracts this file enforces, all frozen in docs/delivery/CONTRACTS.md:
 //   C1  the report shape        -> src/validate.js
@@ -33,71 +28,46 @@
 //   C4  the status vocabulary   -> src/transitions.js, enforced in src/store.js
 // and the work queue's action table (docs/DESIGN-WORK-QUEUE.md) -> src/work.js.
 //
-// No response from this Worker is ever HTTP 500. The router is wrapped in a try/catch in
-// the default export at the bottom, the same shape as
-// projects/resume-forge-site/worker/src/index.js:341-365.
+// No response from this Worker is ever HTTP 500: see the wrapper at the bottom.
 //
 // /report, /log, /board and /board/summary NEVER read the Authorization header. A public
 // route that also honours an operator credential is one refactor away from leaking the queue.
 //
-// WHERE THE ROUTE BODIES WENT, and why that seam. Three files, drawn along the credential and
-// not along the verb, because the credential is the line the contracts care about:
+// WHERE THE ROUTE BODIES LIVE, split along the credential:
 //
 //   src/routes-public.js  ingest, resolvedLog, health                      no credential
 //   src/routes-open.js    openBoard, openBoardSummary                      no credential
-//                         openImport, openSync            called only from routes-desk.js,
-//                                                         which is where their C3 gate is
-//   src/routes-desk.js    deskList, deskPatch, importRoute, work, principalFor         C3
+//   src/routes-desk.js    deskList, deskPatch, importRoute, work           C3
+//   src/routes-apps.js    the /apps routes                                 an app key, C3 or a person
 //
-// src/routes-desk.js is the ONLY file in the Worker that imports src/auth.js, and this file does
-// not import it either, which is what makes the credential rule above checkable rather than a
-// claim about which functions call authenticate(). Every file under src/ is assigned one of four
-// credential roles in tests/tenant-scope.test.mjs, whose role table is asserted to list exactly
-// the files present, so a new file is classified deliberately or the suite is red.
-//
-// src/store.js re-exports what moved out of it to src/budget.js and src/keys.js, so no existing
-// caller of any of them changed.
+// Every credential is read through identify() in src/identity.js, the only file that imports
+// src/auth.js; tests/tenant-scope.test.mjs gives every file under src/ a credential role.
 
 import { ERROR_CODES, fail, corsHeaders, originVerdict } from './envelope.js';
 import { ingest, resolvedLog, health } from './routes-public.js';
 import { deskList, deskPatch, importRoute, work } from './routes-desk.js';
 import { openBoard, openBoardSummary } from './routes-open.js';
 import { parseWorkPath } from './routes-work.js';
+import { ingestAppId, parseAppsPath, appPreflight, appIngest, appRegister, appRead } from './routes-apps.js';
 
 export { ERROR_CODES };
 
-// 1.1.0 is the open-items board and the work queue together: 1.0.0 shipped the corrections
-// feed alone, and the board was built after it without a bump, so the release checks this
-// number to tell the two builds apart.
-//
-// A15 PINS THIS CONSTANT TO THIS FILE. It is read by GET /health, which lives in
-// src/routes-public.js now and is handed the value below rather than importing it: that file is
-// one of the four this one imports, so reading it back from there would be a cycle. Check it by
-// name and not by line number: `grep -n "const VERSION" src/index.js`.
+// 1.1.0 is the open-items board and the work queue; 1.0.0 shipped corrections alone. A15 PINS
+// THIS CONSTANT TO THIS FILE and holds it at 1.1.0 until the tenant campaign's last phase, because
+// scripts/release-work-queue.sh refuses any other value. GET /health is handed it, not importing it.
 const VERSION = '1.1.0';
 
 const notARoute = (origin, env, hint) =>
   fail('NOT_A_ROUTE', { provider: '', origin, env, message: 'That path and method are not a route on this worker.', hint });
 
 const ROUTES_HINT =
-  'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board, GET /board/summary, the /work routes and GET /health.';
+  'The routes are POST /report, GET /reports, PATCH /reports/:id, GET /log, POST /open-items, POST /open-items/sync, GET /board, GET /board/summary, the /work routes, the /apps routes and GET /health.';
 
 // ── The router ────────────────────────────────────────────────────────────────
-// WHICH HANDLERS TAKE A SCOPE, AND WHY THE REST DO NOT. Three derive one and hand it to the
-// store: `deskList` and `deskPatch` from the credential that matched, and `ingest` from the
-// route itself (FLEET_SCOPE, reading no credential at all). The others pass none, which is a
-// statement rather than an omission, an unused scope parameter reading as a guard that is not
-// there. `importRoute` and `work` are fleet-only by invariant 4.3, open items and queued items
-// both, so src/store-open.js, src/store-work.js and src/store-work-runner.js carry the literal
-// and there is nothing to bind. `openBoard`, `openBoardSummary`, `resolvedLog` and `health`
-// carry the literal because C6.5 requires it: written that way, no tenant row CAN be published,
-// structurally, whatever a caller sends. So when a handler gains a scope argument, answer first
-// which statement binds it; if none does, it should not have one.
-//
 // THE ROUTER PASSES NO CREDENTIAL AND DERIVES NO PRINCIPAL. Every handler that needs one calls
-// authenticate() itself, inside src/routes-desk.js. That is why `request` goes through whole:
-// a router that read the header once and handed an actor down would make every handler's
-// credential-free-ness a property of the router's bookkeeping rather than of the handler.
+// identify() itself and derives its scope there, so `request` goes through whole. Handlers that
+// take no scope carry the fleet literal in their SQL instead: invariant 4.3 for the import and
+// the work queue, C6.5 for every credential-free read.
 
 const router = {
   async fetch(request, env) {
@@ -108,7 +78,13 @@ const router = {
     const now = Date.now();
     const ip = request.headers.get('CF-Connecting-IP') || '';
 
+    // An app's ingest route answers its own origin list, not BALISE_ALLOWED_ORIGINS (C6.3), so it
+    // runs before the gate below. A Balise origin's preflight keeps the Balise answer, which is
+    // what lets the console read GET /apps/:app/items from the same path.
+    const appId = ingestAppId(path);
+    if (appId !== null && method === 'POST') return await appIngest(request, env, { origin, ip, now, appId });
     if (method === 'OPTIONS') {
+      if (appId !== null && originVerdict(origin, env) !== 'allowed') return await appPreflight(env, { origin, appId });
       return new Response(null, { status: 204, headers: corsHeaders(origin, env) });
     }
 
@@ -173,6 +149,12 @@ const router = {
       if (target.hint) return notARoute(origin, env, target.hint);
       return await work(request, env, { origin, ip, now, target });
     }
+    if (path === '/apps' || path.startsWith('/apps/')) {
+      const target = parseAppsPath(path, method);
+      if (target.hint) return notARoute(origin, env, target.hint);
+      if (target.route === 'register') return await appRegister(request, env, { origin, ip, now });
+      return await appRead(request, env, { origin, ip, now, target });
+    }
     if (path === '/health') {
       if (method !== 'GET') return notARoute(origin, env, 'Health is read with GET /health.');
       return await health(env, { origin, now, version: VERSION });
@@ -186,21 +168,15 @@ const surfaceFor = (path) => {
   if (path === '/reports' || path.startsWith('/reports/')) return 'desk';
   if (path.startsWith('/open-items') || path === '/work' || path.startsWith('/work/')) return 'desk';
   if (path === '/log' || path === '/board' || path === '/board/summary') return 'log';
+  if (path === '/apps' || path.startsWith('/apps/')) return 'apps';
   return '';
 };
 
 // ── The never-500 wrapper ─────────────────────────────────────────────────────
 
 export default {
-  /**
-   * "No response from this Worker is ever HTTP 500" (C2) is a promise about every
-   * response, including the ones a bug in these files produces. An uncaught throw in a
-   * Workers fetch handler is answered by the runtime with a 500 class error page and no
-   * CORS headers, which the site would see only as an unreadable body.
-   *
-   * This catch existing is not a claim that it never fires. The log line is for the
-   * operator; the person still gets a sentence and something they can do.
-   */
+  /** C2: no response is ever HTTP 500, including the ones a bug produces. An uncaught throw
+   *  would reach the site as a 500 page with no CORS headers, which it cannot read. */
   async fetch(request, env) {
     try {
       return await router.fetch(request, env);

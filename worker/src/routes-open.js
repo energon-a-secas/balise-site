@@ -5,7 +5,7 @@
 //   GET  /board            the public board          (no auth, cacheable, any origin)
 //   GET  /board/summary    the board as counts       (no auth, cacheable, any origin)
 //
-// C3 happens in src/index.js, which owns authentication, and the parsed body arrives
+// C3 happens in src/routes-desk.js, through identify(), and the parsed body arrives
 // here already read under the 8 KB cap. What is left in this file is the shape check and
 // the call into src/store-open.js.
 //

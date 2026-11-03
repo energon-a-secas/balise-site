@@ -19,8 +19,8 @@ export const KINDS = ['wrong', 'missing', 'broken', 'other'];
 /** What the desk may ASK for. Reading the open feed is allowed; writing it is not. */
 export const LIST_KINDS = [...KINDS, 'open'];
 
-const SITE_RE = /^[a-z0-9-]{1,40}$/;
-const TARGET_KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
+export const SITE_RE = /^[a-z0-9-]{1,40}$/;
+export const TARGET_KIND_RE = /^[a-z][a-z0-9-]{0,31}$/;
 
 export const URL_MAX = 512;
 export const BODY_MIN = 10;

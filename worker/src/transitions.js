@@ -78,6 +78,19 @@ export const OPEN_TRANSITIONS = {
 };
 
 /**
+ * C6.4: what a PERSON may do to an item of an app they own. A person never reaches a fleet row,
+ * because their scope is one app's id (src/scope.js), so this table needs no tenancy of its own
+ * (A12). `accepted` and `spam` are absent: one is a publish and the other a judgement about a
+ * person, and both stay the operator's. `duplicate` is terminal here.
+ */
+export const PERSON_TRANSITIONS = {
+  new: ['triaged', 'fixed', 'rejected', 'duplicate'],
+  triaged: ['fixed', 'rejected', 'duplicate'],
+  fixed: ['new'],
+  rejected: ['new'],
+};
+
+/**
  * Pure, and exported so a test can assert the whole table without a database.
  *
  * `kind` is optional and only ever narrows. AUTOMATION HAS NO EDGE AT ALL on an open
@@ -87,8 +100,8 @@ export const OPEN_TRANSITIONS = {
  * absorb and nothing for it to be right about, so it gets nothing.
  */
 export function canTransition(from, to, actor, kind = null) {
-  if (kind === 'open' && actor === 'ai') return false;
-  const table = actor === 'ai' ? AI_TRANSITIONS : kind === 'open' ? OPEN_TRANSITIONS : TRANSITIONS;
+  if (kind === 'open' && (actor === 'ai' || actor === 'person')) return false;
+  const table = actor === 'person' ? PERSON_TRANSITIONS : actor === 'ai' ? AI_TRANSITIONS : kind === 'open' ? OPEN_TRANSITIONS : TRANSITIONS;
   const allowed = table[from];
   return Array.isArray(allowed) && allowed.includes(to);
 }

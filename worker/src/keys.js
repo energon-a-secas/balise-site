@@ -1,16 +1,11 @@
-// The four derived keys this Worker computes, and the digest under all of them:
+// The keys this Worker derives or mints, and the digest under all of them:
 //
 //   fingerprintInput + sha256Hex   the duplicate guard, scoped per tenant (A11)
 //   ipHash                         a reporter's address, salted, truncated, never stored raw
 //   actorKey                       the bucket the rate limit and the C3 lockout count against
+//   mintAppKey, appKeyKind         an app's bpk_ and bsk_ keys, prefix and checksum (C6.2)
 //
-// No SQL, no D1, no request, no env. Lifted out of src/store.js in the phase 2 router split:
-// that file's own header says it is one of the six files in this Worker that contain SQL, and
-// these five functions contain none, so they were the part of it that a reader auditing the
-// store had to skip. src/store.js re-exports all five, so every existing caller is unchanged.
-//
-// It imports only src/scope.js, which imports nothing, so no file that needs a key can create
-// a cycle by reaching for one.
+// No SQL, no D1, no request, no env. It imports only src/scope.js, which imports nothing.
 
 import { FLEET } from './scope.js';
 
@@ -34,25 +29,10 @@ export function normaliseForFingerprint(body) {
 }
 
 /**
- * A11: the tenant is scoped INSIDE the hash, not beside it.
- *
- * `reports_fp` is UNIQUE on `fingerprint` alone, and it stays that way. A composite
- * UNIQUE(app_id, fingerprint) would be the obvious move and it is the wrong one: the three
- * `ON CONFLICT(fingerprint) DO NOTHING` clauses in this Worker name that index by column,
- * so replacing it means editing every one of them and getting all three right, and the
- * failure mode of missing one is a thrown constraint error on a path whose whole design is
- * that a duplicate costs a no-op insert. Mixing the key into the hashed input instead
- * gives per-tenant duplicate detection with no index change and no conflict-clause change.
- *
- * `appId` COMES FIRST, NOT LAST. A call site that was not updated passes three arguments,
- * so `site` lands in `appId` and `body` is undefined, and the report is refused loudly.
- * With the key appended instead, the same stale call site would hash exactly as it always
- * did, which is to say it would silently file a tenant's report as the fleet's. That is
- * DESIGN.md section 9 item 13, and it is why the argument order is not a matter of taste.
- *
- * The fleet's input is byte-identical to what it was before this parameter existed, so
- * every fingerprint already in the table stays correct and no backfill is needed. That is
- * what the FLEET branch is for; it is not an optimisation.
+ * A11: the tenant is scoped INSIDE the hash, so `reports_fp` stays UNIQUE on `fingerprint` alone
+ * and no ON CONFLICT clause changes. `appId` COMES FIRST, so a stale three-argument call site
+ * fails loudly instead of hashing as the fleet (DESIGN.md section 9 item 13). The fleet's input
+ * is byte-identical to what it was before, so every stored fingerprint stays correct.
  */
 export function fingerprintInput(appId, site, targetId, body) {
   const base = `${site}\x00${targetId || ''}\x00${normaliseForFingerprint(body)}`;
@@ -70,19 +50,55 @@ export async function ipHash(salt, address) {
 }
 
 /**
- * The key both the rate limit binding and the C3 lockout count against. The salted hash
- * when a salt is bound, the raw address when it is not, and one shared bucket when there
- * is no address at all. That last case is local development and curl from the same box:
- * everyone shares a bucket, which is stricter than production rather than looser.
- *
- * IT IS HERE AND NOT IN src/auth.js, where it was until the phase 2 split, and the reason is
- * the sentence at the top of that file: /report, /log, /board and /board/summary never import
- * the authentication module. POST /report is rate limited and reads no credential, so it needs
- * this function and nothing else from auth.js, and while this lived there that one need was the
- * only thing making the credential-free ingest handler import C3's own file. It takes `ipHash`'s
- * output and it decides no role, so beside `ipHash` is where it belongs.
+ * The key the rate limit bindings and the C3 lockout count against: the salted hash, else the
+ * raw address, else one shared bucket (local work and curl, stricter rather than looser). It is
+ * here and not in src/auth.js so that the credential-free /report never imports that file.
  */
 export function actorKey(hashed, ip) {
   if (hashed) return hashed;
   return ip ? `ip:${ip}` : 'anonymous';
+}
+
+// ── App keys (C6.2) ───────────────────────────────────────────────────────────
+
+const APP_KEY_PREFIX = { public: 'bpk_', secret: 'bsk_' };
+// 32 random bytes and a 4-byte checksum, both base64url without padding.
+const KEY_BODY = 43;
+const KEY_SUM = 6;
+const APP_KEY_LENGTH = 4 + KEY_BODY + KEY_SUM;
+
+const base64url = (bytes) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+function crc32(text) {
+  let crc = 0xffffffff;
+  for (let i = 0; i < text.length; i += 1) {
+    crc ^= text.charCodeAt(i);
+    for (let bit = 0; bit < 8; bit += 1) crc = (crc >>> 1) ^ (0xedb88320 & -(crc & 1));
+  }
+  return (crc ^ 0xffffffff) >>> 0;
+}
+
+const checksum = (head) => {
+  const c = crc32(head);
+  return base64url([c >>> 24, (c >>> 16) & 255, (c >>> 8) & 255, c & 255]);
+};
+
+/** A new key of one kind. Shown to a person once and stored only as its SHA-256. */
+export function mintAppKey(kind) {
+  const prefix = APP_KEY_PREFIX[kind];
+  if (!prefix) throw new Error(`mintAppKey: no key kind ${JSON.stringify(kind)}`);
+  const head = prefix + base64url(crypto.getRandomValues(new Uint8Array(32)));
+  return head + checksum(head);
+}
+
+/**
+ * 'public', 'secret' or null: the kind a presented text is shaped as. The checksum lets a typo or
+ * a truncated paste be refused without a D1 read. It proves the shape and nothing else: which app
+ * a key belongs to, and whether it is still live, is the app_keys lookup.
+ */
+export function appKeyKind(text) {
+  if (typeof text !== 'string' || text.length !== APP_KEY_LENGTH || !/^[A-Za-z0-9_-]+$/.test(text)) return null;
+  const kind = Object.keys(APP_KEY_PREFIX).find((k) => text.startsWith(APP_KEY_PREFIX[k]));
+  if (!kind) return null;
+  return checksum(text.slice(0, -KEY_SUM)) === text.slice(-KEY_SUM) ? kind : null;
 }

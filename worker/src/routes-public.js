@@ -11,8 +11,8 @@
 // header read is on that list. An unlisted name is a red test, so the rule does not depend on
 // anyone guessing in advance how a credential might be written.
 //
-// The three routes left here are the credential-free ones. src/routes-desk.js holds the four
-// that take C3 and is the only file in the Worker that imports src/auth.js.
+// The three routes left here are the credential-free ones. Every credential in the Worker is
+// read through src/identity.js, the only file that imports src/auth.js.
 //
 // NOTHING HERE PUBLISHES AND NOTHING HERE DECIDES. /report writes a row at status 'new', which
 // is private on both feeds; /log reads only sentences a person typed; /health reports which
@@ -25,6 +25,7 @@ import { STATUSES, insertReport } from './store.js';
 import { fingerprintInput, sha256Hex, ipHash, actorKey } from './keys.js';
 import { warnRowsRead } from './budget.js';
 import { publicLog, healthSites } from './store-public.js';
+import { tenantTally } from './store-apps.js';
 import { FLEET_SCOPE } from './scope.js';
 import { verifyTurnstile } from './turnstile.js';
 
@@ -123,26 +124,16 @@ export async function resolvedLog(request, env, { origin }) {
 // ── GET /health ───────────────────────────────────────────────────────────────
 
 /**
- * Two jobs, and the second one is the important one.
- *
- * `config` reports WHICH secrets are bound and never their values, so an operator can
- * tell a missing secret from an outage without reading anything privileged.
- *
- * `sites` is the per-site read-back. Every other check this campaign builds is static: it
- * proves the widget was copied into a repo, not that a report ever arrived from it. A
- * live site missing from this list either has no visitors or has a Beacon that silently
- * stopped working, and that is the only signal anywhere in the system that would tell the
- * difference. The desk turns it into one line; the query is here so it cannot fall
- * between the two workstreams.
- *
- * `version` ARRIVES AS AN ARGUMENT and is not imported. A15 pins the constant itself to
- * src/index.js, which is the file the release checks, and this file is one of the four that
- * index.js imports: reading it back from there would be a cycle. So the router hands its own
- * version to the handler that reports it, and there is exactly one definition either way.
+ * `config` says WHICH secrets are bound, never their values. `sites` is the per-site read-back:
+ * a live site missing from it has no visitors or a Beacon that silently stopped, and nothing
+ * else in the system can tell the difference. `apps` and `tenant_items` are C6.6's two numbers.
+ * `version` arrives as an argument, because A15 pins the constant to src/index.js.
  */
 export async function health(env, { origin, now, version }) {
   const since = now - HEALTH_WINDOW_DAYS * 24 * 60 * 60 * 1000;
   const read = await healthSites(env.DB, since);
+  // C6.6: tenants as two numbers and never a list, because this route has no credential.
+  const tenants = await tenantTally(env.DB, since);
   const body = {
     version,
     window_days: HEALTH_WINDOW_DAYS,
@@ -156,9 +147,12 @@ export async function health(env, { origin, now, version }) {
       turnstile: Boolean(env.BALISE_TURNSTILE_SECRET),
       ip_salt: Boolean(env.BALISE_IP_SALT),
       rate_limiter: Boolean(env.INGEST_LIMITER),
+      app_rate_limiter: Boolean(env.APP_INGEST_LIMITER),
     },
     sites: read.code ? [] : read.sites,
-    store_ok: !read.code,
+    apps: tenants.code ? null : tenants.apps,
+    tenant_items: tenants.code ? null : tenants.items,
+    store_ok: !read.code && !tenants.code,
   };
   return ok('', body, { origin, env });
 }

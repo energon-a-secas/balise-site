@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { sqliteD1 } from './sqlite-d1.mjs';
 import { FLEET, FLEET_SCOPE, scopeFor } from '../src/scope.js';
-import { principalFor } from '../src/routes-desk.js';
+import { principalFor } from '../src/identity.js';
 import {
   fingerprintInput, listReports, getReport, applyTransition,
 } from '../src/store.js';
@@ -35,15 +35,24 @@ const SQL_STATEMENTS = { 'store-public.js': 2, 'store-open.js': 9 };
 // ── The seam ──────────────────────────────────────────────────────────────────
 
 test('C6: the scope seam has one answer per principal kind and refuses to invent one', () => {
-  // Phase 1 has two principals and both are the fleet's, which is what makes this phase
-  // reviewable: no externally visible behaviour changes. A third kind is WS-C's, and until it
-  // exists scopeFor must THROW rather than fall back, because a fallback to the fleet is
-  // invisible in phase 1 and a cross-tenant read in phase 2.
+  // The two fleet principals are the fleet's. An app principal is its own app; a person is one
+  // app at a time, the one the path named, and only if they own it. Anything malformed THROWS
+  // rather than falling back, because a fallback to the fleet is a cross-tenant read.
   assert.equal(scopeFor({ kind: 'operator' }).appId, FLEET);
   assert.equal(scopeFor({ kind: 'automation' }).appId, FLEET);
   assert.equal(scopeFor({ kind: 'operator' }).appKeyId, null);
-  for (const principal of [{ kind: 'app' }, { kind: 'person' }, { kind: '' }, {}, null, undefined]) {
-    assert.throws(() => scopeFor(principal), /no scope is defined/, `scopeFor accepted ${json(principal)}`);
+  assert.deepEqual({ ...scopeFor({ kind: 'app', app_id: TENANT, key_id: TENANT_KEY }) }, { appId: TENANT, appKeyId: TENANT_KEY });
+  const owned = { id: TENANT, owner: 'person-a' };
+  assert.deepEqual({ ...scopeFor({ kind: 'person', person_id: 'person-a' }, owned) }, { appId: TENANT, appKeyId: null });
+  assert.equal(scopeFor({ kind: 'person', person_id: 'person-b' }, owned), null, "a person was scoped to someone else's app");
+  const malformed = [
+    [{ kind: 'app' }], [{ kind: 'app', app_id: FLEET }], [{ kind: 'app', app_id: '' }],
+    [{ kind: 'person', person_id: 'person-a' }], [{ kind: 'person' }, owned], [{ kind: 'person', person_id: '' }, owned],
+    [{ kind: 'person', person_id: 'person-a' }, { id: FLEET, owner: 'person-a' }],
+    [{ kind: '' }], [{}], [null], [undefined],
+  ];
+  for (const args of malformed) {
+    assert.throws(() => scopeFor(...args), /no scope is defined/, `scopeFor accepted ${json(args)}`);
   }
   // The sentinel is a STRING and never NULL: `WHERE app_id = ?` bound to NULL matches nothing
   // silently, and the symptom is an empty page rather than an error.
@@ -53,7 +62,7 @@ test('C6: the scope seam has one answer per principal kind and refuses to invent
 
 test('C6: the actor seam above scopeFor has one answer per actor and refuses to invent one', () => {
   // The seam above the seam. scopeFor throws on a kind it does not know, but principalFor in
-  // src/routes-desk.js is what decides the kind, and while it read
+  // src/identity.js is what decides the kind, and while it read
   // `actor === 'ai' ? 'automation' : 'operator'` every unknown actor arrived as an OPERATOR:
   // fleet-scoped, silent, and the throw above unreachable from any route. That is the failure
   // this test exists to keep red. It costs nothing in phase 1, where authenticate() returns
@@ -217,7 +226,7 @@ test('C6.5: the three public reads count the fleet only, and take the literal ra
  * somebody has said which of these four it is.
  *
  *   'credential'  may read a credential header out of a request. src/auth.js, alone.
- *   'desk'        may reach src/auth.js. src/routes-desk.js, alone.
+ *   'seam'        may reach src/auth.js. src/identity.js, alone: every credential goes through it.
  *   'public'      holds a route that answers with NO credential at all. A file in this role may
  *                 NAME only what MAY_NAME lists for it, which is the one rule here that does not
  *                 depend on guessing how a credential might be spelled.
@@ -228,23 +237,28 @@ const SRC_ROLES = {
   'auth.js': 'credential',
   'budget.js': 'plain',
   'envelope.js': 'plain',
+  'identity.js': 'seam',
   'index.js': 'plain',
   'keys.js': 'plain',
   'redact.js': 'plain',
-  'routes-desk.js': 'desk',
+  'routes-apps.js': 'plain',
+  'routes-desk.js': 'plain',
   'routes-open.js': 'public',
   'routes-public.js': 'public',
   'routes-work.js': 'plain',
   'scope.js': 'plain',
+  'store-apps.js': 'plain',
   'store-auth.js': 'plain',
   'store-open.js': 'plain',
   'store-public.js': 'plain',
+  'store-tenant.js': 'plain',
   'store-work-runner.js': 'plain',
   'store-work.js': 'plain',
   'store.js': 'plain',
   'suggestion.js': 'plain',
   'transitions.js': 'plain',
   'turnstile.js': 'plain',
+  'validate-apps.js': 'plain',
   'validate-work.js': 'plain',
   'validate.js': 'plain',
   'work.js': 'plain',
@@ -258,7 +272,7 @@ const PUBLIC_ROUTE_FILES = filesInRole('public');
 const MAY_READ_A_CREDENTIAL = filesInRole('credential');
 /** The only file that may reach src/auth.js. Named rather than counted: a count passes when the
  *  importer MOVES, and where it lives is the point. */
-const MAY_IMPORT_AUTH = filesInRole('desk');
+const MAY_IMPORT_AUTH = filesInRole('seam');
 /** Request headers that carry who the caller is. X-Balise-Actor is gone for good (src/auth.js and
  *  src/routes-desk.js both say why) and is listed so that bringing it back is a red. */
 const CREDENTIAL_HEADERS = ['authorization', 'x-balise-actor', 'cookie', 'proxy-authorization'];
@@ -330,17 +344,19 @@ const MAY_NAME = {
     'source', 'syncOpenSource', 'unchanged', 'upsertOpenItems', 'url', 'validateListQuery',
     'validateOpenBatch', 'validateOpenSync', 'value',
   ],
+  // /health's C6.6 tally added './store-apps.js', 'tenantTally', 'tenants', 'apps', 'items' and
+  // the APP_INGEST_LIMITER config flag: a count over apps and a binding's presence, no credential.
   'routes-public.js': [
-    './budget.js', './envelope.js', './keys.js', './scope.js', './store-public.js',
-    './store.js', './turnstile.js', './validate.js', 'BALISE_AUTOMATION_TOKEN',
+    './budget.js', './envelope.js', './keys.js', './scope.js', './store-apps.js', './store-public.js',
+    './store.js', './turnstile.js', './validate.js', 'APP_INGEST_LIMITER', 'BALISE_AUTOMATION_TOKEN',
     'BALISE_IP_SALT', 'BALISE_OPERATOR_TOKEN', 'BALISE_TURNSTILE_SECRET', 'Cache-Control', 'DB',
     'DUPLICATE', 'FLEET_SCOPE', 'HEALTH_WINDOW_DAYS', 'INGEST_LIMITER', 'P', 'RATE_LIMITED',
-    'STATUSES', 'actorKey', 'appId', 'body', 'challenge', 'checked', 'code', 'duplicate',
+    'STATUSES', 'actorKey', 'appId', 'apps', 'body', 'challenge', 'checked', 'code', 'duplicate',
     'entries', 'env', 'error', 'fail', 'fingerprint', 'fingerprintInput', 'fpIn', 'function',
-    'hashed', 'healthSites', 'hint', 'id', 'ingest', 'insertReport', 'ip', 'ipHash', 'key',
+    'hashed', 'healthSites', 'hint', 'id', 'ingest', 'insertReport', 'ip', 'ipHash', 'items', 'key',
     'limit', 'log', 'message', 'new', 'next', 'now', 'ok', 'origin', 'page', 'params', 'parsed',
     'publicLog', 'randomUUID', 'read', 'readJson', 'report', 'result', 'rowsRead',
-    'searchParams', 'sha256Hex', 'since', 'site', 'sites', 'success', 'target', 'turnstile',
+    'searchParams', 'sha256Hex', 'since', 'site', 'sites', 'success', 'target', 'tenantTally', 'tenants', 'turnstile',
     'url', 'validateListQuery', 'validateReport', 'value', 'verifyTurnstile', 'version', 'warn',
     'warnRowsRead',
   ],
@@ -359,7 +375,7 @@ test('every file under src/ is classified, so none of them can sit outside these
     `src/ and SRC_ROLES disagree about which files exist. Classify the new one: 'public' if a route that answers WITHOUT a credential lives in it, 'plain' otherwise, and read what each role costs above. An unclassified file is a file none of the credential rules in this test are applied to.`,
   );
   assert.deepEqual(MAY_READ_A_CREDENTIAL, ['auth.js'], 'a second file has been given leave to read a credential header');
-  assert.deepEqual(MAY_IMPORT_AUTH, ['routes-desk.js'], 'a second file has been given leave to import src/auth.js');
+  assert.deepEqual(MAY_IMPORT_AUTH, ['identity.js'], 'a second file has been given leave to import src/auth.js');
   assert.deepEqual(
     PUBLIC_ROUTE_FILES, Object.keys(MAY_NAME).sort(),
     `a file in the 'public' role has no list of names it may use, so the positive rule below is not applied to it at all`,

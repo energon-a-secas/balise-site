@@ -96,6 +96,7 @@ test('/health names which secrets are bound and never their values', async () =>
   assert.equal(body.ok, true);
   assert.deepEqual(body.config, {
     db: true, operator_token: true, automation_token: true, turnstile: true, ip_salt: true, rate_limiter: true,
+    app_rate_limiter: true,
   });
   assert.equal(body.store_ok, true);
   const text = JSON.stringify(body);

@@ -80,8 +80,9 @@ test('C2: no code rides on an HTTP 500, ever', () => {
   }
 });
 
-test('C2: the surfaces are the four Balise names', () => {
-  assert.deepEqual(SURFACES, ['ingest', 'desk', 'log', '']);
+test('C2: the surfaces are the five Balise names', () => {
+  // 'apps' is A14's one addition: a provider value, not a code, so the C2.1 drift test is unmoved.
+  assert.deepEqual(SURFACES, ['ingest', 'desk', 'log', 'apps', '']);
 });
 
 // ── C2.2: origin policy ───────────────────────────────────────────────────────

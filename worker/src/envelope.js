@@ -6,18 +6,14 @@
 //
 // `provider` keeps its name for fleet consistency with
 // docs/architecture/cloudflare-workers.md even though Balise has no third party
-// upstream. Its value is the Balise SURFACE: 'ingest', 'desk', 'log', or the empty
+// upstream. Its value is the Balise SURFACE: 'ingest', 'desk', 'log', 'apps', or the empty
 // string when the path names none. Renaming the key would give the fleet two envelope
 // shapes; reusing it means one client can read any Neorgon worker.
 //
 // `message` and `hint` are shown to a person verbatim. Every hint ends by naming
 // something the person can still do.
 //
-// readJson() and tooLarge() are at the foot of this file rather than in a module of their
-// own. They were in src/index.js until the router was split out of the handlers, and they
-// belong here because every outcome either one has is a C2 envelope: readJson returns a
-// parsed value or one of the three envelopes above, and tooLarge IS an envelope. Nothing
-// about reading a body under a cap is a route's business, so no route file owns a copy.
+// readJson() and tooLarge() live here because every outcome either one has is a C2 envelope.
 
 import { REQUEST_MAX_BYTES } from './validate.js';
 
@@ -68,8 +64,8 @@ export const HTTP_FOR = {
   STORE_ERROR: 502,
 };
 
-/** The four legal values of `provider`, which is a Balise surface and not an upstream. */
-export const SURFACES = ['ingest', 'desk', 'log', ''];
+/** The five legal values of `provider`, which is a Balise surface and not an upstream. */
+export const SURFACES = ['ingest', 'desk', 'log', 'apps', ''];
 
 const DEFAULT_ORIGINS = [
   'https://balise.neorgon.com',
@@ -107,15 +103,10 @@ export function originVerdict(origin, env) {
 }
 
 /**
- * Access-Control-Allow-Origin cannot hold a list, so exactly one validated origin is
- * echoed per response and `Vary: Origin` is mandatory: without it a cache could serve
- * one site's allowed response to another site's request.
- *
- * Allow-Headers names TWO request headers and that is the whole set. X-Balise-Actor was
- * listed here and is gone (A13): the actor is decided by which secret matched, never
- * declared by the caller, so advertising the header invited a client to send one. Nothing
- * in this Worker reads it. Do not add it back, and do not add a header that names a tenant
- * either, for the same reason: the tenant follows from the credential.
+ * Exactly one validated origin is echoed per response, so `Vary: Origin` is mandatory.
+ * Allow-Headers names TWO request headers and that is the whole set: X-Balise-Actor is gone
+ * (A13), and no header may name a tenant either, because the tenant follows from the
+ * credential. An app's own origins get src/routes-apps.js appCors() instead, never this.
  */
 export function corsHeaders(origin, env) {
   if (originVerdict(origin, env) !== 'allowed') return {};

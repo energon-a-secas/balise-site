@@ -17,12 +17,10 @@
 //      a comment naming the invariant that makes one unnecessary. There is no third
 //      option, and a statement with neither is a defect whether or not it can be reached.
 //
-// WHAT PHASE 1 IS. Only two principal kinds exist yet, `operator` and `automation`, and
-// both scope to 'fleet'. So every row is still the fleet's and nothing visible from
-// outside this Worker changes: that is what makes the predicates reviewable, because any
-// behaviour difference is a bug rather than a feature. The `person` and `app` kinds, and
-// identify() in src/identity.js which is the only function allowed to build a principal
-// from a request, are phase 2 (C6.1). Do not add them here.
+// THE PRINCIPALS. identify() in src/identity.js is the only function that builds one from a
+// request (C6.1). `operator` and `automation` scope to 'fleet'; `app` to the app its key belongs
+// to; `person` to ONE app at a time, the one the path names, and only if they own it (DESIGN.md
+// section 5.5). A person's apps are never turned into an `app_id IN (...)` list.
 //
 // WHY THE SCOPE IS AN OBJECT AND NOT A BARE STRING. A store function takes it as the
 // argument right after `db`, so an un-updated call site passes something that is not a
@@ -33,30 +31,38 @@
 /** The operator's own desk. Refused as a registered app id. */
 export const FLEET = 'fleet';
 
-/**
- * The scope of every principal that exists in phase 1. Frozen, and shared rather than
- * rebuilt per request, because it is a constant: nothing about the fleet's own scope
- * depends on who is asking.
- */
+/** The fleet's own scope. Frozen and shared, because nothing about it depends on who asks. */
 export const FLEET_SCOPE = Object.freeze({ appId: FLEET, appKeyId: null });
 
+const appScope = (appId, appKeyId) => {
+  if (typeof appId !== 'string' || appId === '' || appId === FLEET) {
+    throw new Error(`scopeFor: no scope is defined for an app id of ${JSON.stringify(appId)}`);
+  }
+  return Object.freeze({ appId, appKeyId: appKeyId || null });
+};
+
 /**
- * A principal's scope. The only function in this Worker that decides which tenant a
- * request reads and writes.
+ * A principal's scope. The only function in this Worker that decides which tenant a request
+ * reads and writes. For a person, `app` is the apps row the path named, and the answer is null
+ * when that person does not own it: the caller answers NOT_FOUND, the same as for no app.
  *
- * It THROWS on a kind it does not know rather than returning the fleet's scope, and the
- * difference matters: a default would make a principal added without a scope read the
- * operator's desk, which is the exact failure this file exists to prevent. A throw lands
- * in the never-500 wrapper in src/index.js as STORE_ERROR, so the request fails closed.
+ * It THROWS on a kind it does not know rather than returning the fleet's scope: a default would
+ * make a principal added without a scope read the operator's desk. A throw lands in the
+ * never-500 wrapper in src/index.js as STORE_ERROR, so the request fails closed.
  */
-export function scopeFor(principal) {
+export function scopeFor(principal, app = null) {
   const kind = principal && principal.kind;
   switch (kind) {
-    // C3 and A6. Both hold a shared secret, both act for the fleet, and which one a
-    // caller is was decided by which credential matched, never by a header.
     case 'operator':
     case 'automation':
       return FLEET_SCOPE;
+    case 'app':
+      return appScope(principal.app_id, principal.key_id);
+    case 'person':
+      if (!app || typeof principal.person_id !== 'string' || principal.person_id === '') {
+        throw new Error('scopeFor: no scope is defined for a person without the app their path names');
+      }
+      return app.owner === principal.person_id ? appScope(app.id, null) : null;
     default:
       throw new Error(`scopeFor: no scope is defined for principal kind ${JSON.stringify(kind)}`);
   }
@@ -79,12 +85,8 @@ export function tenantKey(scope) {
   return appId;
 }
 
-/**
- * Which key wrote a row, or null. Forensics only: when a published key leaks and 400
- * items arrive, this is what says which key to revoke and which rows to delete. It is
- * null for every principal that exists in phase 1, because only an `app` principal
- * presents a key, and nothing reads it for authorization.
- */
+/** Which key wrote a row, or null. Forensics only: when a published key leaks, this says which
+ *  key to revoke and which rows to delete. Nothing reads it for authorization. */
 export function scopeKeyId(scope) {
   return (scope && scope.appKeyId) || null;
 }
