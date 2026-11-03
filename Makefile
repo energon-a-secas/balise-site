@@ -29,6 +29,7 @@ help:
 	@echo "  make d1-query Q=  Run one read-only query against the LOCAL D1 database"
 	@echo "  make d1-check     Fail if the LOCAL D1 disagrees with worker/migrations"
 	@echo "  make d1-reset     Drop the local D1 tables and re-apply the schema"
+	@echo "  make purge-disabled  Purge LOCAL items of apps disabled over 90 days ago (C6.8)"
 	@echo ""
 
 # ── D1, always local ──────────────────────────────────────────────────────────
@@ -79,6 +80,19 @@ d1-check:
 d1-query:
 	@test -n "$(Q)" || { echo "usage: make d1-query Q=\"SELECT count(*) FROM reports\""; exit 2; }
 	@$(WRANGLER) d1 execute balise --local --command="$(Q)"
+
+# C6.8's 90-day purge, one bounded page at a time until a page comes back short. The tool prints
+# the statement and reads wrangler's answer, so the --local stays here with every other D1 command.
+PURGE = node tools/purge-disabled.mjs
+
+.PHONY: purge-disabled
+purge-disabled:
+	@while :; do \
+	  Q="$$($(PURGE) --query)" || exit 1; \
+	  OUT="$$($(WRANGLER) d1 execute balise --local --json --command="$$Q")" || exit 1; \
+	  printf '%s' "$$OUT" | $(PURGE); status=$$?; \
+	  [ $$status -eq 3 ] || exit $$status; \
+	done
 
 .PHONY: d1-reset
 d1-reset:

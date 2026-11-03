@@ -243,6 +243,7 @@ make d1-migrate    # apply worker/migrations/*.sql to the LOCAL D1, then check t
 make d1-schema     # the same thing, under the name the runbook uses
 make d1-check      # fail if the LOCAL D1 disagrees with worker/migrations
 make d1-reset      # drop the local tables and apply every migration again
+make purge-disabled  # purge LOCAL items of apps disabled over 90 days ago, a page at a time
 make worker-test   # node --test
 ```
 
