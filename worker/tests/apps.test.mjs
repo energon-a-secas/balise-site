@@ -69,9 +69,18 @@ test('C6.3: an origin is accepted only as a browser names it, exactly', () => {
 });
 
 test('C6: a registration names an owner, a name and at most five origins, and never chooses its own id', () => {
-  const good = { owner: 'owner-a', name: 'Settings app', origins: ['https://a.example'] };
-  assert.deepEqual(validateRegistration(good).value, { owner: 'owner-a', ownerLabel: null, name: 'Settings app', origins: ['https://a.example'] });
-  assert.deepEqual(validateRegistration({ owner: 'o', name: 'n' }).value.origins, [], 'a server-only app needs no origins');
+  const OWNER = 'user_2abcDEF0123456789ghijKLMnop';
+  const good = { owner: OWNER, name: 'Settings app', origins: ['https://a.example'] };
+  assert.deepEqual(validateRegistration(good).value, { owner: OWNER, ownerLabel: null, name: 'Settings app', origins: ['https://a.example'] });
+  assert.deepEqual(validateRegistration({ owner: OWNER, name: 'n' }).value.origins, [], 'a server-only app needs no origins');
+  // Phase 3 reads an app as its owner's only when apps.owner equals the verified token's sub, a
+  // Clerk user id. Anything else registered now would be an app nobody can ever open.
+  for (const owner of ['owner-a', 'someone@example.com', 'Ana Perez', 'user_', 'user_abc-def', 'USER_abc', `user_${'a'.repeat(65)}`]) {
+    const refused = validateRegistration({ ...good, owner });
+    assert.equal(refused.code, 'BAD_FIELD', `${json(owner)} was accepted as an owner`);
+    assert.match(refused.message, /Clerk user id/);
+  }
+  assert.equal(validateRegistration({ ...good, owner: ` ${OWNER} ` }).value.owner, OWNER);
   assert.equal(validateRegistration({ ...good, app_id: 'apaaaaaaaaaaaaaa' }).code, 'BAD_FIELD');
   assert.equal(validateRegistration({ ...good, id: FLEET }).code, 'BAD_FIELD');
   assert.equal(validateRegistration({ ...good, owner: '' }).code, 'MISSING_PARAM');
@@ -197,6 +206,35 @@ test('C6.8 and C6.2: a disabled app mints nothing, a revoked key resolves to not
     const out = await call();
     assert.equal(out.code, 'STORE_ERROR', `the fleet scope reached the apps tables: ${json(out)}`);
   }
+});
+
+test("DESIGN.md 7.2: every scoped store-apps function leaves another app's keys and row alone", async () => {
+  const db = sqliteD1();
+  const a = await register(db, 'owner-a');
+  const b = await register(db, 'owner-b');
+  const scopeA = scopeFor({ kind: 'app', app_id: a.app.id });
+  const bKeys = [b.keys.public.id, b.keys.secret.id];
+
+  // listKeys: A's two, never B's.
+  assert.deepEqual((await listKeys(db, scopeA)).keys.map((k) => k.id).sort(), [a.keys.public.id, a.keys.secret.id].sort());
+  // revokeKey: B's key under A's scope is NOT_FOUND, exactly as a key that never existed, and stays live.
+  const never = await revokeKey(db, scopeA, { keyId: 'never-existed', now: T + 1 });
+  for (const keyId of bKeys) {
+    assert.deepEqual(await revokeKey(db, scopeA, { keyId, now: T + 1 }), never, "another app's key answered differently from no key");
+  }
+  for (const k of [b.keys.public, b.keys.secret]) {
+    assert.ok((await resolveKey(db, await sha256Hex(k.key))).key, "A's scope revoked one of B's keys");
+  }
+  assert.equal(db.sqlite.prepare('SELECT COUNT(*) AS n FROM app_keys WHERE revoked_at IS NOT NULL').get().n, 0);
+  // mintKey: a key minted under A's scope belongs to A.
+  const minted = await mintKey(db, scopeA, { kind: 'secret', now: T + 2 });
+  assert.equal((await resolveKey(db, await sha256Hex(minted.key.key))).key.app_id, a.app.id);
+  assert.equal((await listKeys(db, scopeFor({ kind: 'app', app_id: b.app.id }))).keys.length, 2, "a key minted under A's scope landed on B");
+  // disableApp: A's scope turns A off and leaves B on.
+  await disableApp(db, scopeA, { now: T + 3 });
+  assert.equal((await getApp(db, b.app.id)).app.disabled_at, null, "A's scope switched B off");
+  // listApps: by owner, so B's owner sees B only.
+  assert.deepEqual((await listApps(db, 'owner-b')).apps.map((x) => x.id), [b.app.id]);
 });
 
 test('Q9: the daily count rises within a UTC day and starts again on the next', async () => {

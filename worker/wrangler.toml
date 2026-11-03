@@ -66,8 +66,9 @@ namespace_id = "2001"
   limit = 20
   period = 60
 
-# The /apps/:app/items route's binding, same shape and same caveats as the one above. Keyed on
-# the app plus the visitor for a bpk_ key and on the app alone for a bsk_ key (Q9). The number a
+# The /apps/:app/items route's binding, same shape and same caveats as the one above. Every post
+# to a live app counts on the app plus the visitor BEFORE its key is looked up, so a failed
+# attempt counts too (C6.2, A46), and a bsk_ post also counts on the app alone (Q9). The number a
 # tenant can be promised is the D1 daily cap in src/store-apps.js, never this one.
 [[ratelimits]]
 name = "APP_INGEST_LIMITER"

@@ -31,6 +31,13 @@ const NO_SUCH_APP = {
   hint: 'Check the app id in the address, and that this page\'s web address is on the app\'s list.',
 };
 
+// readJson's own sentences are the beacon's. An integrator sending to the API gets these instead.
+const BODY_HINTS = {
+  retryHint: 'Send the body as one JSON object, like { "v": 1, "kind": "wrong", "body": "..." }.',
+  tooLargeHint: 'Send one item of a couple of paragraphs at a time.',
+};
+const CONSOLE_HINTS = { retryHint: 'Send the body as one JSON object and try again.' };
+
 /** The app id in POST|OPTIONS /apps/:app/items, or null for any other path. */
 export function ingestAppId(path) {
   const match = ITEMS_PATH.exec(path);
@@ -102,6 +109,14 @@ export async function appIngest(request, env, { origin, ip, now, appId }) {
   const app = found.app;
   const cors = verdict === 'allowed' ? appCors(origin) : {};
   const refuse = (code, message, hint) => fail(code, { provider: P, message, hint, cors: false, headers: cors });
+  const limited = () => refuse('RATE_LIMITED', 'That is more items than this app takes from one place in a short time.', 'Wait a minute and send it again.');
+
+  // Before the key is looked up, so a failed attempt counts exactly as a good one does (C6.2,
+  // A10): the bucket is this app and this visitor (Q9), whatever key was presented. The address
+  // is only ever a bucket here; the tenant row stores none of it (A46).
+  const under = limiterOf(env);
+  const actor = actorKey(await ipHash(env.BALISE_IP_SALT, ip), ip);
+  if (!(await under(`${app.id}:${actor}`))) return limited();
 
   const who = await identify(request, env, env.DB, { now, ip, accept: ['app'], app: app.id });
   if (who.error) return refuse(who.error.code, who.error.message, who.error.hint);
@@ -112,20 +127,10 @@ export async function appIngest(request, env, { origin, ip, now, appId }) {
   if (key.key_kind === 'public' && verdict === 'absent') {
     return refuse('FORBIDDEN_ORIGIN', 'A bpk_ key only works from a web page on the app\'s list.', 'Send it from that page, or use the app\'s bsk_ key from a server.');
   }
+  // A bsk_ key is one server speaking for many visitors, so it also has a bucket of the app's own.
+  if (key.key_kind === 'secret' && !(await under(app.id))) return limited();
 
-  // Before the body is read, as on /report. Fails open when unbound: the D1 daily cap below is
-  // the limit that holds, and this binding is an abuse ceiling that counts per location (A3).
-  const hashed = await ipHash(env.BALISE_IP_SALT, ip);
-  if (env.APP_INGEST_LIMITER && typeof env.APP_INGEST_LIMITER.limit === 'function') {
-    const limitKey = key.key_kind === 'public' ? `${app.id}:${actorKey(hashed, ip)}` : app.id;
-    if (!(await env.APP_INGEST_LIMITER.limit({ key: limitKey })).success) {
-      return refuse('RATE_LIMITED', 'That is more items than this app takes from one place in a short time.', 'Wait a minute and send it again.');
-    }
-  } else {
-    console.warn('APP_INGEST_LIMITER is not bound; app ingest is running on the daily cap alone');
-  }
-
-  const parsed = await readJson(request, P, null, env);
+  const parsed = await readJson(request, P, null, env, BODY_HINTS);
   if (parsed.error) return refuse(...(await envelopeOf(parsed.error)));
   const checked = validateTenantItem(parsed.value, app.id);
   if (checked.code) return refuse(checked.code, checked.message, checked.hint);
@@ -139,13 +144,23 @@ export async function appIngest(request, env, { origin, ip, now, appId }) {
 
   const scope = scopeFor(key);
   const fingerprint = await sha256Hex(fingerprintInput(scope.appId, item.site, item.target && item.target.id, item.body));
-  const result = await insertReport(env.DB, scope, { ...item, contact: null, id: crypto.randomUUID(), created_at: now, ip_hash: hashed, fingerprint });
+  const result = await insertReport(env.DB, scope, { ...item, contact: null, id: crypto.randomUUID(), created_at: now, ip_hash: null, fingerprint });
   if (result.code) return refuse(result.code, result.message, result.hint);
   if (result.duplicate) return refuse('DUPLICATE', 'That exact item has already been sent to this app.', 'It is already on the app\'s list, so there is nothing more to do.');
 
   const day = dayOf(now);
   if (key.last_used_date !== day) await touchKey(env.DB, key.key_id, day);
   return ok(P, { id: result.id, status: 'new' }, { headers: cors });
+}
+
+/** One count against APP_INGEST_LIMITER per call. Fails open when unbound, with one warning per
+ *  request: the D1 daily cap is the limit that holds, and this binding is an abuse ceiling that
+ *  counts per location (A3). */
+function limiterOf(env) {
+  const binding = env.APP_INGEST_LIMITER;
+  if (binding && typeof binding.limit === 'function') return async (key) => (await binding.limit({ key })).success;
+  console.warn('APP_INGEST_LIMITER is not bound; app ingest is running on the daily cap alone');
+  return async () => true;
 }
 
 /** readJson answers with a finished Response; this reads its code and sentences back out, so the
@@ -161,7 +176,7 @@ export async function appRegister(request, env, { origin, ip, now }) {
   const reply = (r) => fail(r.code, { provider: P, origin, env, message: r.message, hint: r.hint });
   const who = await identify(request, env, env.DB, { now, ip, accept: ['operator'] });
   if (who.error) return reply(who.error);
-  const parsed = await readJson(request, P, origin, env);
+  const parsed = await readJson(request, P, origin, env, CONSOLE_HINTS);
   if (parsed.error) return parsed.error;
   const checked = validateRegistration(parsed.value);
   if (checked.code) return reply(checked);
@@ -177,7 +192,7 @@ export async function appPerson(request, env, { origin, ip, now, target }) {
   const who = await identify(request, env, env.DB, { now, ip, accept: ['person'] });
   if (who.error) return fail(who.error.code, { provider: P, origin, env, message: who.error.message, hint: who.error.hint });
   if (target.route !== 'move') return await readAs(env, who.principal, target, { url: new URL(request.url), origin });
-  const parsed = await readJson(request, P, origin, env);
+  const parsed = await readJson(request, P, origin, env, CONSOLE_HINTS);
   if (parsed.error) return parsed.error;
   return await moveAs(env, who.principal, target, { body: parsed.value, origin, now });
 }

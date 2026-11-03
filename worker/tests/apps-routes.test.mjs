@@ -11,7 +11,7 @@ import { invariantCounts } from './tenant-fixture.mjs';
 import worker from '../src/index.js';
 import { FLEET_SCOPE, scopeFor } from '../src/scope.js';
 import { insertReport } from '../src/store.js';
-import { fingerprintInput, sha256Hex } from '../src/keys.js';
+import { fingerprintInput, sha256Hex, mintAppKey } from '../src/keys.js';
 import { registerApp, disableApp, revokeKey, listApps, DAILY_ITEM_CAP } from '../src/store-apps.js';
 import { listItems } from '../src/store-tenant.js';
 import { readAs, moveAs } from '../src/routes-apps.js';
@@ -170,19 +170,26 @@ test('C6.2: a bsk_ key from a page and a bpk_ key from no page are refused, and 
   const contact = await post(env, a, a.keys.secret.key, null, item(1, { contact: 'reader@example.com' }));
   assert.equal(contact.body.code, 'BAD_FIELD');
   assert.equal((await post(env, a, a.keys.secret.key, null, '{not json')).body.code, 'BAD_FIELD');
+  // A body that is not JSON at all, sent raw: the refusal speaks to an integrator, not to a reader at the beacon.
+  const raw = await worker.fetch(new Request(`https://balise-api.test/apps/${a.app.id}/items`, {
+    method: 'POST', headers: { Authorization: `Bearer ${a.keys.secret.key}`, 'Content-Type': 'application/json' }, body: '{not json',
+  }), env);
+  const rawBody = await raw.json();
+  assert.equal(rawBody.code, 'BAD_FIELD');
+  assert.doesNotMatch(`${rawBody.message} ${rawBody.hint}`, /beacon/i, 'an integrator was told to reopen the beacon');
   assert.equal(rows(db, a.app.id).length, 0, 'a refused post stored a row');
 });
 
-test('Q9: the binding counts a bpk_ per app and visitor and a bsk_ per app, and refuses with a sentence that names no number', async () => {
+test('Q9: the binding counts every post per app and visitor, a bsk_ also per app, and refuses with a sentence that names no number', async () => {
   const { db, env, limited, a } = await world();
   await post(env, a, a.keys.public.key, A_ORIGIN, item(1), '203.0.113.1');
   await post(env, a, a.keys.public.key, A_ORIGIN, item(2), '203.0.113.2');
   await post(env, a, a.keys.secret.key, null, item(3));
-  assert.equal(limited.length, 3);
-  assert.ok(limited[0].startsWith(`${a.app.id}:`) && limited[1].startsWith(`${a.app.id}:`));
+  assert.equal(limited.length, 4);
+  assert.ok(limited.slice(0, 3).every((k) => k.startsWith(`${a.app.id}:`)), JSON.stringify(limited));
   assert.notEqual(limited[0], limited[1], 'two visitors shared a bucket');
-  assert.ok(!limited[0].includes('203.0.113'), 'the raw address reached the binding while a salt is bound');
-  assert.equal(limited[2], a.app.id);
+  assert.ok(!limited.join(' ').includes('203.0.113'), 'the raw address reached the binding while a salt is bound');
+  assert.equal(limited[3], a.app.id, 'a bsk_ post was not counted against the app as a whole');
 
   env.refuse = true;
   const refused = await post(env, a, a.keys.public.key, A_ORIGIN, item(4));
@@ -199,6 +206,29 @@ test('Q9: the binding counts a bpk_ per app and visitor and a bsk_ per app, and 
   } finally {
     console.warn = warn;
   }
+});
+
+test('C6.2 and A10: a key that fails is counted before it is looked up, and past the limit no key is read at all', async () => {
+  const { db, env, limited, a, b } = await world();
+  // Well formed with a good checksum, so it passes the shape check and reaches D1 without the limit.
+  const forged = mintAppKey('public');
+  for (const [name, key, origin] of [['a forged key', forged, A_ORIGIN], ["another app's key", b.keys.public.key, A_ORIGIN], ['a bsk_ from a page', a.keys.secret.key, A_ORIGIN]]) {
+    const from = limited.length;
+    assert.notEqual((await post(env, a, key, origin, item(1))).status, 200, name);
+    assert.deepEqual(limited.slice(from).map((k) => k.split(':')[0]), [a.app.id], `${name} was not counted against the app and visitor`);
+  }
+
+  env.refuse = true;
+  const from = db.log.length;
+  const refused = await post(env, a, forged, A_ORIGIN, item(2));
+  assert.equal(refused.body.code, 'RATE_LIMITED');
+  assert.equal(refused.headers['access-control-allow-origin'], A_ORIGIN, 'the page cannot read why it was refused');
+  const sent = db.log.slice(from);
+  assert.equal(sent.filter((sql) => /\bapp_keys\b/.test(sql)).length, 0, `a key was looked up past the limit:\n${sent.join('\n')}`);
+  assert.ok(sent.length <= 1, `past the limit a post still sent ${sent.length} statements:\n${sent.join('\n')}`);
+  // An unknown app is decided before the limit, so its answer is the same over the limit as under it.
+  assert.equal((await call(env, '/apps/apzzzzzzzzzzzzzz/items', { method: 'POST', key: forged, origin: A_ORIGIN, body: item(3) })).body.code, 'NOT_FOUND');
+  assert.equal(rows(db, a.app.id).length, 0);
 });
 
 test('Q9 and A14: past the daily cap an item is refused with the daily sentence, and tomorrow it is taken again', async () => {
@@ -325,6 +355,7 @@ test("C6.4 at the route: an owner moves their own item, and another person's ite
   };
   const columns = () => db.sqlite.prepare('SELECT public, public_note, fixed_ref, fixed_at, work_state, work_mode, work_run FROM reports WHERE id = ?').get(itemA.id);
   const before = { ...columns() };
+  assert.equal(before.public, 0, 'A16.2: a tenant item was written as published');
 
   const nothing = await move(ownerB, b.app.id, 'never-existed', { status: 'fixed' });
   assert.equal(nothing.status, 404);
@@ -354,4 +385,33 @@ test("C6.4 at the route: an owner moves their own item, and another person's ite
   for (const path of ['/log?limit=50', '/board?limit=50', '/board/summary']) {
     assert.ok(!(await call(env, path)).text.includes(itemA.id), `${path} published a tenant item after a move`);
   }
+});
+
+test('C2 and A16.2: a tenant item is written unpublished and with no address, so a move to fixed puts nothing in a public seek', async () => {
+  const { db, env, a, b } = await world();
+  for (const [app, origin] of [[a, A_ORIGIN], [b, B_ORIGIN]]) {
+    for (let n = 1; n <= 3; n += 1) assert.equal((await post(env, app, app.keys.public.key, origin, item(n))).status, 200);
+  }
+  const ownerA = { kind: 'person', person_id: 'owner-a' };
+  for (const { id } of rows(db, a.app.id)) {
+    const res = await moveAs(env, ownerA, { route: 'move', appId: a.app.id, id }, { body: { status: 'fixed' }, origin: null, now: NOW + 5 });
+    assert.equal(res.status, 200, await res.text());
+  }
+  const tenant = db.sqlite.prepare("SELECT status, public, ip_hash FROM reports WHERE app_id <> 'fleet'").all().map((r) => ({ ...r }));
+  assert.equal(tenant.length, 6);
+  assert.equal(tenant.filter((r) => r.status === 'fixed').length, 3);
+  for (const row of tenant) {
+    assert.equal(row.public, 0, `a tenant row was written or moved as published: ${JSON.stringify(row)}`);
+    assert.equal(row.ip_hash, null, 'a tenant row kept a hash of its visitor\'s address');
+  }
+  // The board's resolved list and its summary's latest seek (status, public) on reports_public_log
+  // (tests/local-d1-plans.test.mjs), so this range is every row they step over: none is a tenant's.
+  assert.equal(db.sqlite.prepare("SELECT COUNT(*) AS n FROM reports WHERE status = 'fixed' AND public = 1 AND app_id <> 'fleet'").get().n, 0);
+
+  // The fleet's own row from the same INSERT is still published by default, as it always was.
+  const fleet = await insertReport(db, FLEET_SCOPE, {
+    ...item(9), site: 'parla-site', url: '', target: null, contact: null, id: 'fleet-1', created_at: NOW, ip_hash: 'h', fingerprint: 'fp-fleet-1',
+  });
+  assert.equal(fleet.id, 'fleet-1');
+  assert.deepEqual({ ...db.sqlite.prepare("SELECT public, ip_hash FROM reports WHERE id = 'fleet-1'").get() }, { public: 1, ip_hash: 'h' });
 });

@@ -30,7 +30,7 @@
 
 import { redactionFindings } from './redact.js';
 import { ACTIVE_STATES, CLOSED_STATUSES } from './work.js';
-import { tenantKey, scopeKeyId } from './scope.js';
+import { FLEET, tenantKey, scopeKeyId } from './scope.js';
 
 // ── C4: the status vocabulary and the transition tables ───────────────────────
 //
@@ -90,6 +90,13 @@ const refuse = (code, message, hint) => ({ code, message, hint });
  * `app_key_id` is null for every principal that exists in phase 1, because only an `app`
  * principal presents a key. It is written now rather than in phase 2 so that the column
  * list and the VALUES do not have to be touched again to start recording it.
+ *
+ * `public` is 1 for a fleet row, as it always was, and 0 for a tenant row, chosen here from
+ * the scope and never from the request (A16.2: a tenant item is never published). Every
+ * public read seeks `public = 1` (reports_public_log, reports_board, reports_app_board), so a
+ * tenant row sits outside each of those ranges whatever status its owner moves it to, and no
+ * public request reads it only to discard it (condition C2, A46). Nothing a tenant can send
+ * reaches this column: store-tenant.js names it nowhere.
  */
 export async function insertReport(db, scope, row) {
   try {
@@ -99,7 +106,7 @@ export async function insertReport(db, scope, row) {
            (id, created_at, site, url, target_kind, target_id, target_label,
             kind, body, contact, status, public, ip_hash, fingerprint,
             app_id, app_key_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', 1, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'new', ?, ?, ?, ?, ?)
          ON CONFLICT(fingerprint) DO NOTHING`,
       )
       .bind(
@@ -113,6 +120,7 @@ export async function insertReport(db, scope, row) {
         row.kind,
         row.body,
         row.contact || null,
+        tenantKey(scope) === FLEET ? 1 : 0,
         row.ip_hash,
         row.fingerprint,
         tenantKey(scope),

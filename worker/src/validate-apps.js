@@ -16,6 +16,8 @@ export const ORIGINS_MAX = 5;
 export const TENANT_STATUSES = [...new Set([...Object.keys(PERSON_TRANSITIONS), ...Object.values(PERSON_TRANSITIONS).flat()])];
 
 const APP_ID_RE = /^ap[a-z2-7]{14}$/;
+// A Clerk user id, the `sub` of the session token phase 3 verifies (Q3, P2b).
+const OWNER_RE = /^user_[A-Za-z0-9]{1,64}$/;
 const CONTROL_RE = /[\u0000-\u001f\u007f]/;
 const HOST_RE = /^(?:[a-z0-9-]+\.)*[a-z0-9-]+$|^\[[0-9a-f:.]+\]$/;
 const LOOPBACK = ['localhost', '127.0.0.1', '[::1]'];
@@ -62,7 +64,9 @@ export function validateOrigin(raw) {
 
 /**
  * POST /apps: { owner, owner_label?, name, origins? }. In phase 2 the operator registers on a
- * person's behalf and `owner` is an opaque string; phase 3 takes it from the signed-in person.
+ * person's behalf; phase 3 takes `owner` from the signed-in person. Either way it is compared,
+ * byte for byte, with the `sub` of a verified Clerk token (scope.js), so it has to be a Clerk
+ * user id now: an app registered under a name or an address could never be read by its owner.
  * An app id is generated, never chosen, so a body naming one is refused (C6).
  */
 export function validateRegistration(body) {
@@ -72,6 +76,9 @@ export function validateRegistration(body) {
   }
   const owner = label(body.owner, 'owner', OWNER_MAX, { required: true });
   if (owner.code) return owner;
+  if (!OWNER_RE.test(owner.value)) {
+    return bad('The owner has to be the person\'s Clerk user id, which starts with user_.', 'Copy the id from the person\'s page in the Clerk dashboard. Signing in matches that exact id, so an app registered under a name or an address could never be opened by its owner.');
+  }
   const ownerLabel = label(body.owner_label, 'owner_label', OWNER_LABEL_MAX, { required: false });
   if (ownerLabel.code) return ownerLabel;
   const name = label(body.name, 'name', APP_NAME_MAX, { required: true });

@@ -141,11 +141,14 @@ export function ok(provider, body, { origin = null, env = null, headers = {} } =
 /**
  * The one error constructor. Errors are never cached: a retry has to reach the Worker.
  *
- * `cors: false` is the FORBIDDEN_ORIGIN path and only that path. Everywhere else the
- * headers are computed from the origin, which for a denied origin is already {}.
+ * `cors: false` skips the Balise allowlist's headers. Two callers need that: the
+ * FORBIDDEN_ORIGIN path, and every refusal of `POST /apps/:app/items`, whose CORS is the
+ * app's own list (src/routes-apps.js appCors, C6.3) and arrives through `headers`.
+ * Everywhere else the headers are computed from the origin, which for a denied origin is
+ * already {}.
  *
- * `headers` exists for the two public board reads (A8), whose errors must be as readable
- * from another origin as their answers, or a failure there looks like a network fault.
+ * `headers` also carries the two public board reads' `*` (A8), whose errors must be as
+ * readable from another origin as their answers, or a failure there looks like a network fault.
  */
 export function fail(code, { provider = '', message, hint = '', origin = null, env = null, cors = true, headers = {} } = {}) {
   const merged = { 'Cache-Control': 'no-store', ...headers, ...(cors ? corsHeaders(origin, env) : {}) };
@@ -171,21 +174,24 @@ export const tooLarge = (provider, origin, env, maxBytes, hint) =>
  *
  * `allowEmpty` is for the work actions, where a body-less POST (withdraw) means "no
  * fields" rather than a malformed request. Every other route keeps refusing an empty body.
+ *
+ * The default hints speak to a reader at the beacon. A route whose caller is not one, an
+ * integrator on the app API or the console, passes `retryHint` and `tooLargeHint`.
  */
-export async function readJson(request, provider, origin, env, { allowEmpty = false, maxBytes = REQUEST_MAX_BYTES, tooLargeHint } = {}) {
+export async function readJson(request, provider, origin, env, { allowEmpty = false, maxBytes = REQUEST_MAX_BYTES, tooLargeHint, retryHint } = {}) {
   const declared = Number(request.headers.get('Content-Length') || '0');
   if (declared > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
   let text;
   try {
     text = await request.text();
   } catch {
-    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body could not be read.', hint: 'Send it again from the beacon.' }) };
+    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body could not be read.', hint: retryHint || 'Send it again from the beacon.' }) };
   }
   if (new TextEncoder().encode(text).length > maxBytes) return { error: tooLarge(provider, origin, env, maxBytes, tooLargeHint) };
   if (allowEmpty && !text.trim()) return { value: {} };
   try {
     return { value: JSON.parse(text) };
   } catch {
-    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body was not valid JSON.', hint: 'Reopen the beacon on the page you were reading and send it again.' }) };
+    return { error: fail('BAD_FIELD', { provider, origin, env, message: 'The request body was not valid JSON.', hint: retryHint || 'Reopen the beacon on the page you were reading and send it again.' }) };
   }
 }

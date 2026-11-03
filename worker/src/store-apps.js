@@ -166,7 +166,8 @@ export async function mintKey(db, scope, { kind, now }) {
   return { key: shown(k) };
 }
 
-/** A timestamp, never a delete, so a revoked key still posting is recognised rather than unknown. */
+/** A timestamp, never a delete, so the owner's key list still shows the key and an item's app_key_id
+ *  still names it. At ingest a revoked key is answered exactly as an unknown one (KEY_REFUSED). */
 export async function revokeKey(db, scope, { keyId, now }) {
   try {
     const res = await db
