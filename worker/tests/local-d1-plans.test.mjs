@@ -16,10 +16,12 @@
 // AND THAT IS A PROPERTY OF THIS SUITE'S DATABASE, NOT OF THE WORKER'S. Applied to a database that
 // already holds rows, which is what 0005 meets on a desk or on the remote, the same pragma does
 // gather statistics: measured over node:sqlite, no sqlite_stat1 at all before the apply and 24
-// rows of it after, on a 3000-row copy. So a plan pinned here is the unanalysed one, and where the
-// analysed plan differs the migration comment says so. 0005's work-queue paragraph is the one that
-// does: the pre-0005 schema already seeks reports_work_updated for the four-state page once the
-// database has been analysed, and walks the fleet when it has not.
+// rows of it after, on a 3000-row copy. So a plan pinned here is the unanalysed one. 0005's
+// work-queue paragraph was the first place to say where an analysed plan differs (the pre-0005
+// schema already seeks reports_work_updated for the four-state page once the database has been
+// analysed, and walks the fleet when it has not); tests/analysed-plans.test.mjs now pins every
+// one of them, including the statistics a release leaves on production's table, which turn the
+// import's dedupe read into a full scan.
 //
 // WHY THE STATEMENTS ARE TRANSCRIBED. `EXPLAIN QUERY PLAN` needs a statement, and this file
 // cannot ask the store for one: the store's text is built inside a function, with bound
@@ -34,10 +36,16 @@
 // only a statement about scoping if there is a second tenancy in the table to leave out.
 //
 // WHAT IS PINNED SOMEWHERE ELSE, so nobody reads this file as the whole inventory. The work
-// queue's reads (listWork's two page shapes, its tally and the runner's claim pick) are pinned in
-// tests/work.test.mjs, by the same rules, because they need a queue with rows in it and this
-// suite's queue is empty. A transcription proved against an empty answer proves nothing, which
-// is the one thing both files refuse to do.
+// queue's reads (listWork's page shapes and their second pages, its tally, the runner's claim
+// pick and the claim's answer, readDetail by run) are pinned in tests/work.test.mjs, by the same
+// rules, because they need a queue with rows in it and this suite's queue is empty. A
+// transcription proved against an empty answer proves nothing, which is the one thing both files
+// refuse to do.
+//
+// AND THE ANALYSED PLANS, which neither workerd suite can measure, are pinned over node:sqlite in
+// tests/analysed-plans.test.mjs (queue #139): every statement here and in tests/work.test.mjs,
+// captured from the store, on a populated multi-tenant database in three states of statistics.
+// Where those plans differ from the ones below, that file says what each one reads.
 
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -50,6 +58,7 @@ import {
 } from './harness.mjs';
 import { plantTenant, d1For, TENANT_ROWS } from './tenant-rows.mjs';
 import { TENANT, TENANT_MARK } from './tenant-fixture.mjs';
+import { APP_LEADING, APP_KIND_LEADING, FP_UNIQUE } from './plan-ties.mjs';
 // The two the import pins need: the fingerprint the Worker would compute for a (source, ref), and
 // the hash it computes it with. Imported rather than copied, so a change to either shows up here
 // as a failed lookup instead of as a pin on a statement nobody runs.
@@ -325,19 +334,8 @@ test('the tenant fixture reaches neither the board nor the summary', async () =>
 // WHAT THIS DOES NOT PIN. The `rows_read` these plans cost: that is through the route, in
 // tests/local-d1-rows.test.mjs, which is why POST /open-items reports rows_read at all.
 
-/** The indexes that tie for a bare `app_id` seek: app_id leading, no partial predicate. The last
- *  three arrived with 0005 and joined the tie rather than changing anyone's cost: measured,
- *  POST /open-items scanned the same rows before and after they existed. */
-const APP_LEADING = ['reports_app_created', 'reports_app_status_created', 'reports_app_site_created',
-  'reports_app_kind_created', 'reports_app_kind_status_created', 'reports_app_board'];
-/** The three that can serve an (app_id, kind) seek, which is a NARROWER seek than the above and so
- *  a different assertion, not a wider tie list. Which of the three wins is a tie SQLite breaks for
- *  itself: with 0005 applied the sync read takes reports_app_board, and it took
- *  reports_app_kind_status_created when that was the only one of the three that existed. Same two
- *  seek terms, same cost, measured both ways. */
-const APP_KIND_LEADING = ['reports_app_kind_created', 'reports_app_kind_status_created', 'reports_app_board'];
-/** The UNIQUE index on the fingerprint. A28's rule applies here too: this is a measurement. */
-const FP_UNIQUE = ['reports_fp'];
+// The three tie sets, APP_LEADING, APP_KIND_LEADING and FP_UNIQUE, are in tests/plan-ties.mjs,
+// because tests/work.test.mjs and tests/analysed-plans.test.mjs pin seeks of the same shapes.
 
 const SEEK_LINE = /^SEARCH reports USING INDEX (\S+) (\(.+\))$/;
 

@@ -14,11 +14,23 @@ import { fileURLToPath } from 'node:url';
 
 const MIGRATIONS = join(dirname(dirname(fileURLToPath(import.meta.url))), 'migrations');
 
-export function sqliteD1() {
-  const sqlite = new DatabaseSync(':memory:');
-  for (const file of readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort()) {
-    sqlite.exec(readFileSync(join(MIGRATIONS, file), 'utf8'));
-  }
+/** The migration files in the order they apply, for a suite that needs to stop between two. */
+export const MIGRATION_FILES = readdirSync(MIGRATIONS).filter((f) => f.endsWith('.sql')).sort();
+
+/** One migration file, run against a database as the release runs it: the whole file. */
+export function applyMigration(sqlite, file) {
+  sqlite.exec(readFileSync(join(MIGRATIONS, file), 'utf8'));
+}
+
+/**
+ * A fresh in-memory database with every migration applied, or, given `sqlite`, a database a
+ * suite has already built itself. tests/plan-fixture.mjs is the one caller that passes one: it
+ * plants rows between two migrations, so the statistics the later ones gather are the statistics
+ * a release would leave.
+ */
+export function sqliteD1({ sqlite: given } = {}) {
+  const sqlite = given || new DatabaseSync(':memory:');
+  if (!given) for (const file of MIGRATION_FILES) applyMigration(sqlite, file);
   const hooks = { batch: null, statements: [] };
   const log = [];
 
