@@ -14,6 +14,10 @@
 // added to the post-check's list that no migration creates. Stage 1 of the release runs this
 // suite, so a red here stops the release before it reads production.
 //
+// The last test keeps stage 7's reminder about the home page's Open items tab (queue #137)
+// true to index.html, for the same reason: a check that has drifted from what it reads says
+// nothing, and silence reads as all clear.
+//
 // No database other than :memory: and no network: this is a test of the script's text.
 
 import { test } from 'node:test';
@@ -26,6 +30,7 @@ import { fileURLToPath } from 'node:url';
 const MIGRATIONS_DIR = fileURLToPath(new URL('../migrations/', import.meta.url));
 const SCRIPT = fileURLToPath(new URL('../../scripts/release-work-queue.sh', import.meta.url));
 const SOURCE = readFileSync(SCRIPT, 'utf8');
+const INDEX = fileURLToPath(new URL('../../index.html', import.meta.url));
 const FILES = readdirSync(MIGRATIONS_DIR).filter((f) => f.endsWith('.sql')).sort();
 
 /** One shell function's definition, cut out of the script: a one-liner, or up to its closing `}`. */
@@ -225,4 +230,61 @@ test('the post-check finds every name on a fully migrated database and misses on
   });
   assert.deepEqual(lines(gone.out).sort(),
     ['missing column:reports.app_key_id', 'missing index:reports_app_board', 'missing table:app_keys']);
+});
+
+/** Every attribute on one opening tag, with where it sits in the tag: quoted values are skipped whole. */
+function tagAttributes(tag) {
+  return [...tag.matchAll(/\s+([^\s"'=<>/]+)(?:\s*=\s*(?:"[^"]*"|'[^']*'|[^\s"'=<>`]+))?/g)]
+    .map((m) => ({ name: m[1].toLowerCase(), start: m.index, end: m.index + m[0].length }));
+}
+
+test('stage 7 warns that the Open items tab is hidden exactly when index.html hides it (#137)', () => {
+  // bcbe871 hid the home page's tablist while production ran 1.0.0, and the release does not
+  // show it again, so stage 7 reads index.html at the pushed commit and names queue #137 while
+  // the attribute is there. It finds the attribute with a one-line grep. A tablist edited so the
+  // grep no longer sees it (another attribute after hidden, hidden="", the tag split over lines)
+  // would end the release in silence with the board still dark, so the markup decides here,
+  // read attribute by attribute, and the grep has to agree with it.
+  const script = SOURCE.split('\n');
+  const start = script.findIndex((line) => line.startsWith('if ') && line.includes('boardTabs'));
+  assert.ok(start >= 0, 'scripts/release-work-queue.sh no longer checks index.html for the hidden Open items tab');
+  const end = script.findIndex((line, i) => i > start && line === 'fi');
+  assert.ok(end > start, 'the Open items check in scripts/release-work-queue.sh has no closing fi');
+  const block = script.slice(start, end + 1).join('\n');
+
+  const sha = '0123456789abcdef0123456789abcdef01234567';
+  // git answers only the one read the stage makes, the release commit's index.html, and says
+  // anything else on fd 3, since the block sends git's stderr to /dev/null.
+  const warns = (page) => {
+    const body = `exec 3>&2
+warn() { printf 'warn %s\\n' "$1"; }
+note() { printf 'note %s\\n' "$1"; }
+git() { [ "$*" = "-C site show $SHA:index.html" ] || { echo "unexpected git $*" >&3; return 2; }; printf '%s' "$PAGE"; }
+SITE=site SHA=${sha}
+${block}`;
+    const res = sh(body, [], { PAGE: page });
+    assert.equal(res.code, 0, res.err);
+    assert.equal(res.err, '', res.err);
+    return res.out;
+  };
+
+  const html = readFileSync(INDEX, 'utf8');
+  const found = html.match(/<[a-z][a-z0-9-]*\b[^>]*\sid="boardTabs"[^>]*>/i);
+  assert.ok(found, 'index.html has no #boardTabs element, which stage 7 and js/board.js both read');
+  const tag = found[0];
+  const hiddenAttr = tagAttributes(tag).find((a) => a.name === 'hidden');
+  const swap = (newTag) => html.slice(0, found.index) + newTag + html.slice(found.index + tag.length);
+  const shownTag = hiddenAttr ? tag.slice(0, hiddenAttr.start) + tag.slice(hiddenAttr.end) : tag;
+  // The form bcbe871 wrote: a bare hidden, last.
+  const hiddenTag = shownTag.replace(/\s*>$/, ' hidden>');
+
+  const atHead = warns(html);
+  assert.equal(atHead !== '', Boolean(hiddenAttr), hiddenAttr
+    ? `index.html hides #boardTabs but stage 7's check does not see it, so the release would say nothing:\n  ${tag}`
+    : `index.html shows #boardTabs but stage 7's check still warns:\n  ${tag}`);
+
+  assert.equal(warns(swap(shownTag)), '', 'stage 7 warns about a tablist that is not hidden');
+  const said = warns(swap(hiddenTag));
+  assert.match(said, /^warn .*Open items tab is still hidden at 0123456789ab\b/m);
+  assert.match(said, /^note .*queue #137.*hidden on #boardTabs in index\.html/m);
 });
