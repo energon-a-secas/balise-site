@@ -44,7 +44,10 @@ Vendored from `packages/neorgon-ui/`, never edit in place; run the sync script i
 
 ## Gotchas
 
-TODO: the non-obvious failures. What broke here before, what looks wrong but is deliberate, what a reasonable change would break. This is the highest-value section; leave it empty rather than filling it with generic advice.
+- **A new migration needs two lines in the release script.** `scripts/release-work-queue.sh` applies whatever `worker/migrations` holds at the release commit, and names and reads back each file from its `migration_note` and `migration_objects` tables. Stage 2 refuses a file missing from them, and `worker/tests/release-script.test.mjs` fails first, printing what the file creates. Before those tables existed the script narrated "0002 and 0003" while it would also have applied 0004 and 0005 (queue `#138`).
+- **Never add to a migration that may have been applied; add a new numbered file.** `d1_migrations` records a file by name with no hash, so a re-run skips it, and `make d1-check` compares tables and columns only, so an index added to an old file reaches no database and nothing reports it. The measurement is in the header of `worker/migrations/0005_indexes.sql`.
+- **The release script's `#76` gate imports `publicLog` by file path** (`GATE76_MODULE`). It kept importing `store.js` after `248e104` moved `publicLog` to `store-public.js`, and reported the missing export as "#76 is not in this tree". The test now runs the gate against the tree.
+- **"You installed workerd on another platform" is a misleading error.** It means `worker/node_modules/@cloudflare/workerd-darwin-arm64/bin/` lost its binary, and every local-D1 test in `make worker-test` fails with it. The fix is `npm ci` inside `worker/`, which is not a root workspace member, so it does not prune the root's `node_modules`.
 
 ## Do not touch
 
