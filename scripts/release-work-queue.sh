@@ -1012,6 +1012,13 @@ for _ in $(seq 1 12); do
   sleep 10
 done
 if [ "$live" = yes ]; then ok "the live desk has its Work view"; else warn "Pages has not served it yet. Check again in a few minutes."; fi
+# The home page's Open items tab is a change of its own (queue #137): bcbe871 hid it while
+# production ran 1.0.0, and the deploy does not show it. Read from the pushed commit, so a
+# release that already carries the change says nothing here.
+if grep -q 'id="boardTabs"[^>]* hidden>' <<<"$(git -C "$SITE" show "$SHA:index.html" 2>/dev/null)"; then
+  warn "The home page's Open items tab is still hidden at ${SHA:0:12}, though production serves the board now."
+  note "  Turning it on is queue #137: delete hidden on #boardTabs in index.html, commit and push."
+fi
 pause
 
 # ── 8 ───────────────────────────────────────────────────────────────────────
