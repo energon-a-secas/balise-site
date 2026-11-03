@@ -199,7 +199,7 @@ WR="npx --prefix $SITE/worker wrangler --cwd $SITE/worker"
 
 # Set by stages 1 and 2, declared here so the exit trap can read them on any path.
 SHA=''; LIVE_VERSION=''; ACTIVE_ID=''; PREV_ID=''; PREV_VERSION=''; WORKER_FILE=''
-BOOKMARK=''; RESTORE_FILE=''; PENDING=''; COLS=''; MINT_SUM=''
+BOOKMARK=''; RESTORE_FILE=''; MIGRATIONS=''; PENDING=''; COLS=''; OBJECTS=''; MINT_SUM=''
 CLIP_ARMED=0; DEPLOY_STARTED=0; WAY_BACK_SCREEN=-1
 
 # ── JSON ────────────────────────────────────────────────────────────────────
@@ -247,11 +247,91 @@ live_version() {
 # Grepped from a here-string, never from a pipe: under pipefail a `| grep -q` that matches
 # early kills the writer with SIGPIPE and reads as no match.
 has_col() { grep -qxF -- "$1" <<<"$COLS"; }
-is_pending() { grep -qxF -- "$1" <<<"$PENDING"; }
 pending_after() { LC_ALL=C comm -23 <(printf '%s\n' "$MIGRATIONS") <(printf '%s\n' "$1" | LC_ALL=C sort); }
 
 # The last of the files named, which for release-<stamp> names is the newest.
 newest() { local f latest=''; for f in "$@"; do [ -f "$f" ] && latest=$f; done; printf '%s' "$latest"; }
+
+# ── The migrations ──────────────────────────────────────────────────────────
+# What each file in worker/migrations is for, in one line, and every table, index and added
+# reports column it creates, one kind:name per line. Stage 3 narrates the first and reads the
+# second back from production after applying. A file missing from either stops stage 2 with
+# nothing changed, so a new migration cannot reach production unnamed: this script used to
+# say "0002 and 0003" on three screens while it would also have applied 0004 and 0005.
+# worker/tests/release-script.test.mjs builds a database one migration at a time and fails
+# when these tables disagree with what the files create, or when a file is missing from them.
+migration_note() {
+  case $1 in
+    0001_baseline.sql) printf '%s\n' "the baseline, all CREATE ... IF NOT EXISTS, so it changes nothing on a database built from schema.sql" ;;
+    0002_open_items.sql) printf '%s\n' "the open-item columns on reports and their indexes" ;;
+    0003_work.sql) printf '%s\n' "the work columns on reports, the work_runs table and their indexes" ;;
+    0004_tenants.sql) printf '%s\n' "reports.app_id, DEFAULT 'fleet' so every existing report is the fleet's, and reports.app_key_id; the apps and app_keys tables; app_id-leading indexes on reports; then PRAGMA optimize" ;;
+    0005_indexes.sql) printf '%s\n' "four more app_id-leading indexes on reports, for the desk's open tab, the board and the work queue; then PRAGMA optimize" ;;
+    *) return 1 ;;
+  esac
+}
+
+# A column is column:<table>.<name>, and only ever on reports: that is the one table the
+# post-check reads columns from, and the test fails on a column added anywhere else.
+migration_objects() {
+  case $1 in
+    0001_baseline.sql) printf '%s\n' table:reports table:auth_attempts table:submit_counters \
+      index:reports_status_created index:reports_created index:reports_public_log \
+      index:reports_site_created index:reports_fp ;;
+    0002_open_items.sql) printf '%s\n' column:reports.source column:reports.source_ref \
+      column:reports.suggested column:reports.opened_at column:reports.source_closed_at \
+      index:reports_board index:reports_open_created index:reports_open_status_created \
+      index:reports_fix_created index:reports_fix_status_created index:reports_fix_public_log ;;
+    0003_work.sql) printf '%s\n' column:reports.work_state column:reports.work_mode \
+      column:reports.work_instruction column:reports.work_run column:reports.work_attempts \
+      column:reports.work_lease_until column:reports.work_approved_at \
+      column:reports.work_updated_at column:reports.filed_by table:work_runs \
+      index:reports_work_updated index:reports_work_run index:work_runs_report ;;
+    0004_tenants.sql) printf '%s\n' column:reports.app_id column:reports.app_key_id \
+      table:apps table:app_keys index:apps_owner index:app_keys_hash index:app_keys_app \
+      index:reports_app_created index:reports_app_status_created index:reports_app_fix_created \
+      index:reports_app_fix_status_created index:reports_app_fix_public_log \
+      index:reports_app_site_created ;;
+    0005_indexes.sql) printf '%s\n' index:reports_app_kind_created \
+      index:reports_app_kind_status_created index:reports_app_board index:reports_app_work_updated ;;
+    *) return 1 ;;
+  esac
+}
+
+# "5 columns, 6 indexes": what one migration creates, counted from the table above.
+migration_counts() {
+  local objects kind n word out=''
+  objects=$(migration_objects "$1") || return 1
+  for kind in column table index; do
+    n=$(grep -c "^$kind:" <<<"$objects")
+    case $n in
+      0) continue ;;
+      1) word=$kind ;;
+      *) if [ "$kind" = index ]; then word=indexes; else word=${kind}s; fi ;;
+    esac
+    out+="${out:+, }$n $word"
+  done
+  printf '%s\n' "${out:-nothing new}"
+}
+
+# How many of the indexes the migrations at the recorded commit create lead on app_id. The
+# test holds the naming rule this counts by: an index on reports leads on app_id exactly when
+# its name starts reports_app_.
+tenant_indexes() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] && migration_objects "$f"
+  done <<<"$MIGRATIONS" | grep -c '^index:reports_app_'
+}
+
+# Whether production holds a name from migration_objects. Reads $COLS and $OBJECTS, which the
+# caller fills first.
+has_object() {
+  case $1 in
+    column:reports.*) has_col "${1#column:reports.}" ;;
+    *) grep -qxF -- "$1" <<<"$OBJECTS" ;;
+  esac
+}
 
 # ── Guards ──────────────────────────────────────────────────────────────────
 # The tree the suite ran is what migrates, deploys and is pushed. Checked in stage 1 and
@@ -294,16 +374,31 @@ tree_ok() {
 # restore while it runs breaks the desk, the board and /work while /health still reads
 # store_ok. And a bare `wrangler rollback` takes the deployment before the newest, which
 # after stage 5's secret put is this release again, so only the recorded id goes back.
+#
+# The rollback leaves the database as the migrations made it. That is the design (the root
+# repo's docs/delivery/DESIGN.md section 6.3: do nothing to the database), and it includes the
+# app_id-leading indexes of 0004 and 0005: a rollback restores the Worker and not the planner,
+# and what the older Worker's queries are planned onto with those indexes present is measured
+# only on local D1 (queue #139). The screen names them, so that "a complete way back" is not
+# read as "the database is as it was before the release".
 way_back() {
+  local n
   WAY_BACK_SCREEN=$CURRENT_STAGE
+  n=$(tenant_indexes)
   printf '\n'
   say "${BOLD}If you back out of this release, in this order:${RESET}"
   step "1. Roll the Worker back to the version that ran before it, $PREV_VERSION:"
   say "     $WR rollback $PREV_ID"
   note "   Its prompt names the version it deploys, which must read $PREV_ID. If it lists"
   note "   secrets changed since then, go on. Then $API/health must report $PREV_VERSION."
-  note "   0002 and 0003 only add columns, a table and indexes, and $PREV_VERSION runs on them,"
-  note "   so this step alone is a complete way back."
+  note "   Every migration at ${SHA:0:12} only adds columns, tables and indexes, and"
+  note "   $PREV_VERSION runs on them, so this step alone is a complete way back. It leaves"
+  note "   the database as the migrations made it, and that is intended."
+  if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
+    note "   That includes the $n app_id-leading indexes on reports: $PREV_VERSION's queries are"
+    note "   planned with them present, which is measured only on local D1 (queue #139)."
+    note "   Leave them: dropping an index is no part of this way back."
+  fi
   if [ -n "$BOOKMARK" ]; then
     step "2. Only if a migration itself damaged data, and only after step 1, restore the database:"
     say "     $WR d1 time-travel restore balise --bookmark=$BOOKMARK"
@@ -363,8 +458,15 @@ banner "Balise release: the work queue"
 say "Production ran Worker 1.0.0 before this release: no board, no work queue. This takes it"
 say "to $RELEASE_VERSION, turns on the automation credential, and publishes the desk and board."
 printf '\n'
+# 248e104 put the phase 1 tenant seam on main under this same VERSION, so the 1.1.0 this
+# releases is the one with it; the pre-tenant 1.1.0 is not on any branch this script reads.
+say "The $RELEASE_VERSION on $BRANCH also carries the tenant seam (balise-site 248e104): every statement"
+say "on reports names app_id, and every caller this build has is the fleet's. So it needs"
+say "migration 0004, and 0005 gives the desk, board and work reads indexes that lead on app_id."
+say "No app can register yet: that is 1.2.0, which this script does not release."
+printf '\n'
 say "It asks before each of these and does nothing without a yes:"
-step "apply D1 migrations 0002 and 0003 to the production database"
+step "apply the D1 migrations production has not recorded (stage 2 names each one)"
 step "deploy the Worker"
 step "mint the automation token, keep it in the Keychain, set it on the Worker"
 step "import the trackers into production as PRIVATE drafts"
@@ -383,12 +485,23 @@ SHA=$(git -C "$SITE" rev-parse HEAD) || { fail "could not read HEAD in $SITE"; e
 for f in worker/migrations/0003_work.sql worker/src/store-work-runner.js js/desk-work.js js/desk-run.js tools/work.mjs; do
   git -C "$SITE" cat-file -e "$SHA:$f" 2>/dev/null || { fail "HEAD has no $f. Commit the work queue first."; exit 1; }
 done
+# What the banner says this release carries. The Worker at HEAD cannot run without 0004, and
+# 0005 is the index fix that gated the release (queue #136).
+for f in worker/src/scope.js worker/migrations/0004_tenants.sql worker/migrations/0005_indexes.sql; do
+  git -C "$SITE" cat-file -e "$SHA:$f" 2>/dev/null || { fail "HEAD has no $f, which this release is written for."; exit 1; }
+done
 INDEX_JS=$(git -C "$SITE" show "$SHA:worker/src/index.js") || { fail "could not read worker/src/index.js at HEAD"; exit 1; }
 case $INDEX_JS in
   *"const VERSION = '$RELEASE_VERSION';"*) ;;
-  *) fail "worker/src/index.js at HEAD does not declare VERSION $RELEASE_VERSION, which every check below expects."; exit 1 ;;
+  *)
+    FOUND=$(sed -n "s/^const VERSION = '\([^']*\)';.*/\1/p" <<<"$INDEX_JS" | head -n 1)
+    fail "worker/src/index.js at HEAD declares VERSION ${FOUND:-none that this script can read}, and this script releases $RELEASE_VERSION only."
+    say "Every check below is written for $RELEASE_VERSION. A later VERSION, such as 1.2.0 for the"
+    say "multi-tenant work (queue #83), needs a release path of its own, which is queue #138."
+    say "Do not change RELEASE_VERSION to get past this: the checks would still be $RELEASE_VERSION's."
+    exit 1 ;;
 esac
-ok "on $BRANCH at ${SHA:0:12}, clean, with the work queue committed"
+ok "on $BRANCH at ${SHA:0:12}, clean, with the work queue and the tenant seam committed"
 
 # Queue #76 must land first: this Worker's GET /log serves each fixed report's full page
 # address, which would publish Vitrina shelf handles and working Sash claim links. Both
@@ -420,8 +533,16 @@ fi
 # The fix, run rather than grepped: publicLog from worker/src at the recorded commit gets an
 # address with userinfo, a query and a fragment, and passes only if the origin and path are
 # all that survive. A queue closed while the fix sits on a branch fails here.
+#
+# publicLog lives in store-public.js since 248e104 split it out of store.js. This gate kept
+# importing store.js, found no publicLog, and reported that as "#76 is not in this tree" at
+# every commit since, so a gate that cannot run now says so instead (exit 3), and
+# worker/tests/release-script.test.mjs runs this code against GATE76_MODULE in the tree.
+GATE76_MODULE=worker/src/store-public.js
 NODE_GATE76='import { pathToFileURL } from "node:url";
-const { publicLog } = await import(pathToFileURL(process.argv[1]).href);
+let publicLog;
+try { ({ publicLog } = await import(pathToFileURL(process.argv[1]).href)); } catch { process.exit(3); }
+if (typeof publicLog !== "function") process.exit(3);
 const row = { id: "r1", kind: "correction", status: "fixed", public: 1, site: "vitrina-site",
   url: "https://zzuser:zzpass@vitrina.neorgon.com/u/?zzhandle=1#zzfrag",
   target_label: null, public_note: "Fixed.", fixed_ref: null, fixed_at: 1 };
@@ -436,13 +557,20 @@ if ! git -C "$SITE" archive "$SHA" worker/src | tar -x -C "$GATE_DIR"; then
   fail "could not copy worker/src at ${SHA:0:12} to check #76"
   exit 1
 fi
-if ! node --input-type=module -e "$NODE_GATE76" "$GATE_DIR/worker/src/store.js" </dev/null >/dev/null 2>&1; then
-  rm -rf "$GATE_DIR"
-  fail "publicLog at ${SHA:0:12} publishes more of an address than its origin and path: #76 is not in this tree."
-  say "Commit the #76 fix to balise-site (its steps are in $QUEUE), then run this again."
-  exit 1
-fi
+node --input-type=module -e "$NODE_GATE76" "$GATE_DIR/$GATE76_MODULE" </dev/null >/dev/null 2>&1
+GATE76=$?
 rm -rf "$GATE_DIR"
+case $GATE76 in
+  0) ;;
+  1)
+    fail "publicLog at ${SHA:0:12} publishes more of an address than its origin and path: #76 is not in this tree."
+    say "Commit the #76 fix to balise-site (its steps are in $QUEUE), then run this again."
+    exit 1 ;;
+  *)
+    fail "could not run publicLog from $GATE76_MODULE at ${SHA:0:12}, so #76 cannot be shown fixed."
+    say "If publicLog has moved, point GATE76_MODULE in this script at the file that exports it."
+    exit 1 ;;
+esac
 ok "queue #76 is closed, and publicLog at HEAD cuts an address to its origin and path"
 
 WHO=$(W whoami </dev/null 2>/dev/null) || WHO=''
@@ -509,6 +637,19 @@ if ! MIGRATIONS=$(git -C "$SITE" ls-tree --name-only "$SHA" worker/migrations/ |
   fail "could not list worker/migrations at ${SHA:0:12}"
   exit 1
 fi
+# Every migration at the commit, applied or not, has to be one this script can name: stage 3's
+# narration, its post-check and the way back are all written from those two tables.
+UNNAMED=''
+while IFS= read -r f; do
+  if ! migration_note "$f" >/dev/null || ! migration_objects "$f" >/dev/null; then UNNAMED+="      $f"$'\n'; fi
+done <<<"$MIGRATIONS"
+if [ -n "$UNNAMED" ]; then
+  fail "this script cannot say what these migrations at ${SHA:0:12} do, so it does not apply them:"
+  printf '%s' "$UNNAMED"
+  say "Name each in migration_note and migration_objects in scripts/release-work-queue.sh."
+  say "worker/tests/release-script.test.mjs prints what each one creates. Nothing was changed."
+  exit 1
+fi
 if ! TABLE=$(d1_names "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'd1_migrations'"); then
   fail "could not read the production database. Nothing was changed."
   exit 1
@@ -535,13 +676,24 @@ if ! COLS=$(d1_names "SELECT name FROM pragma_table_info('reports')") || ! has_c
   exit 1
 fi
 # A column that exists while its migration is still pending means someone changed the
-# database by hand. Applying on top of that fails on its first statement, so stop and say why.
-if is_pending 0002_open_items.sql && has_col source; then
-  fail "0002 is pending but its columns already exist. Reconcile d1_migrations by hand first."
-  exit 1
-fi
-if is_pending 0003_work.sql && has_col work_state; then
-  fail "0003 is pending but its columns already exist. Reconcile d1_migrations by hand first."
+# database by hand. ALTER TABLE ADD COLUMN has no IF NOT EXISTS, so applying on top of that
+# fails at the colliding statement: stop first and say why. Every column a migration adds is
+# checked, 0004's app_id and app_key_id included. Every other statement in the migrations is
+# CREATE ... IF NOT EXISTS or PRAGMA optimize (the test holds them to that), which is why
+# 0001 and 0005, which add no column, need no guard: there is nothing for them to collide with.
+COLLIDE=''
+while IFS= read -r f; do
+  [ -n "$f" ] || continue
+  while IFS= read -r o; do
+    case $o in
+      column:reports.*) if has_col "${o#column:reports.}"; then COLLIDE+="      $f adds reports.${o#column:reports.}"$'\n'; fi ;;
+    esac
+  done < <(migration_objects "$f")
+done <<<"$PENDING"
+if [ -n "$COLLIDE" ]; then
+  fail "these migrations are pending, but production already has their columns:"
+  printf '%s' "$COLLIDE"
+  say "Applying them would fail at that column. Reconcile d1_migrations by hand first. Nothing was changed."
   exit 1
 fi
 ok "the schema matches the migrations production has recorded"
@@ -585,9 +737,22 @@ stage "Apply the migrations to production"
 if [ -z "$PENDING" ]; then
   ok "production already records every migration in ${SHA:0:12}. Nothing to apply."
 else
-  say "Applies, in order: $(tr '\n' ' ' <<<"$PENDING")"
-  note "0001 is CREATE ... IF NOT EXISTS, so it changes nothing on a database built from schema.sql."
-  note "0002 and 0003 add columns, one table and indexes. Worker $PREV_VERSION keeps working on them."
+  say "Applies, in order:"
+  OPTIMIZES=''
+  while IFS= read -r f; do
+    step "$f: $(migration_note "$f")"
+    note "    creates $(migration_counts "$f")"
+    # A here-string, not a pipe into grep -q: see has_col.
+    if grep -qx 'PRAGMA optimize;' <<<"$(git -C "$SITE" show "$SHA:worker/migrations/$f" 2>/dev/null)"; then
+      OPTIMIZES+="${OPTIMIZES:+ and }${f%%_*}"
+    fi
+  done <<<"$PENDING"
+  note "Each one only adds columns, tables and indexes. Worker $PREV_VERSION keeps working on them."
+  if [ -n "$OPTIMIZES" ]; then
+    note "$OPTIMIZES run PRAGMA optimize. On production's populated reports table that gathers the"
+    note "planner statistics no test database has, so production plans its reads on statistics"
+    note "the suite never measured (queue #139)."
+  fi
   confirm "Apply these migrations to the PRODUCTION database now?"
   # wrangler applies the files on disk, so they have to still be the commit the suite ran.
   tree_ok || exit 1
@@ -606,12 +771,28 @@ if ! APPLIED=$(d1_names "SELECT name FROM d1_migrations ORDER BY id") || [ -n "$
   fail "production does not record every migration in ${SHA:0:12} as applied"
   exit 1
 fi
+# Recorded is not the same as present, so every name the migrations create is read back: each
+# added reports column, and each table and index from sqlite_master, 0004's tenant columns,
+# apps, app_keys and the app_id-leading indexes of 0004 and 0005 among them.
 if ! COLS=$(d1_names "SELECT name FROM pragma_table_info('reports')") \
-   || ! has_col source || ! has_col work_state || ! has_col filed_by; then
-  fail "the open-item and work columns are not all in the production reports table"
+   || ! OBJECTS=$(d1_names "SELECT type || ':' || name AS name FROM sqlite_master WHERE type IN ('table', 'index')"); then
+  fail "could not read the production schema back after the migrations"
   exit 1
 fi
-ok "production records every migration and has the open-item and work columns"
+MISSING=''
+while IFS= read -r f; do
+  while IFS= read -r o; do
+    if [ -n "$o" ] && ! has_object "$o"; then MISSING+="      $f: $o"$'\n'; fi
+  done < <(migration_objects "$f")
+done <<<"$MIGRATIONS"
+if [ -n "$MISSING" ]; then
+  fail "production records every migration, but lacks what these create:"
+  printf '%s' "$MISSING"
+  say "The Worker was not deployed. The database differs from its own migration record: find out"
+  say "why before going on. $RELEASE_VERSION reads those columns and tables, and its plans assume those indexes."
+  exit 1
+fi
+ok "production records every migration and holds every column, table and index they create"
 pause
 
 # ── 4 ───────────────────────────────────────────────────────────────────────
