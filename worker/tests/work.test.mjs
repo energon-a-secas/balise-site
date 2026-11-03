@@ -13,6 +13,7 @@ import {
   WORKER_DIR, TOKEN, AI_TOKEN, SALT, TURNSTILE_PASS,
   migrate, run, startWorker, stopWorker, requester, report, seedReports, seedOpenItems,
 } from './harness.mjs';
+import { APP_LEADING } from './plan-ties.mjs';
 import { rowsReadBudget } from '../src/store.js';
 import { MAX_ATTEMPTS } from '../src/work.js';
 
@@ -346,6 +347,9 @@ test('a lease runs out in real time, and the next claim takes the item over', as
   assert.equal(second.body.item.work.run.runner, 'second');
   assert.equal(second.body.item.work.attempts, 2);
   assert.equal(second.body.item.runs[1].end_reason, 'expired');
+  // Kept for the plan pins below: this answer is readDetail by run, and nothing moves this item
+  // again before they read it.
+  claims.takeover = second.body.item;
 
   const stale = await ai(`/work/${row.id}/heartbeat`, { run: first.body.item.work.run.id });
   assert.equal(stale.res.status, 409, 'an expired run revived over the run that replaced it');
@@ -440,12 +444,26 @@ const RUN_JOINED = ['id', 'attempt', 'runner', 'mode', 'instruction', 'claimed_a
 
 /** The page, for a set of states rendered as literals. IN_PROGRESS plus approved is what
  *  GET /work answers with no `state`, and the four-element list is what moved the plan: at one
- *  state the read stayed on reports_work_updated even before the fix. */
-const workPage = (states, limit) => `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED}
+ *  state the read stayed on reports_work_updated even before the fix.
+ *
+ *  `before` is the keyset cursor, `{ updatedAt, id }` as validateWorkList parses it, rendered into
+ *  CURSOR_TERM from src/store-work.js. The second page had no pin until queue #139 (item 2), which
+ *  is the same gap the first page had before 0005: a cursor term is a range on the index's third
+ *  column, and nothing showed the planner still took it. */
+const workPage = (states, limit, before = null) => `SELECT ${ITEM_COLUMNS}, ${RUN_JOINED}
   FROM reports r LEFT JOIN work_runs w ON w.id = r.work_run
   WHERE r.work_state IS NOT NULL AND r.work_state IN (${states.map((s) => `'${s}'`).join(',')})
-    AND r.app_id = 'fleet'
+    AND r.app_id = 'fleet' ${before ? `AND r.work_updated_at <= ${before.updatedAt} AND (r.work_updated_at < ${before.updatedAt}
+    OR (r.work_updated_at = ${before.updatedAt} AND r.id < '${before.id}'))` : ''}
   ORDER BY r.work_updated_at DESC, r.id DESC LIMIT ${limit}`;
+
+/** `next` as GET /work answers it, back into the cursor workPage takes. */
+const cursorOf = (next) => {
+  const at = next.indexOf(':');
+  return { updatedAt: Number(next.slice(0, at)), id: next.slice(at + 1) };
+};
+/** A cursor no row is past, for a pin: the plan of a range does not depend on where it starts. */
+const ANY_CURSOR = { updatedAt: Number.MAX_SAFE_INTEGER, id: NOT_A_RUN };
 
 /** CLAIMABLE from src/store-work-runner.js, with the lease instant and the attempt cap rendered.
  *  MAX_ATTEMPTS is imported rather than typed, so a change to the cap cannot leave this pinning
@@ -455,12 +473,23 @@ const claimPick = `SELECT id FROM reports WHERE work_state IS NOT NULL
   AND work_attempts < ${MAX_ATTEMPTS}
   AND app_id = 'fleet' ORDER BY work_approved_at LIMIT 1`;
 
+const ACTIVE_FOUR = ['approved', 'claimed', 'review', 'accepted'];
+
 const WORK_STATEMENTS = {
-  'listWork, the active four': workPage(['approved', 'claimed', 'review', 'accepted'], 50),
+  'listWork, the active four': workPage(ACTIVE_FOUR, 50),
+  'listWork, the active four, page 2': workPage(ACTIVE_FOUR, 50, ANY_CURSOR),
   'listWork, one state': workPage(['done'], 1),
+  'listWork, one state, page 2': workPage(['done'], 1, ANY_CURSOR),
   'listWork, the tally': 'SELECT work_state, COUNT(*) AS n FROM reports WHERE work_state IS NOT NULL GROUP BY work_state',
   'claimWork, the pick': claimPick,
 };
+
+/** readDetail(db, 'run', id) from src/store-work.js: DETAIL_COLUMNS over the same join, keyed on
+ *  the run. The SELECT every successful POST /work/claim answers with. */
+const DETAIL_COLUMNS = `${ITEM_COLUMNS}, r.url, r.target_kind, r.target_id, r.target_label, r.opened_at, r.source_closed_at`;
+const detailByRun = (run) => `SELECT ${DETAIL_COLUMNS}, ${RUN_JOINED}
+  FROM reports r LEFT JOIN work_runs w ON w.id = r.work_run
+  WHERE r.work_run = '${run}' AND r.app_id = 'fleet'`;
 
 // Measured, not intended. The four-state page keeps its temp b-tree because the IN list makes the
 // sort span four seeks; the single-state page loses the one it used to take for the LAST TERM of
@@ -480,19 +509,36 @@ const WORK_STATEMENTS = {
 // the last pin below is the fragile one: ANALYZE the database and claimWork's pick becomes a
 // MULTI-INDEX OR, taking reports_app_work_updated once per arm of the OR on (app_id=? AND
 // work_state=?), which is a BETTER plan than the one pinned and a different string. Nothing
-// analyses a test database today. If something starts, that pin is the first thing it will break,
-// and the plan is not what will have gone wrong.
+// analyses THIS database. If something starts, that pin is the first thing it will break, and
+// the plan is not what will have gone wrong.
+//
+// THE ANALYSED PLANS ARE PINNED, over node:sqlite, in tests/analysed-plans.test.mjs (queue #139):
+// the same statements, captured from the store rather than transcribed, on a populated
+// multi-tenant database with no statistics, with its own statistics, and with the statistics a
+// release leaves behind. The MULTI-INDEX OR above is pinned there. So is the other half of the
+// second-page question below: #139 said an analysed database takes the unscoped
+// reports_work_updated for it, and that file could not reproduce it.
 //
 // THE TALLY IS THE LOAD-BEARING LINE HERE. It takes reports_work_updated, 0003's unscoped index,
 // and it always will: it carries no tenant term at all, deliberately and by invariant 4.3, so an
 // app_id-leading index is not a candidate for it. That is the measurement that says 0005's
 // reports_app_work_updated does not supersede it and no drop list may hold it.
+//
+// THE SECOND PAGES seek the cursor as a range on the index's third column, so a deep page costs a
+// page and not every newer row of its state. That is the `<=` bound's whole job (see CURSOR_TERM).
 const WORK_PLANS = {
   'listWork, the active four': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=?)'
     + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
     + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)'
     + ' | USE TEMP B-TREE FOR ORDER BY',
+  'listWork, the active four, page 2': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=? AND work_updated_at<?)'
+    + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
+    + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)'
+    + ' | USE TEMP B-TREE FOR ORDER BY',
   'listWork, one state': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=?)'
+    + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
+    + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)',
+  'listWork, one state, page 2': 'SEARCH r USING INDEX reports_app_work_updated (app_id=? AND work_state=? AND work_updated_at<?)'
     + ' | SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
     + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)',
   'listWork, the tally': 'SEARCH reports USING COVERING INDEX reports_work_updated (work_state>?)',
@@ -521,12 +567,68 @@ test('the queue\'s reads seek their own index, the tally keeps the unscoped one,
   assert.ok(rows.length > 0, 'the active queue is empty, so this comparison is two empty lists agreeing');
   assert.deepEqual(rows.map((r) => r.id), body.items.map((i) => i.id), 'the transcribed page is not the page the route answers');
 
+  // The second pages, with the cursor the route itself handed out, so the transcription's
+  // CURSOR_TERM is proved on the one form of cursor GET /work accepts. A page of 2 over the active
+  // four and of 1 over the finished, because those are what leave a second page on this queue.
+  for (const [query, states, limit] of [['', ACTIVE_FOUR, 2], ['&state=done', ['done'], 1]]) {
+    const first = await op(`/work?limit=${limit}${query}`);
+    assert.ok(first.body.next, `GET /work?limit=${limit}${query} has one page, so its second page proves nothing`);
+    const second = await op(`/work?limit=${limit}${query}&before=${encodeURIComponent(first.body.next)}`);
+    const [page] = await d1(workPage(states, limit, cursorOf(first.body.next)));
+    assert.ok(page.length > 0, `the second page of ${query || 'the active four'} is empty, so this comparison is two empty lists agreeing`);
+    assert.deepEqual(page.map((r) => r.id), second.body.items.map((i) => i.id), `the transcribed second page of ${query || 'the active four'} is not the route's`);
+  }
+
   // WHAT IS DELIBERATELY NOT ASSERTED HERE: a number. This fleet is about twenty reports, and the
   // regressed plan cost the fleet's whole slice plus the tally, so a ceiling separating it from
   // the fixed plan would be a handful of rows wide and would be measuring the LEFT JOIN's own
   // reads as much as the seek. The page's cost is bounded where the fixture can carry it, against
   // a fleet of ninety rows and an empty queue, in tests/local-d1-rows.test.mjs. The single-state
   // page already has a budget in the test above. What this test owns is the plan.
+});
+
+// readDetail by run had no pin until queue #139 (item 1), although it runs on every successful
+// POST /work/claim: claimWork answers with it. 0005_indexes.sql measured it seeking `app_id`
+// ALONE and testing the run per row, so the claim's answer costs the fleet's whole slice of the
+// table, and left (app_id, work_run) as an open item. This pins that measurement where the claim
+// that pays for it runs.
+//
+// PINNED BY SEEK SHAPE, because the index is a tie: every app_id-leading index without a partial
+// predicate gives the same one-column seek at the same cost (tests/plan-ties.mjs, and the import
+// pins in tests/local-d1-plans.test.mjs, which is where the argument is made).
+//
+// ON THIS DATABASE ONLY. With planner statistics of any kind this read takes the partial
+// reports_work_run and reads one row; tests/analysed-plans.test.mjs pins both. So the fleet-slice
+// cost is what an UNANALYSED database pays, which this suite and a fresh desk are.
+test('#139 item 1: the claim\'s answer seeks the fleet\'s slice on an unanalysed database, and the transcription is the claim\'s own read', async () => {
+  const [plan] = await d1(`EXPLAIN QUERY PLAN ${detailByRun(NOT_A_RUN)}`);
+  const lines = plan.map((r) => r.detail);
+  const seek = /^SEARCH r USING INDEX (\S+) (\(.+\))$/.exec(lines[0]);
+  assert.ok(seek, `readDetail by run no longer opens with one index SEARCH: ${lines.join(' | ')}`);
+  assert.equal(seek[2], '(app_id=?)', `readDetail by run seeks ${seek[2]} where it sought (app_id=?): a cost change, not a tie-break`);
+  assert.ok(APP_LEADING.includes(seek[1]), `readDetail by run seeks (app_id=?) on ${seek[1]}, outside the tie set. If the seek is unchanged, add the index to tests/plan-ties.mjs rather than deleting this.`);
+  assert.equal(lines.slice(1).join(' | '), 'SEARCH w USING INDEX sqlite_autoindex_work_runs_1 (id=?) LEFT-JOIN'
+    + ' | CORRELATED SCALAR SUBQUERY 1 | SEARCH n USING INDEX work_runs_report (report_id=?)');
+
+  // The answer: the run a real claim made, read back by the transcription, is the item that claim
+  // answered with. claimWork's answer IS readDetail(db, 'run', runId), so equal fields are the
+  // proof that the copy above is the statement the claim runs.
+  const answered = claims.takeover;
+  assert.ok(answered, 'the lease test did not record its claim');
+  const [rows] = await d1(detailByRun(answered.work.run.id));
+  assert.equal(rows.length, 1, `the claim's run matched ${rows.length} rows`);
+  const [row] = rows;
+  assert.deepEqual(
+    [row.id, row.work_state, row.work_run, row.work_attempts, row.body, row.run_runner],
+    [answered.id, answered.work.state, answered.work.run.id, answered.work.attempts, answered.body, answered.work.run.runner],
+    'the transcribed readDetail is not the read the claim answered with',
+  );
+
+  // What the plan above costs here, derived from it because the claim route reports no rows_read
+  // (and `wrangler d1 execute --local` reports none either): an (app_id) seek spans every fleet
+  // row to find one. A noted number rather than a ceiling, for the reason the test above gives.
+  const [[slice]] = await d1("SELECT COUNT(*) AS n FROM reports WHERE app_id = 'fleet'");
+  assert.ok(slice.n > rows.length, `the fleet's slice is ${slice.n} rows, so the seek and a one-row read cannot be told apart here`);
 });
 
 test('the board says a published item is moving and nothing more, both board routes answer any origin, and automation still cannot publish', async () => {
