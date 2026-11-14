@@ -693,11 +693,6 @@ button:active,
   overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
 }
 
-/* Intro */
-.intro { margin-bottom: 40px; }
-.intro__head { font-size: 1.5rem; margin-bottom: 12px; }
-.intro__lede { line-height: 1.65; margin-bottom: 10px; }
-.intro__note { font-size: 0.92rem; line-height: 1.55; }
 
 /* The public log */
 .log__head { font-size: 1.1rem; text-transform: uppercase; letter-spacing: 0.08em;
